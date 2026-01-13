@@ -4,19 +4,28 @@ import glfw
 from OpenGL.GL import *
 from pathlib import Path
 import math
+import ctypes 
+from imgui_bundle import imgui
 
 # --- CONFIG ---
 VDB_FILE = "cloud_01_variant_0000.vdb" 
-WIDTH, HEIGHT = 1024, 768
 VOL_SIZE = 128
+SHADER_FILE = "hybrid.slang"
 
-g_width, g_height = 1024, 768
-g_screen_texture = None
-g_display_tex = None
+# ==========================================
+# 1. DATA & LOGIC CLASSES
+# ==========================================
 
-# --- CAMERA CLASS (Improved) ---
-class Camera:
+class Settings:
     def __init__(self):
+        self.step_size = 0.015
+        self.density_scale = 40.0
+        self.density_curve = 0.6
+        self.step_count = 256
+        self.smoke_color = [0.9, 0.95, 1.0]
+
+class Camera:
+    def __init__(self, w, h):
         self.pos = np.array([0.0, 0.0, 2.5], dtype=np.float32)
         self.yaw = -90.0
         self.pitch = 0.0
@@ -25,13 +34,9 @@ class Camera:
         self.up = np.array([0, 1, 0], dtype=np.float32)
         self.speed = 2.0
         self.sensitivity = 0.1
-        
-        # State tracking
-        self.last_x = WIDTH / 2.0
-        self.last_y = HEIGHT / 2.0
+        self.last_x, self.last_y = w / 2.0, h / 2.0
         self.first_mouse = True
-        self.is_dragging = False # Track if we are currently looking around
-
+        self.is_dragging = False
         self.update_vectors()
 
     def update_vectors(self):
@@ -43,7 +48,6 @@ class Camera:
             math.sin(rad_yaw) * math.cos(rad_pitch)
         ], dtype=np.float32)
         self.front = f / np.linalg.norm(f)
-        
         world_up = np.array([0, 1, 0], dtype=np.float32)
         self.right = np.cross(self.front, world_up)
         self.right /= np.linalg.norm(self.right)
@@ -51,23 +55,16 @@ class Camera:
         self.up /= np.linalg.norm(self.up)
 
     def process_mouse(self, xpos, ypos):
-        # 1. If we just started dragging, reset the anchor to avoid jumps
         if self.first_mouse:
-            self.last_x = xpos
-            self.last_y = ypos
+            self.last_x, self.last_y = xpos, ypos
             self.first_mouse = False
-            return # Skip the first frame of movement
-
-        # 2. Calculate Delta
+            return 
+        
         xoffset = (xpos - self.last_x) * self.sensitivity
         yoffset = (self.last_y - ypos) * self.sensitivity 
-        
-        self.last_x = xpos
-        self.last_y = ypos
-
+        self.last_x, self.last_y = xpos, ypos
         self.yaw += xoffset
-        self.pitch += yoffset
-        
+        self.pitch += yoffset 
         if self.pitch > 89.0: self.pitch = 89.0
         if self.pitch < -89.0: self.pitch = -89.0
         self.update_vectors()
@@ -80,21 +77,21 @@ class Camera:
         data[12:15] = self.up * 0.5
         return data
 
-cam = Camera()
-
-# --- VDB LOADER ---
-def load_volume_data(size):
-    print(f"Loading {VDB_FILE}...")
+def load_vdb_volume(filename, size):
+    print(f"Loading {filename}...")
     try:
         import openvdb as vdb
-        if not Path(VDB_FILE).exists(): raise Exception("File missing")
-        raw = vdb.readAll(VDB_FILE)
+        if not Path(filename).exists(): raise Exception("File missing")
+        raw = vdb.readAll(filename)
         grid = raw[0][0] if isinstance(raw, (list, tuple)) else raw 
         
         bbox = grid.evalActiveVoxelBoundingBox()
         min_i, max_i = np.array(bbox[0]), np.array(bbox[1])
         center = (min_i + max_i) / 2.0
-        max_dim = np.max(max_i - min_i) * 1.1
+        
+        # Padding fix: 1.2x largest extent
+        extent = np.max(max_i - min_i)
+        max_dim = extent * 1.2 
         
         accessor = grid.getAccessor()
         data = np.zeros((size, size, size), dtype=np.float32)
@@ -110,163 +107,278 @@ def load_volume_data(size):
         if m > 0: data /= m
         return np.ascontiguousarray(data, dtype=np.float32)
     except Exception as e:
-        print(f"Fallback Noise ({e})")
+        print(f"Error loading VDB, using fallback noise: {e}")
         x = np.linspace(-1, 1, size)
         X, Y, Z = np.meshgrid(x, x, x, indexing='ij')
         return np.exp(-4 * (X**2 + Y**2 + Z**2)).astype(np.float32)
 
-# --- SETUP ---
-EXAMPLE_DIR = Path(__file__).parent
-device = spy.Device(enable_debug_layers=True, compiler_options={"include_paths": [EXAMPLE_DIR]})
+# ==========================================
+# 2. RENDERER SYSTEM (The Engine)
+# ==========================================
 
-linear_sampler = device.create_sampler(
-    min_filter=spy.TextureFilteringMode.linear,
-    mag_filter=spy.TextureFilteringMode.linear,
-    mip_filter=spy.TextureFilteringMode.linear,
-    address_u=spy.TextureAddressingMode.wrap,
-    address_v=spy.TextureAddressingMode.wrap,
-    address_w=spy.TextureAddressingMode.wrap
-)
-
-volume_data = load_volume_data(VOL_SIZE)
-volume_texture = device.create_texture(
-    type=spy.TextureType.texture_3d, format=spy.Format.r32_float,
-    width=VOL_SIZE, height=VOL_SIZE, depth=VOL_SIZE,
-    usage=spy.TextureUsage.shader_resource, label="VDBVolume"
-)
-cmd = device.create_command_encoder()
-cmd.upload_texture_data(volume_texture, [volume_data])
-device.submit_command_buffer(cmd.finish())
-
-cam_buffer = device.create_buffer(
-    size=16 * 4,
-    usage=spy.BufferUsage.shader_resource, 
-    memory_type=spy.MemoryType.upload,
-    label="CameraUniforms"
-)
-
-screen_texture = device.create_texture(
-    format=spy.Format.rgba32_float, width=WIDTH, height=HEIGHT,
-    usage=spy.TextureUsage.render_target, label="Screen"
-)
-
-graphics_program = device.load_program("hybrid.slang", ["vertex_main", "fragment_main"])
-render_pipeline = device.create_render_pipeline(
-    program=graphics_program,
-    input_layout=device.create_input_layout(input_elements=[], vertex_streams=[]),
-    targets=[{"format": spy.Format.rgba32_float}],
-)
-
-# --- WINDOW & INPUT ---
-# --- WINDOW ---
-if not glfw.init(): raise Exception("GLFW failed")
-window = glfw.create_window(g_width, g_height, "Right Click to Fly | Resizeable", None, None)
-glfw.make_context_current(window)
-
-# --- RESIZE LOGIC ---
-def recreate_resources(w, h):
-    global g_screen_texture, g_display_tex, g_width, g_height
-    g_width, g_height = w, h
-    
-    # 1. Slang Render Target
-    g_screen_texture = device.create_texture(
-        format=spy.Format.rgba32_float, width=w, height=h,
-        usage=spy.TextureUsage.render_target, label="Screen"
-    )
-    
-    # 2. OpenGL Display Texture
-    if g_display_tex is None:
-        g_display_tex = glGenTextures(1)
+class Renderer:
+    def __init__(self, device, volume_data):
+        self.device = device
+        self.pipeline = None
+        self.last_mod_time = 0
+        self.error_msg = ""
         
-    glBindTexture(GL_TEXTURE_2D, g_display_tex)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
-    # Reallocate storage for new size
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, None)
+        # 1. Static Resources
+        self.linear_sampler = device.create_sampler(
+            min_filter=spy.TextureFilteringMode.linear,
+            mag_filter=spy.TextureFilteringMode.linear,
+            mip_filter=spy.TextureFilteringMode.linear,
+            address_u=spy.TextureAddressingMode.wrap, 
+            address_v=spy.TextureAddressingMode.wrap,
+            address_w=spy.TextureAddressingMode.wrap
+        )
 
-# Initial Create
-recreate_resources(g_width, g_height)
+        self.volume_tex = device.create_texture(
+            type=spy.TextureType.texture_3d, format=spy.Format.r32_float,
+            width=VOL_SIZE, height=VOL_SIZE, depth=VOL_SIZE,
+            usage=spy.TextureUsage.shader_resource, label="VDBVolume"
+        )
+        # Upload data immediately
+        cmd = device.create_command_encoder()
+        cmd.upload_texture_data(self.volume_tex, [volume_data])
+        device.submit_command_buffer(cmd.finish())
 
-def mouse_callback(window, xpos, ypos):
-    if cam.is_dragging:
-        cam.process_mouse(xpos, ypos)
-glfw.set_cursor_pos_callback(window, mouse_callback)
+        self.cam_buffer = device.create_buffer(size=64, usage=spy.BufferUsage.shader_resource, memory_type=spy.MemoryType.upload)
+        self.settings_buffer = device.create_buffer(size=64, usage=spy.BufferUsage.shader_resource, memory_type=spy.MemoryType.upload)
 
-# --- MAIN LOOP ---
-last_time = glfw.get_time()
+        # 2. Dynamic Resources (Resizeable)
+        self.screen_tex = None
+        self.display_gl_tex = None
+        self.width, self.height = 0, 0
 
-while not glfw.window_should_close(window):
-    current_time = glfw.get_time()
-    dt = current_time - last_time
-    last_time = current_time
+        # 3. Initial Compile
+        self.check_hot_reload()
 
-    # 1. CHECK RESIZE
-    win_w, win_h = glfw.get_window_size(window)
-    # Handle minimization (size 0) by skipping
-    if win_w == 0 or win_h == 0:
-        glfw.poll_events()
-        continue
+    def resize(self, w, h):
+        if w == self.width and h == self.height: return
+        self.width, self.height = w, h
         
-    if win_w != g_width or win_h != g_height:
-        recreate_resources(win_w, win_h)
-
-    # 2. INPUT
-    right_mouse_down = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
-    if right_mouse_down and not cam.is_dragging:
-        cam.is_dragging = True
-        cam.first_mouse = True 
-        glfw.set_input_mode(window, glfw.CURSOR, glfw.CURSOR_DISABLED)
-    elif not right_mouse_down and cam.is_dragging:
-        cam.is_dragging = False
-        glfw.set_input_mode(window, glfw.CURSOR, glfw.CURSOR_NORMAL)
-
-    speed = cam.speed * dt
-    if glfw.get_key(window, glfw.KEY_W) == glfw.PRESS: cam.pos += cam.front * speed
-    if glfw.get_key(window, glfw.KEY_S) == glfw.PRESS: cam.pos -= cam.front * speed
-    if glfw.get_key(window, glfw.KEY_A) == glfw.PRESS: cam.pos -= cam.right * speed
-    if glfw.get_key(window, glfw.KEY_D) == glfw.PRESS: cam.pos += cam.right * speed
-    if glfw.get_key(window, glfw.KEY_E) == glfw.PRESS: cam.pos += cam.up * speed
-    if glfw.get_key(window, glfw.KEY_Q) == glfw.PRESS: cam.pos -= cam.up * speed
-    if glfw.get_key(window, glfw.KEY_ESCAPE) == glfw.PRESS: glfw.set_window_should_close(window, True)
-
-    # 3. RENDER
-    # Pass new Aspect Ratio (win_w / win_h)
-    cam_data = cam.get_gpu_data(win_w / win_h)
-    cam_buffer.copy_from_numpy(cam_data)
-
-    cmd = device.create_command_encoder()
-    cmd.set_texture_state(volume_texture, spy.ResourceState.shader_resource)
-
-    with cmd.begin_render_pass({"color_attachments": [{"view": g_screen_texture.create_view({})}]}) as rp:
-        shader = rp.bind_pipeline(render_pipeline)
-        cursor = spy.ShaderCursor(shader)
-        cursor["inVolume"] = volume_texture
-        cursor["camera"] = cam_buffer
-        cursor["linearSampler"] = linear_sampler
+        # Slang Texture
+        self.screen_tex = self.device.create_texture(
+            format=spy.Format.rgba32_float, width=w, height=h,
+            usage=spy.TextureUsage.render_target, label="Screen"
+        )
         
-        # Update Viewport/Scissor to match new size
-        rp.set_render_state({
-            "viewports": [spy.Viewport.from_size(g_width, g_height)],
-            "scissor_rects": [spy.ScissorRect.from_size(g_width, g_height)]
-        })
-        rp.draw({"vertex_count": 3})
+        # OpenGL Texture (for display)
+        if self.display_gl_tex is None: self.display_gl_tex = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, self.display_gl_tex)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, None)
 
-    device.submit_command_buffer(cmd.finish())
+    def check_hot_reload(self):
+        try:
+            curr_time = Path(SHADER_FILE).stat().st_mtime
+            if curr_time > self.last_mod_time:
+                self.last_mod_time = curr_time
+                
+                # Compile
+                prog = self.device.load_program(SHADER_FILE, ["vertex_main", "fragment_main"])
+                new_pipe = self.device.create_render_pipeline(
+                    program=prog,
+                    input_layout=self.device.create_input_layout(input_elements=[], vertex_streams=[]),
+                    targets=[{"format": spy.Format.rgba32_float}]
+                )
+                
+                self.pipeline = new_pipe
+                self.error_msg = ""
+                print("Shader Reloaded!")
+        except Exception as e:
+            self.error_msg = str(e)
+            print("Shader Compile Error (Safe)")
 
-    # 4. DISPLAY
-    pixels = (np.clip(g_screen_texture.to_numpy(), 0, 1) * 255).astype(np.uint8)
-    glBindTexture(GL_TEXTURE_2D, g_display_tex)
-    # Use global width/height
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, g_width, g_height, GL_RGBA, GL_UNSIGNED_BYTE, pixels)
-    
-    fb = glGenFramebuffers(1)
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb)
-    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_display_tex, 0)
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0)
-    glBlitFramebuffer(0, 0, g_width, g_height, 0, 0, g_width, g_height, GL_COLOR_BUFFER_BIT, GL_NEAREST)
-    glDeleteFramebuffers(1, [fb])
+    def render(self, camera, settings):
+        # Safety check
+        if not self.pipeline: return
 
-    glfw.swap_buffers(window)
-    glfw.poll_events()
+        # Update Uniforms
+        self.cam_buffer.copy_from_numpy(camera.get_gpu_data(self.width / self.height))
+        
+        s_data = np.zeros(8, dtype=np.float32)
+        s_data[0] = settings.step_size
+        s_data[1] = settings.density_scale
+        s_data[2] = settings.density_curve
+        s_data[3] = float(settings.step_count)
+        s_data[4:7] = settings.smoke_color
+        self.settings_buffer.copy_from_numpy(s_data)
 
-glfw.terminate()
+        # Encode
+        cmd = self.device.create_command_encoder()
+        cmd.set_texture_state(self.volume_tex, spy.ResourceState.shader_resource)
+
+        with cmd.begin_render_pass({"color_attachments": [{"view": self.screen_tex.create_view({})}]}) as rp:
+            rp.bind_pipeline(self.pipeline)
+            cursor = spy.ShaderCursor(rp.bind_pipeline(self.pipeline))
+            
+            cursor["inVolume"] = self.volume_tex
+            cursor["camera"] = self.cam_buffer
+            cursor["linearSampler"] = self.linear_sampler
+            cursor["settings"] = self.settings_buffer
+            
+            rp.set_render_state({
+                "viewports": [spy.Viewport.from_size(self.width, self.height)],
+                "scissor_rects": [spy.ScissorRect.from_size(self.width, self.height)]
+            })
+            rp.draw({"vertex_count": 3})
+
+        self.device.submit_command_buffer(cmd.finish())
+
+    def update_display(self):
+        # Copy Slang -> OpenGL
+        pixels = (np.clip(self.screen_tex.to_numpy(), 0, 1) * 255).astype(np.uint8)
+        glBindTexture(GL_TEXTURE_2D, self.display_gl_tex)
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, self.width, self.height, GL_RGBA, GL_UNSIGNED_BYTE, pixels)
+        
+        # Blit to Framebuffer
+        fb = glGenFramebuffers(1)
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fb)
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, self.display_gl_tex, 0)
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0)
+        glBlitFramebuffer(0, 0, self.width, self.height, 0, 0, self.width, self.height, GL_COLOR_BUFFER_BIT, GL_NEAREST)
+        glDeleteFramebuffers(1, [fb])
+
+# ==========================================
+# 3. APP CLASS (Window & UI)
+# ==========================================
+
+class App:
+    def __init__(self):
+        # Window
+        if not glfw.init(): raise Exception("GLFW failed")
+        glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
+        glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
+        glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+        self.width, self.height = 1024, 768
+        self.window = glfw.create_window(self.width, self.height, "VDB Editor", None, None)
+        glfw.make_context_current(self.window)
+
+        # ImGui
+        imgui.create_context()
+        self.io = imgui.get_io()
+        self.io.config_flags |= imgui.ConfigFlags_.docking_enable
+        window_address = ctypes.cast(self.window, ctypes.c_void_p).value
+        imgui.backends.glfw_init_for_opengl(window_address, True)
+        imgui.backends.opengl3_init("#version 330")
+
+        # Logic
+        self.settings = Settings()
+        self.camera = Camera(self.width, self.height)
+        
+        # Renderer
+        example_dir = Path(__file__).parent
+        self.device = spy.Device(enable_debug_layers=True, compiler_options={"include_paths": [example_dir]})
+        
+        # Load Data
+        vol = load_vdb_volume(VDB_FILE, VOL_SIZE)
+        self.renderer = Renderer(self.device, vol)
+        self.renderer.resize(self.width, self.height)
+
+    def run(self):
+        last_time = glfw.get_time()
+        
+        while not glfw.window_should_close(self.window):
+            curr_time = glfw.get_time()
+            dt = curr_time - last_time
+            last_time = curr_time
+            
+            glfw.poll_events()
+            
+            # Resize
+            w, h = glfw.get_window_size(self.window)
+            if w == 0 or h == 0: continue
+            self.renderer.resize(w, h)
+
+            # Hot Reload
+            self.renderer.check_hot_reload()
+
+            # ImGui Frame
+            imgui.backends.opengl3_new_frame()
+            imgui.backends.glfw_new_frame()
+            imgui.new_frame()
+            imgui.dock_space_over_viewport(0, imgui.get_main_viewport(), imgui.DockNodeFlags_.passthru_central_node)
+
+            # Draw UI
+            self.draw_ui(dt)
+
+            # Input
+            self.handle_input(dt)
+
+            # Render Scene
+            try:
+                self.renderer.render(self.camera, self.settings)
+                self.renderer.update_display()
+            except Exception as e:
+                print(f"Runtime Render Error: {e}")
+
+            # Render UI
+            imgui.render()
+            imgui.backends.opengl3_render_draw_data(imgui.get_draw_data())
+            glfw.swap_buffers(self.window)
+
+        self.cleanup()
+
+    def handle_input(self, dt):
+        if self.io.want_capture_mouse: return
+        
+        # Mouse
+        right_down = glfw.get_mouse_button(self.window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
+        if right_down and not self.camera.is_dragging:
+            self.camera.is_dragging = True
+            self.camera.first_mouse = True
+            glfw.set_input_mode(self.window, glfw.CURSOR, glfw.CURSOR_DISABLED)
+        elif not right_down and self.camera.is_dragging:
+            self.camera.is_dragging = False
+            glfw.set_input_mode(self.window, glfw.CURSOR, glfw.CURSOR_NORMAL)
+            
+        if self.camera.is_dragging:
+            x, y = glfw.get_cursor_pos(self.window)
+            self.camera.process_mouse(x, y)
+
+        # Keyboard
+        speed = self.camera.speed * dt
+        if glfw.get_key(self.window, glfw.KEY_W) == glfw.PRESS: self.camera.pos += self.camera.front * speed
+        if glfw.get_key(self.window, glfw.KEY_S) == glfw.PRESS: self.camera.pos -= self.camera.front * speed
+        if glfw.get_key(self.window, glfw.KEY_A) == glfw.PRESS: self.camera.pos -= self.camera.right * speed
+        if glfw.get_key(self.window, glfw.KEY_D) == glfw.PRESS: self.camera.pos += self.camera.right * speed
+        if glfw.get_key(self.window, glfw.KEY_Q) == glfw.PRESS: self.camera.pos += self.camera.up * speed
+        if glfw.get_key(self.window, glfw.KEY_E) == glfw.PRESS: self.camera.pos -= self.camera.up * speed
+        if glfw.get_key(self.window, glfw.KEY_ESCAPE) == glfw.PRESS: glfw.set_window_should_close(self.window, True)
+
+    def draw_ui(self, dt):
+        if imgui.begin("Stats"):
+            imgui.text(f"FPS: {1.0/(dt+0.0001):.1f}")
+            if self.renderer.error_msg:
+                imgui.text_colored(imgui.ImVec4(1, 0, 0, 1), "SHADER ERROR")
+        imgui.end()
+
+        if imgui.begin("Settings"):
+            if self.renderer.error_msg:
+                imgui.text_colored(imgui.ImVec4(1, 0, 0, 1), f"{self.renderer.error_msg}")
+            else:
+                imgui.text_colored(imgui.ImVec4(0, 1, 0, 1), "Shader Active")
+            
+            imgui.separator()
+            _, self.settings.density_scale = imgui.slider_float("Density", self.settings.density_scale, 1.0, 200.0)
+            _, self.settings.step_size = imgui.slider_float("Step Size", self.settings.step_size, 0.001, 0.05)
+            _, self.settings.step_count = imgui.slider_int("Step Count", self.settings.step_count, 10, 2000)
+            _, self.settings.density_curve = imgui.slider_float("Gamma", self.settings.density_curve, 0.1, 2.0)
+            _, self.settings.smoke_color = imgui.color_edit3("Color", self.settings.smoke_color)
+        imgui.end()
+
+    def cleanup(self):
+        imgui.backends.opengl3_shutdown()
+        imgui.backends.glfw_shutdown()
+        imgui.destroy_context()
+        glfw.terminate()
+
+# ==========================================
+# 4. ENTRY POINT
+# ==========================================
+if __name__ == "__main__":
+    app = App()
+    app.run()
