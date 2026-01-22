@@ -6,6 +6,8 @@ from pathlib import Path
 import math
 import ctypes 
 from imgui_bundle import imgui
+from slangpy.math import uint3
+
 
 # --- CONFIG ---
 VDB_FILE = "cloud_01_variant_0000.vdb" 
@@ -76,6 +78,121 @@ class Camera:
         data[8:11] = self.right * aspect_ratio * 0.5 
         data[12:15] = self.up * 0.5
         return data
+
+import openvdb as vdb
+import numpy as np
+import random
+
+def load_first_grid(vdb_path):
+    import openvdb as vdb
+    raw = vdb.readAll(vdb_path)
+    grid = raw[0][0] if isinstance(raw, (list, tuple)) else raw
+    print("Using grid:", type(grid))
+    return grid
+
+import openvdb as vdb
+import numpy as np
+import random
+
+def load_first_grid(vdb_path):
+    raw = vdb.readAll(vdb_path)
+    return raw[0][0] if isinstance(raw, (list, tuple)) else raw
+
+import numpy as np
+import random
+from pathlib import Path
+import openvdb as vdb
+
+def load_first_grid(vdb_path):
+    raw = vdb.readAll(vdb_path)
+    return raw[0][0] if isinstance(raw, (list, tuple)) else raw
+
+def load_vdb_as_gaussians_voxel_sampling(
+    vdb_path,
+    probability_scale=1.0,
+    max_gaussians=None,
+    jitter_scale=0.5,
+    sigma_scale=1.0
+):
+    """
+    Voxel-driven stochastic Gaussian initialization with debug prints.
+    """
+    grid = load_first_grid(vdb_path)
+    print("Using grid:", type(grid))
+    print("Grid info:", grid.info())
+
+    accessor = grid.getAccessor()
+
+    # Get voxel bounding box
+    bbox = grid.evalActiveVoxelBoundingBox()
+    min_i, max_i = np.array(bbox[0]), np.array(bbox[1])
+    print("Voxel bounding box:", min_i, "to", max_i)
+    total_voxels = np.prod(max_i - min_i + 1)
+    print("Total voxels in bbox:", total_voxels)
+
+    # World transform & voxel size
+    transform = grid.transform
+    voxel_size = np.linalg.norm(
+        np.array(transform.indexToWorld((1, 0, 0))) -
+        np.array(transform.indexToWorld((0, 0, 0)))
+    )
+    print("Approx voxel size in world units:", voxel_size)
+
+    gaussians = []
+    active_voxels_sampled = 0
+    min_value, max_value = float("inf"), float("-inf")
+
+
+
+    # Iterate over all active voxels
+    for z in range(min_i[2], max_i[2] + 1):
+        for y in range(min_i[1], max_i[1] + 1):
+            for x in range(min_i[0], max_i[0] + 1):
+                value = accessor.getValue((x, y, z))
+                if value <= 0.0:
+                    continue
+
+                active_voxels_sampled += 1
+                min_value = min(min_value, value)
+                max_value = max(max_value, value)
+
+                # Stochastic spawn probability
+                if value * probability_scale < random.random():
+                    continue
+
+                # Voxel center in world coordinates
+                center = np.array(transform.indexToWorld((x, y, z)), dtype=np.float32)
+
+                # Jitter inside voxel
+                jitter = (np.random.rand(3) - 0.5) * voxel_size * jitter_scale
+                position = center + jitter
+
+                sigma = voxel_size * sigma_scale
+                weight = value
+
+                gaussians.append((
+                    position[0], position[1], position[2],
+                    sigma,
+                    weight
+                ))
+
+                # Print first few Gaussians for debug
+                if len(gaussians) <= 5:
+                    print(f"Gaussian {len(gaussians)}: pos={position}, sigma={sigma}, weight={weight}")
+
+                if max_gaussians is not None and len(gaussians) >= max_gaussians:
+                    print(f"Reached max_gaussians={max_gaussians}, stopping.")
+                    print(f"Active voxels sampled: {active_voxels_sampled}")
+                    print(f"Voxel density range: min={min_value}, max={max_value}")
+                    return np.array(gaussians, dtype=np.float32)
+
+    print(f"Total Gaussians generated: {len(gaussians)}")
+    print(f"Active voxels sampled: {active_voxels_sampled}")
+    print(f"Voxel density range: min={min_value}, max={max_value}")
+
+    return np.array(gaussians, dtype=np.float32)
+
+
 
 def load_vdb_volume(filename, size):
     print(f"Loading {filename}...")
@@ -151,6 +268,29 @@ class Renderer:
         self.display_gl_tex = None
         self.width, self.height = 0, 0
 
+        # Gaussian stuff
+        self.gaussian_volume_tex = device.create_texture(
+            type=spy.TextureType.texture_3d,
+            format=spy.Format.r32_float,
+            width=VOL_SIZE, height=VOL_SIZE, depth=VOL_SIZE,
+            usage=spy.TextureUsage.unordered_access | spy.TextureUsage.shader_resource,
+            label="GaussianVolume"
+        )
+
+        self.gaussian_buffer = None
+        self.gaussian_count = 0
+
+        self.gaussian_raster_program = device.load_program(
+            "3drasterizer.slang",
+            ["main"]
+        )
+
+        self.gaussian_raster_pipeline = device.create_compute_pipeline(
+            program=self.gaussian_raster_program
+        )
+
+        self.use_gaussian_volume = False
+
         # 3. Initial Compile
         self.check_hot_reload()
 
@@ -215,7 +355,10 @@ class Renderer:
             rp.bind_pipeline(self.pipeline)
             cursor = spy.ShaderCursor(rp.bind_pipeline(self.pipeline))
             
-            cursor["inVolume"] = self.volume_tex
+            if self.use_gaussian_volume:
+                cursor["inVolume"] = self.gaussian_volume_tex
+            else:
+                cursor["inVolume"] = self.volume_tex
             cursor["camera"] = self.cam_buffer
             cursor["linearSampler"] = self.linear_sampler
             cursor["settings"] = self.settings_buffer
@@ -241,6 +384,56 @@ class Renderer:
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0)
         glBlitFramebuffer(0, 0, self.width, self.height, 0, 0, self.width, self.height, GL_COLOR_BUFFER_BIT, GL_NEAREST)
         glDeleteFramebuffers(1, [fb])
+    
+    def rasterize_gaussians(self, gaussians):
+        if gaussians is None or len(gaussians) == 0:
+            print("No gaussians to rasterize")
+            return
+
+        self.gaussian_count = len(gaussians)
+
+        self.gaussian_buffer = self.device.create_buffer(
+            size=gaussians.nbytes,
+            usage=spy.BufferUsage.shader_resource,
+            memory_type=spy.MemoryType.upload
+        )
+        self.gaussian_buffer.copy_from_numpy(gaussians)
+
+        # Clear volume
+        cmd = self.device.create_command_encoder()
+        cmd.clear_texture_float(self.gaussian_volume_tex)
+
+        cmd.set_texture_state(self.gaussian_volume_tex, spy.ResourceState.unordered_access)
+
+        with cmd.begin_compute_pass() as cp:
+            
+            cursor = spy.ShaderCursor(cp.bind_pipeline(self.gaussian_raster_pipeline))
+
+            cursor["gGaussians"] = self.gaussian_buffer
+            cursor["gGaussianVolume"] = self.gaussian_volume_tex
+            gaussian_positions = gaussians[:, :3]  # x,y,z
+            volume_min_world = gaussian_positions.min(axis=0)
+            volume_max_world = gaussian_positions.max(axis=0)
+
+            cursor["GaussianParams"]["volumeMinWorld"] = tuple(volume_min_world)
+            cursor["GaussianParams"]["volumeMaxWorld"] = tuple(volume_max_world)
+
+
+            cursor["GaussianParams"]["gaussianCount"] = self.gaussian_count
+            cursor["GaussianParams"]["volumeResolution"] = (VOL_SIZE, VOL_SIZE, VOL_SIZE)
+            cursor["GaussianParams"]["voxelSize"] = 1.0
+
+            groups = uint3(
+                VOL_SIZE,
+                VOL_SIZE,
+                VOL_SIZE
+            )
+            cp.dispatch(groups)
+
+        self.device.submit_command_buffer(cmd.finish())
+
+        print(f"Rasterized {self.gaussian_count} gaussians")
+
 
 # ==========================================
 # 3. APP CLASS (Window & UI)
@@ -277,6 +470,16 @@ class App:
         vol = load_vdb_volume(VDB_FILE, VOL_SIZE)
         self.renderer = Renderer(self.device, vol)
         self.renderer.resize(self.width, self.height)
+
+        self.gaussians = load_vdb_as_gaussians_voxel_sampling(
+            VDB_FILE,
+            probability_scale=0.05,
+            sigma_scale=1.0,
+            jitter_scale=0.5
+        )
+
+        self.renderer.rasterize_gaussians(self.gaussians)
+
 
     def run(self):
         last_time = glfw.get_time()
@@ -368,6 +571,10 @@ class App:
             _, self.settings.step_count = imgui.slider_int("Step Count", self.settings.step_count, 10, 2000)
             _, self.settings.density_curve = imgui.slider_float("Gamma", self.settings.density_curve, 0.1, 2.0)
             _, self.settings.smoke_color = imgui.color_edit3("Color", self.settings.smoke_color)
+            changed, self.renderer.use_gaussian_volume = imgui.checkbox(
+                "Render Gaussian Volume",
+                self.renderer.use_gaussian_volume
+            )
         imgui.end()
 
     def cleanup(self):
