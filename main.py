@@ -10,6 +10,7 @@ from slangpy.math import uint3
 import random
 from pathlib import Path
 import openvdb as vdb
+import itertools
 
 
 # --- CONFIG ---
@@ -83,146 +84,129 @@ class Camera:
         return data
 
 
-def load_first_grid(vdb_path):
-    raw = vdb.readAll(vdb_path)
-    return raw[0][0] if isinstance(raw, (list, tuple)) else raw
+def load_vdb_grid(vdb_path):
+    """
+    Step 1: Just load the OpenVDB grid object from disk.
+    """
+    print(f"Loading VDB file: {vdb_path}...")
+    try:
+        if not Path(vdb_path).exists():
+            raise FileNotFoundError("File missing")
+        
+        raw = vdb.readAll(vdb_path)
+        # Handle list vs single object return
+        grid = raw[0][0] if isinstance(raw, (list, tuple)) else raw
+        return grid
+    except Exception as e:
+        print(f"Error loading VDB: {e}")
+        return None
 
-def load_vdb_as_gaussians_voxel_sampling(
-    vdb_path,
+def convert_grid_to_dense_volume(grid, size):
+    """
+    Step 2: Convert the loaded grid into a dense 3D numpy array for the Raymarcher.
+    Returns: (min_world, max_world, dense_volume_data)
+    """
+    if grid is None:
+        # Fallback noise generation if grid failed to load
+        print("Using fallback noise volume.")
+        x = np.linspace(-1, 1, size)
+        X, Y, Z = np.meshgrid(x, x, x, indexing='ij')
+        dummy_data = np.exp(-4 * (X**2 + Y**2 + Z**2)).astype(np.float32)
+        # Return dummy bounds
+        return np.array([-1,-1,-1]), np.array([1,1,1]), dummy_data
+
+    # --- 1. Calculate Bounds ---
+    bbox = grid.evalActiveVoxelBoundingBox()
+    min_i, max_i = np.array(bbox[0]), np.array(bbox[1])
+    center = (min_i + max_i) / 2.0
+    
+    # Padding logic: 1.0x extent (User changed from 1.2 previously, keeping 1.0 as per your snippet)
+    extent = np.max(max_i - min_i)
+    max_dim = extent 
+    r = max_dim / 2.0
+
+    min_index_bound = center - r
+    max_index_bound = center + r
+    
+    # Convert to World Space
+    transform = grid.transform
+    min_w = np.array(transform.indexToWorld(tuple(min_index_bound)))
+    max_w = np.array(transform.indexToWorld(tuple(max_index_bound)))
+    
+    # --- 2. Dense Sampling ---
+    accessor = grid.getAccessor()
+    data = np.zeros((size, size, size), dtype=np.float32)
+    inv_size = 1.0 / size
+    
+    # Optimize: Use numpy vectorized coordinates instead of itertools loop for speed
+    # (Optional optimization, but sticking to your logic for safety)
+    for z, y, x in itertools.product(range(size), range(size), range(size)):
+        uvw = (np.array([x, y, z]) * inv_size) - 0.5
+        pos = center + uvw * max_dim
+        # Nearest neighbor sampling of the VDB
+        val = accessor.getValue(tuple(pos.astype(int)))
+        data[z, y, x] = val
+        
+    m = np.max(data)
+    if m > 0: data /= m
+    
+    return min_w, max_w, np.ascontiguousarray(data, dtype=np.float32)
+
+def convert_grid_to_gaussians(
+    grid,
     probability_scale=1.0,
     max_gaussians=None,
     jitter_scale=0.5,
     sigma_scale=1.0
 ):
     """
-    Voxel-driven stochastic Gaussian initialization with debug prints.
+    Step 3: Stochastically sample the SAME grid to create Gaussians.
     """
-    grid = load_first_grid(vdb_path)
-    print("Using grid:", type(grid))
-    print("Grid info:", grid.info())
+    if grid is None: return np.array([], dtype=np.float32)
 
+    print("Generating Gaussians from grid...")
     accessor = grid.getAccessor()
-
-    # Get voxel bounding box
     bbox = grid.evalActiveVoxelBoundingBox()
     min_i, max_i = np.array(bbox[0]), np.array(bbox[1])
-    print("Voxel bounding box:", min_i, "to", max_i)
-    total_voxels = np.prod(max_i - min_i + 1)
-    print("Total voxels in bbox:", total_voxels)
-
-    # World transform & voxel size
+    
     transform = grid.transform
-    voxel_size = np.linalg.norm(
-        np.array(transform.indexToWorld((1, 0, 0))) -
-        np.array(transform.indexToWorld((0, 0, 0)))
-    )
-    print("Approx voxel size in world units:", voxel_size)
+    # Calculate voxel size in world units
+    p0 = np.array(transform.indexToWorld((0, 0, 0)))
+    p1 = np.array(transform.indexToWorld((1, 0, 0)))
+    voxel_size = np.linalg.norm(p1 - p0)
 
     gaussians = []
-    active_voxels_sampled = 0
-    min_value, max_value = float("inf"), float("-inf")
-
-
-
-    # Iterate over all active voxels
+    
+    # Iterate over active voxels
+    # Note: Using grid.cbeginValueOn() is faster than XYZ loops for sparse grids,
+    # but loops are fine for now.
     for z in range(min_i[2], max_i[2] + 1):
         for y in range(min_i[1], max_i[1] + 1):
             for x in range(min_i[0], max_i[0] + 1):
                 value = accessor.getValue((x, y, z))
-                if value <= 0.0:
-                    continue
+                if value <= 0.0: continue
 
-                active_voxels_sampled += 1
-                min_value = min(min_value, value)
-                max_value = max(max_value, value)
-
-                # Stochastic spawn probability
+                # Stochastic spawn
                 if value * probability_scale < random.random():
                     continue
 
-                # Voxel center in world coordinates
                 center = np.array(transform.indexToWorld((x, y, z)), dtype=np.float32)
-
-                # Jitter inside voxel
                 jitter = (np.random.rand(3) - 0.5) * voxel_size * jitter_scale
                 position = center + jitter
-
+                
                 sigma = voxel_size * sigma_scale
                 weight = value
 
                 gaussians.append((
                     position[0], position[1], position[2],
-                    sigma,
-                    weight
+                    sigma, weight
                 ))
-
-                # Print first few Gaussians for debug
-                if len(gaussians) <= 5:
-                    print(f"Gaussian {len(gaussians)}: pos={position}, sigma={sigma}, weight={weight}")
-
-                if max_gaussians is not None and len(gaussians) >= max_gaussians:
-                    print(f"Reached max_gaussians={max_gaussians}, stopping.")
-                    print(f"Active voxels sampled: {active_voxels_sampled}")
-                    print(f"Voxel density range: min={min_value}, max={max_value}")
+                
+                if max_gaussians and len(gaussians) >= max_gaussians:
                     return np.array(gaussians, dtype=np.float32)
 
-    print(f"Total Gaussians generated: {len(gaussians)}")
-    print(f"Active voxels sampled: {active_voxels_sampled}")
-    print(f"Voxel density range: min={min_value}, max={max_value}")
-
+    print(f"Generated {len(gaussians)} gaussians.")
     return np.array(gaussians, dtype=np.float32)
-
-
-
-def load_vdb_volume(filename, size):
-    print(f"Loading {filename}...")
-    try:
-        import openvdb as vdb
-        if not Path(filename).exists(): raise Exception("File missing")
-        raw = vdb.readAll(filename)
-        grid = raw[0][0] if isinstance(raw, (list, tuple)) else raw 
-        
-        bbox = grid.evalActiveVoxelBoundingBox()
-        min_i, max_i = np.array(bbox[0]), np.array(bbox[1])
-        center = (min_i + max_i) / 2.0
-        
-        # Padding fix: 1.2x largest extent
-        extent = np.max(max_i - min_i)
-        max_dim = extent
-
-        r = max_dim / 2.0
-    
-        min_index_bound = center - r
-        max_index_bound = center + r
-        
-        # 2. Convert to World Space using the Grid's Transform
-        # Note: We assume the transform is linear for the AABB 
-        transform = grid.transform
-        
-        # We corner-check to get the world AABB (handles rotation/scaling roughly)
-        # For perfect accuracy with rotation, you'd transform all 8 corners. 
-        # Assuming aligned or simple scale here for "cloud_01":
-        min_w = np.array(transform.indexToWorld(tuple(min_index_bound)))
-        max_w = np.array(transform.indexToWorld(tuple(max_index_bound)))
-        
-        accessor = grid.getAccessor()
-        data = np.zeros((size, size, size), dtype=np.float32)
-        inv_size = 1.0 / size
-        
-        import itertools
-        for z, y, x in itertools.product(range(size), range(size), range(size)):
-            uvw = (np.array([x, y, z]) * inv_size) - 0.5
-            pos = center + uvw * max_dim
-            data[z, y, x] = accessor.getValue(tuple(pos.astype(int)))
-            
-        m = np.max(data)
-        if m > 0: data /= m
-        return min_w, max_w, np.ascontiguousarray(data, dtype=np.float32)
-    except Exception as e:
-        print(f"Error loading VDB, using fallback noise: {e}")
-        x = np.linspace(-1, 1, size)
-        X, Y, Z = np.meshgrid(x, x, x, indexing='ij')
-        return np.exp(-4 * (X**2 + Y**2 + Z**2)).astype(np.float32)
     
 
 # ==========================================
@@ -460,24 +444,21 @@ class App:
         self.device = spy.Device(enable_debug_layers=True, compiler_options={"include_paths": [example_dir]})
         
         # Load Data
-        self.vol_min_world, self.vol_max_world, vol = load_vdb_volume(VDB_FILE, VOL_SIZE)
-        self.renderer = Renderer(self.device, vol)
-        self.renderer.resize(self.width, self.height)
+        grid = load_vdb_grid(VDB_FILE)
 
-        self.gaussians = load_vdb_as_gaussians_voxel_sampling(
-            VDB_FILE,
+        self.vol_min_world, self.vol_max_world, vol_data = convert_grid_to_dense_volume(grid, VOL_SIZE)
+
+        self.gaussians = convert_grid_to_gaussians(
+            grid,
             probability_scale=0.005,
             sigma_scale=3.0,
             jitter_scale=0.5
         )
 
+        self.renderer = Renderer(self.device, vol_data)
+        self.renderer.resize(self.width, self.height)
 
-        # 5. Rasterize using the MASTER BOUNDS
-        self.renderer.rasterize_gaussians(
-            self.gaussians, 
-            self.vol_min_world, 
-            self.vol_max_world
-        )
+        self.renderer.rasterize_gaussians(self.gaussians, self.vol_min_world, self.vol_max_world)
 
 
     def run(self):
