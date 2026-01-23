@@ -7,6 +7,9 @@ import math
 import ctypes 
 from imgui_bundle import imgui
 from slangpy.math import uint3
+import random
+from pathlib import Path
+import openvdb as vdb
 
 
 # --- CONFIG ---
@@ -79,29 +82,6 @@ class Camera:
         data[12:15] = self.up * 0.5
         return data
 
-import openvdb as vdb
-import numpy as np
-import random
-
-def load_first_grid(vdb_path):
-    import openvdb as vdb
-    raw = vdb.readAll(vdb_path)
-    grid = raw[0][0] if isinstance(raw, (list, tuple)) else raw
-    print("Using grid:", type(grid))
-    return grid
-
-import openvdb as vdb
-import numpy as np
-import random
-
-def load_first_grid(vdb_path):
-    raw = vdb.readAll(vdb_path)
-    return raw[0][0] if isinstance(raw, (list, tuple)) else raw
-
-import numpy as np
-import random
-from pathlib import Path
-import openvdb as vdb
 
 def load_first_grid(vdb_path):
     raw = vdb.readAll(vdb_path)
@@ -208,7 +188,22 @@ def load_vdb_volume(filename, size):
         
         # Padding fix: 1.2x largest extent
         extent = np.max(max_i - min_i)
-        max_dim = extent * 1.2 
+        max_dim = extent
+
+        r = max_dim / 2.0
+    
+        min_index_bound = center - r
+        max_index_bound = center + r
+        
+        # 2. Convert to World Space using the Grid's Transform
+        # Note: We assume the transform is linear for the AABB 
+        transform = grid.transform
+        
+        # We corner-check to get the world AABB (handles rotation/scaling roughly)
+        # For perfect accuracy with rotation, you'd transform all 8 corners. 
+        # Assuming aligned or simple scale here for "cloud_01":
+        min_w = np.array(transform.indexToWorld(tuple(min_index_bound)))
+        max_w = np.array(transform.indexToWorld(tuple(max_index_bound)))
         
         accessor = grid.getAccessor()
         data = np.zeros((size, size, size), dtype=np.float32)
@@ -222,12 +217,13 @@ def load_vdb_volume(filename, size):
             
         m = np.max(data)
         if m > 0: data /= m
-        return np.ascontiguousarray(data, dtype=np.float32)
+        return min_w, max_w, np.ascontiguousarray(data, dtype=np.float32)
     except Exception as e:
         print(f"Error loading VDB, using fallback noise: {e}")
         x = np.linspace(-1, 1, size)
         X, Y, Z = np.meshgrid(x, x, x, indexing='ij')
         return np.exp(-4 * (X**2 + Y**2 + Z**2)).astype(np.float32)
+    
 
 # ==========================================
 # 2. RENDERER SYSTEM (The Engine)
@@ -385,7 +381,7 @@ class Renderer:
         glBlitFramebuffer(0, 0, self.width, self.height, 0, 0, self.width, self.height, GL_COLOR_BUFFER_BIT, GL_NEAREST)
         glDeleteFramebuffers(1, [fb])
     
-    def rasterize_gaussians(self, gaussians):
+    def rasterize_gaussians(self, gaussians, vol_min, vol_max):
         if gaussians is None or len(gaussians) == 0:
             print("No gaussians to rasterize")
             return
@@ -411,12 +407,9 @@ class Renderer:
 
             cursor["gGaussians"] = self.gaussian_buffer
             cursor["gGaussianVolume"] = self.gaussian_volume_tex
-            gaussian_positions = gaussians[:, :3]  # x,y,z
-            volume_min_world = gaussian_positions.min(axis=0)
-            volume_max_world = gaussian_positions.max(axis=0)
 
-            cursor["GaussianParams"]["volumeMinWorld"] = tuple(volume_min_world)
-            cursor["GaussianParams"]["volumeMaxWorld"] = tuple(volume_max_world)
+            cursor["GaussianParams"]["volumeMinWorld"] = tuple(vol_min)
+            cursor["GaussianParams"]["volumeMaxWorld"] = tuple(vol_max)
 
 
             cursor["GaussianParams"]["gaussianCount"] = self.gaussian_count
@@ -467,18 +460,24 @@ class App:
         self.device = spy.Device(enable_debug_layers=True, compiler_options={"include_paths": [example_dir]})
         
         # Load Data
-        vol = load_vdb_volume(VDB_FILE, VOL_SIZE)
+        self.vol_min_world, self.vol_max_world, vol = load_vdb_volume(VDB_FILE, VOL_SIZE)
         self.renderer = Renderer(self.device, vol)
         self.renderer.resize(self.width, self.height)
 
         self.gaussians = load_vdb_as_gaussians_voxel_sampling(
             VDB_FILE,
-            probability_scale=0.05,
-            sigma_scale=1.0,
+            probability_scale=0.005,
+            sigma_scale=3.0,
             jitter_scale=0.5
         )
 
-        self.renderer.rasterize_gaussians(self.gaussians)
+
+        # 5. Rasterize using the MASTER BOUNDS
+        self.renderer.rasterize_gaussians(
+            self.gaussians, 
+            self.vol_min_world, 
+            self.vol_max_world
+        )
 
 
     def run(self):
