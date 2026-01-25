@@ -24,11 +24,30 @@ SHADER_FILE = "hybrid.slang"
 
 class Settings:
     def __init__(self):
+        # Basic
         self.step_size = 0.015
         self.density_scale = 40.0
-        self.density_curve = 0.6
+        self.density_curve = 1.0
         self.step_count = 256
         self.smoke_color = [0.9, 0.95, 1.0]
+
+        # Lighting & Shadows
+        self.light_penetration = 0.15   # The "Fluffiness" factor
+        self.phase_g = 0.4 # https://en.wikipedia.org/wiki/Henyey%E2%80%93Greenstein_phase_function - would be 0.7 - 0.9
+        
+        self.sun_direction = [1.0, -1.0, 0.0]
+        self.sun_color_base = [1.0, 0.9, 0.7]
+        self.sun_intensity = 8.0
+        
+        self.ambient_color_base = [0.6, 0.7, 0.8]
+        self.ambient_intensity = 0.6
+        
+        self.shadow_steps = 6
+        self.shadow_step_mult = 4.0
+    
+    # UNNORMALIZED!
+    def get_sun_dir(self):
+        return self.sun_direction
 
 class Camera:
     def __init__(self, w, h):
@@ -107,15 +126,10 @@ def convert_grid_to_dense_volume(grid, size):
     Returns: (min_world, max_world, dense_volume_data)
     """
     if grid is None:
-        # Fallback noise generation if grid failed to load
-        print("Using fallback noise volume.")
-        x = np.linspace(-1, 1, size)
-        X, Y, Z = np.meshgrid(x, x, x, indexing='ij')
-        dummy_data = np.exp(-4 * (X**2 + Y**2 + Z**2)).astype(np.float32)
-        # Return dummy bounds
-        return np.array([-1,-1,-1]), np.array([1,1,1]), dummy_data
+        print("Error! Grid is None!")
+        return None
 
-    # --- 1. Calculate Bounds ---
+    # Calculate Bounds
     bbox = grid.evalActiveVoxelBoundingBox()
     min_i, max_i = np.array(bbox[0]), np.array(bbox[1])
     center = (min_i + max_i) / 2.0
@@ -133,7 +147,7 @@ def convert_grid_to_dense_volume(grid, size):
     min_w = np.array(transform.indexToWorld(tuple(min_index_bound)))
     max_w = np.array(transform.indexToWorld(tuple(max_index_bound)))
     
-    # --- 2. Dense Sampling ---
+    # Dense Sampling
     accessor = grid.getAccessor()
     data = np.zeros((size, size, size), dtype=np.float32)
     inv_size = 1.0 / size
@@ -210,7 +224,7 @@ def convert_grid_to_gaussians(
     
 
 # ==========================================
-# 2. RENDERER SYSTEM (The Engine)
+# 2. RENDERER SYSTEM
 # ==========================================
 
 class Renderer:
@@ -220,7 +234,7 @@ class Renderer:
         self.last_mod_time = 0
         self.error_msg = ""
         
-        # 1. Static Resources
+        # Static Resources
         self.linear_sampler = device.create_sampler(
             min_filter=spy.TextureFilteringMode.linear,
             mag_filter=spy.TextureFilteringMode.linear,
@@ -241,9 +255,9 @@ class Renderer:
         device.submit_command_buffer(cmd.finish())
 
         self.cam_buffer = device.create_buffer(size=64, usage=spy.BufferUsage.shader_resource, memory_type=spy.MemoryType.upload)
-        self.settings_buffer = device.create_buffer(size=64, usage=spy.BufferUsage.shader_resource, memory_type=spy.MemoryType.upload)
+        self.settings_buffer = device.create_buffer(size=128, usage=spy.BufferUsage.shader_resource, memory_type=spy.MemoryType.upload)
 
-        # 2. Dynamic Resources (Resizeable)
+        # Dynamic Resources (Resizeable)
         self.screen_tex = None
         self.display_gl_tex = None
         self.width, self.height = 0, 0
@@ -271,7 +285,7 @@ class Renderer:
 
         self.use_gaussian_volume = False
 
-        # 3. Initial Compile
+        # Initial Compile
         self.check_hot_reload()
 
     def resize(self, w, h):
@@ -316,15 +330,39 @@ class Renderer:
         # Safety check
         if not self.pipeline: return
 
-        # Update Uniforms
         self.cam_buffer.copy_from_numpy(camera.get_gpu_data(self.width / self.height))
         
-        s_data = np.zeros(8, dtype=np.float32)
+        # PACK SETTINGS BUFFER (24 floats only!!!!)
+        s_data = np.zeros(24, dtype=np.float32)
+        
+        # [0-6] Basic
         s_data[0] = settings.step_size
         s_data[1] = settings.density_scale
         s_data[2] = settings.density_curve
         s_data[3] = float(settings.step_count)
         s_data[4:7] = settings.smoke_color
+        
+        # [7-8] Params
+        s_data[7] = settings.light_penetration
+        s_data[8] = settings.phase_g
+        
+        # [9-11] Sun Dir
+        s_data[9:12] = settings.get_sun_dir()
+        
+        # [12-14] Sun Color (Base * Intensity)
+        s_data[12] = settings.sun_color_base[0] * settings.sun_intensity
+        s_data[13] = settings.sun_color_base[1] * settings.sun_intensity
+        s_data[14] = settings.sun_color_base[2] * settings.sun_intensity
+        
+        # [15-17] Ambient Color (Base * Intensity)
+        s_data[15] = settings.ambient_color_base[0] * settings.ambient_intensity
+        s_data[16] = settings.ambient_color_base[1] * settings.ambient_intensity
+        s_data[17] = settings.ambient_color_base[2] * settings.ambient_intensity
+        
+        # [18-19] Shadows
+        s_data[18] = float(settings.shadow_steps)
+        s_data[19] = settings.shadow_step_mult
+
         self.settings_buffer.copy_from_numpy(s_data)
 
         # Encode
@@ -395,7 +433,6 @@ class Renderer:
             cursor["GaussianParams"]["volumeMinWorld"] = tuple(vol_min)
             cursor["GaussianParams"]["volumeMaxWorld"] = tuple(vol_max)
 
-
             cursor["GaussianParams"]["gaussianCount"] = self.gaussian_count
             cursor["GaussianParams"]["volumeResolution"] = (VOL_SIZE, VOL_SIZE, VOL_SIZE)
             cursor["GaussianParams"]["voxelSize"] = 1.0
@@ -413,7 +450,7 @@ class Renderer:
 
 
 # ==========================================
-# 3. APP CLASS (Window & UI)
+# 3. APP CLASS
 # ==========================================
 
 class App:
@@ -450,8 +487,8 @@ class App:
 
         self.gaussians = convert_grid_to_gaussians(
             grid,
-            probability_scale=0.005,
-            sigma_scale=3.0,
+            probability_scale=0.01,
+            sigma_scale=5.0,
             jitter_scale=0.5
         )
 
@@ -545,16 +582,45 @@ class App:
             else:
                 imgui.text_colored(imgui.ImVec4(0, 1, 0, 1), "Shader Active")
             
+            imgui.text("Raymarcher")
             imgui.separator()
             _, self.settings.density_scale = imgui.slider_float("Density", self.settings.density_scale, 1.0, 200.0)
-            _, self.settings.step_size = imgui.slider_float("Step Size", self.settings.step_size, 0.001, 0.05)
-            _, self.settings.step_count = imgui.slider_int("Step Count", self.settings.step_count, 10, 2000)
             _, self.settings.density_curve = imgui.slider_float("Gamma", self.settings.density_curve, 0.1, 2.0)
-            _, self.settings.smoke_color = imgui.color_edit3("Color", self.settings.smoke_color)
-            changed, self.renderer.use_gaussian_volume = imgui.checkbox(
-                "Render Gaussian Volume",
-                self.renderer.use_gaussian_volume
-            )
+            _, self.settings.step_size = imgui.slider_float("Step Size", self.settings.step_size, 0.001, 0.05)
+            _, self.settings.step_count = imgui.slider_int("Max Steps", self.settings.step_count, 10, 500)
+            
+            imgui.dummy((0, 10))
+            imgui.text("Lighting")
+            imgui.separator()
+            
+            # Sun Controls
+            _, self.settings.sun_direction = imgui.slider_float3("Sun Pitch", self.settings.sun_direction, -1.0, 1.0)
+            _, self.settings.sun_intensity = imgui.slider_float("Sun Intensity", self.settings.sun_intensity, 0.0, 20.0)
+            _, self.settings.sun_color_base = imgui.color_edit3("Sun Color", self.settings.sun_color_base)
+            
+            # Ambient
+            _, self.settings.ambient_intensity = imgui.slider_float("Amb Intensity", self.settings.ambient_intensity, 0.0, 2.0)
+            _, self.settings.ambient_color_base = imgui.color_edit3("Amb Color", self.settings.ambient_color_base)
+
+            imgui.dummy((0, 10))
+            imgui.text("Volumetric Look")
+            imgui.separator()
+            
+            # The Magic Sliders
+            _, self.settings.light_penetration = imgui.slider_float("Fluffiness (Penetration)", self.settings.light_penetration, 0.01, 1.0)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Low = Light goes deep (White Clouds)\nHigh = Light blocked early (Dark Smoke)")
+                
+            _, self.settings.phase_g = imgui.slider_float("Silver Lining (Phase G)", self.settings.phase_g, -0.9, 0.9)
+            
+            _, self.settings.shadow_steps = imgui.slider_int("Shadow Steps", self.settings.shadow_steps, 1, 16)
+            _, self.settings.shadow_step_mult = imgui.slider_float("Shadow Step Mult", self.settings.shadow_step_mult, 1.0, 10.0)
+
+            imgui.dummy((0, 10))
+            _, self.settings.smoke_color = imgui.color_edit3("Smoke Albedo", self.settings.smoke_color)
+            
+            changed, self.renderer.use_gaussian_volume = imgui.checkbox("Render Gaussian Volume", self.renderer.use_gaussian_volume)
+            
         imgui.end()
 
     def cleanup(self):
