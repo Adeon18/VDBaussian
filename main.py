@@ -17,6 +17,8 @@ import itertools
 VDB_FILE = "cloud_01_variant_0000.vdb" 
 VOL_SIZE = 128
 SHADER_FILE = "hybrid.slang"
+TILE_SIZE = 4
+
 
 # ==========================================
 # 1. DATA & LOGIC CLASSES
@@ -287,6 +289,145 @@ class Renderer:
 
         # Initial Compile
         self.check_hot_reload()
+    
+    def init_training(self):
+        
+        # Tile Params
+        # Integer division to get tile counts
+        self.tile_res = (
+            (VOL_SIZE + TILE_SIZE - 1) // TILE_SIZE,
+            (VOL_SIZE + TILE_SIZE - 1) // TILE_SIZE,
+            (VOL_SIZE + TILE_SIZE - 1) // TILE_SIZE
+        )
+        total_tiles = self.tile_res[0] * self.tile_res[1] * self.tile_res[2]
+        MAX_GAUSSIANS_PER_TILE = 64
+        
+        self.grad_buffer = self.device.create_buffer(
+            element_count=self.gaussian_count * 5, # Total floats
+            struct_size=4, # float is 4 bytes
+            usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
+            memory_type=spy.MemoryType.device_local
+        )
+        
+        # 2. Tile Content Buffer (FIXED)
+        # MUST use element_count/struct_size, NOT size/format!
+        self.tile_content = self.device.create_buffer(
+            element_count=total_tiles * MAX_GAUSSIANS_PER_TILE,
+            struct_size=4, # uint is 4 bytes
+            usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
+            memory_type=spy.MemoryType.device_local
+        )
+        
+        # 3. Tile Counts Buffer (FIXED)
+        self.tile_counts = self.device.create_buffer(
+            element_count=total_tiles, 
+            struct_size=4, # uint is 4 bytes
+            usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
+            memory_type=spy.MemoryType.device_local
+        )
+
+        # 4. Pipelines
+        print("Compiling Kernels...")
+        
+        prog_clear_grads = self.device.load_program("training.slang", ["clear_gradients"])
+        self.pipe_clear_grads = self.device.create_compute_pipeline(program=prog_clear_grads)
+        
+        prog_clear_tiles = self.device.load_program("training.slang", ["clear_tiles"])
+        self.pipe_clear_tiles = self.device.create_compute_pipeline(program=prog_clear_tiles)
+
+        prog_bin = self.device.load_program("training.slang", ["bin_gaussians"])
+        self.pipe_bin = self.device.create_compute_pipeline(program=prog_bin)
+
+        prog_train = self.device.load_program("training.slang", ["train_main"])
+        self.pipe_train = self.device.create_compute_pipeline(program=prog_train)
+
+        prog_optim = self.device.load_program("training.slang", ["optimizer_main"])
+        self.pipe_optim = self.device.create_compute_pipeline(program=prog_optim)
+
+    def run_training_step(self, vol_min, vol_max):
+        cmd = self.device.create_command_encoder()
+        
+        # Params Setup
+        total_tiles = self.tile_res[0] * self.tile_res[1] * self.tile_res[2]
+
+        # 1. Clear Gradients
+        with cmd.begin_compute_pass() as cp:
+            root_object = cp.bind_pipeline(self.pipe_clear_grads)
+            cursor = spy.ShaderCursor(root_object)
+            cursor["gGradientsRaw"] = self.grad_buffer
+            cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
+            
+            # FIX: Double parens for tuple
+            threads = self.gaussian_count * 5
+            cp.dispatch(thread_count=(threads, 1, 1))
+            
+        # 2. Clear Tiles
+        with cmd.begin_compute_pass() as cp:
+            root_object = cp.bind_pipeline(self.pipe_clear_tiles)
+            cursor = spy.ShaderCursor(root_object)
+            cursor["gTileCounts"] = self.tile_counts
+            cursor["TrainParams"]["tileResolution"] = self.tile_res
+            cursor["TrainParams"]["totalTiles"] = total_tiles
+
+            # FIX: Double parens for tuple
+            groups = (total_tiles + 255) // 256
+            # print("Total tiles:", total_tiles)
+            # print("Groups:", groups)
+            # print("Tile Res:", self.tile_res)
+            # print("VOL size:", VOL_SIZE)
+            # print("TILE size:", TILE_SIZE)
+            cp.dispatch(thread_count=(total_tiles, 1, 1))
+
+        # 3. Bin Gaussians (The Tiler)
+        with cmd.begin_compute_pass() as cp:
+            root_object = cp.bind_pipeline(self.pipe_bin)
+            cursor = spy.ShaderCursor(root_object)
+            
+            cursor["gGaussians"] = self.gaussian_buffer
+            cursor["gTileContent"] = self.tile_content
+            cursor["gTileCounts"] = self.tile_counts
+            cursor["TrainParams"]["volumeResolution"] = (VOL_SIZE, VOL_SIZE, VOL_SIZE)
+            cursor["TrainParams"]["tileResolution"] = self.tile_res
+            cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
+            cursor["TrainParams"]["minWorld"] = tuple(vol_min)
+            cursor["TrainParams"]["maxWorld"] = tuple(vol_max)
+            
+            # FIX: Double parens for tuple
+            cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
+
+
+        # 4. Train (Using Tiled Access)
+        with cmd.begin_compute_pass() as cp:
+            root_object = cp.bind_pipeline(self.pipe_train)
+            cursor = spy.ShaderCursor(root_object)
+            
+            cursor["ReferenceVol"] = self.volume_tex 
+            cursor["gGaussians"] = self.gaussian_buffer
+            cursor["gGradientsRaw"] = self.grad_buffer
+            cursor["gTileContent"] = self.tile_content
+            cursor["gTileCounts"] = self.tile_counts
+            cursor["TrainParams"]["volumeResolution"] = (VOL_SIZE, VOL_SIZE, VOL_SIZE)
+            cursor["TrainParams"]["tileResolution"] = self.tile_res
+            cursor["TrainParams"]["minWorld"] = tuple(vol_min)
+            cursor["TrainParams"]["maxWorld"] = tuple(vol_max)
+            
+            cp.dispatch(thread_count=(VOL_SIZE, VOL_SIZE, VOL_SIZE))
+
+        # 5. Optimize
+        with cmd.begin_compute_pass() as cp:
+            root_object = cp.bind_pipeline(self.pipe_optim)
+            cursor = spy.ShaderCursor(root_object)
+            
+            cursor["gGaussians"] = self.gaussian_buffer
+            cursor["gGradientsRaw"] = self.grad_buffer
+            cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
+            cursor["TrainParams"]["learningRatePos"] = 0.001
+            cursor["TrainParams"]["learningRateWeight"] = 0.03
+            
+            # FIX: Double parens for tuple
+            cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
+
+        self.device.submit_command_buffer(cmd.finish())
 
     def resize(self, w, h):
         if w == self.width and h == self.height: return
@@ -404,18 +545,15 @@ class Renderer:
         glDeleteFramebuffers(1, [fb])
     
     def rasterize_gaussians(self, gaussians, vol_min, vol_max):
-        if gaussians is None or len(gaussians) == 0:
-            print("No gaussians to rasterize")
-            return
-
-        self.gaussian_count = len(gaussians)
-
-        self.gaussian_buffer = self.device.create_buffer(
-            size=gaussians.nbytes,
-            usage=spy.BufferUsage.shader_resource,
-            memory_type=spy.MemoryType.upload
-        )
-        self.gaussian_buffer.copy_from_numpy(gaussians)
+        if gaussians is not None:
+            self.gaussian_count = len(gaussians)
+            self.gaussian_buffer = self.device.create_buffer(
+                element_count=self.gaussian_count,
+                struct_size=20, # 5 floats * 4 bytes = 20 bytes
+                usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+                memory_type=spy.MemoryType.device_local,
+                data=gaussians 
+            )
 
         # Clear volume
         cmd = self.device.create_command_encoder()
@@ -472,6 +610,7 @@ class App:
         imgui.backends.glfw_init_for_opengl(window_address, True)
         imgui.backends.opengl3_init("#version 330")
 
+        self.is_training = False
         # Logic
         self.settings = Settings()
         self.camera = Camera(self.width, self.height)
@@ -489,13 +628,15 @@ class App:
             grid,
             probability_scale=0.01,
             sigma_scale=5.0,
-            jitter_scale=0.5
+            jitter_scale=1
         )
 
         self.renderer = Renderer(self.device, vol_data)
         self.renderer.resize(self.width, self.height)
 
         self.renderer.rasterize_gaussians(self.gaussians, self.vol_min_world, self.vol_max_world)
+
+        self.renderer.init_training()
 
 
     def run(self):
@@ -530,6 +671,32 @@ class App:
 
             # Render Scene
             try:
+                # --- THE TRAINING LOOP ---
+                if self.is_training:
+                    # 1. Update Gaussians (Compute Gradients & Step)
+                    self.renderer.run_training_step(self.vol_min_world, self.vol_max_world)
+
+                    tile_debug = self.renderer.tile_counts.to_numpy().view(dtype=np.uint32)
+                    total_refs = np.sum(tile_debug)
+                    
+                    # Gradients: View bytes as float32, THEN take the first 25 floats
+                    # (Note: Use float32 because we are treating them as floats in the Python check now)
+                    grad_bytes = self.renderer.grad_buffer.to_numpy()
+                    grad_debug = grad_bytes.view(dtype=np.float32)[:25]
+                    
+                    if total_refs == 0:
+                        print(f"[CRITICAL] Tiler is empty! (Total Refs: {total_refs})")
+                    elif np.all(grad_debug == 0):
+                        print(f"[ALERT] Tiler works ({total_refs} refs) but Gradients are ZERO.")
+                    else:
+                        print(f"[OK] Training Running. Refs: {total_refs}, GradMax: {np.max(np.abs(grad_debug)):.6f}")
+                    
+                    # 2. Update 3D Texture (Burn new gaussians into volume)
+                    # We pass 'None' for gaussians array because the data is already on GPU buffer!
+                    # Note: You might need to tweak rasterize_gaussians to handle "GPU-resident" data
+                    # if it tries to re-upload numpy arrays every time.
+                    # For now, assuming it re-uses self.gaussian_buffer if gaussians is None:
+                    self.renderer.rasterize_gaussians(None, self.vol_min_world, self.vol_max_world)
                 self.renderer.render(self.camera, self.settings)
                 self.renderer.update_display()
             except Exception as e:
@@ -620,6 +787,13 @@ class App:
             _, self.settings.smoke_color = imgui.color_edit3("Smoke Albedo", self.settings.smoke_color)
             
             changed, self.renderer.use_gaussian_volume = imgui.checkbox("Render Gaussian Volume", self.renderer.use_gaussian_volume)
+
+            imgui.separator()
+            if imgui.button("Start Training" if not self.is_training else "Stop Training"):
+                self.is_training = not self.is_training
+            
+            if self.is_training:
+                imgui.text_colored((0,1,0,1), "TRAINING ACTIVE")
             
         imgui.end()
 
