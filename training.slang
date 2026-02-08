@@ -1,7 +1,6 @@
 // training.slang
 
 // --- DEFINITIONS ---
-static const uint TILE_SIZE = 4; // Each tile is 4x4x4 voxels
 static const uint MAX_GAUSSIANS_PER_TILE = 64; 
 
 // --- BINDINGS ---
@@ -24,9 +23,11 @@ cbuffer TrainParams {
     float3 minWorld;
     float3 maxWorld;
     float learningRatePos;
+    float learningRateSigma;
     float learningRateWeight;
     uint3 tileResolution; // volumeResolution / TILE_SIZE
     uint totalTiles;
+    uint tileSize;
 };
 
 // --- HELPERS ---
@@ -37,7 +38,7 @@ int3 WorldToVoxel(float3 pos) {
 
 // Map a Voxel Coordinate to a Flattened Tile Index
 uint GetTileIndex(uint3 voxelID) {
-    uint3 tileID = voxelID / TILE_SIZE;
+    uint3 tileID = voxelID / tileSize;
     // Clamp to be safe
     tileID = min(tileID, tileResolution - 1);
     // Flatten: z * (w*h) + y * w + x
@@ -68,8 +69,8 @@ void bin_gaussians(uint3 tid : SV_DispatchThreadID) {
     int3 min_vox = WorldToVoxel(g.pos - radius);
     int3 max_vox = WorldToVoxel(g.pos + radius);
     
-    uint3 min_tile = max(int3(0), min_vox) / TILE_SIZE;
-    uint3 max_tile = min(int3(volumeResolution)/TILE_SIZE - 1, max_vox / TILE_SIZE);
+    uint3 min_tile = max(int3(0), min_vox) / tileSize;
+    uint3 max_tile = min(int3(volumeResolution)/tileSize - 1, max_vox / tileSize);
     
     // 2. Loop over touched tiles and append ID
     for (uint z = min_tile.z; z <= max_tile.z; ++z) {
@@ -110,7 +111,7 @@ void atomicAccumulate(uint idx, float val) {
 float3 load_pos(uint index) { return gGaussians[index].pos; }
 void load_pos_bwd(uint index, float3 dOut) {
     uint base = index * 5;
-    atomicAccumulate(base+0, 1.0);
+    atomicAccumulate(base+0, dOut.x);
     atomicAccumulate(base+1, dOut.y);
     atomicAccumulate(base+2, dOut.z);
 }
@@ -203,7 +204,7 @@ void optimizer_main(uint3 tid : SV_DispatchThreadID) {
     float dWeight = asfloat(gGradientsRaw[base+4]);
     Gaussian g = gGaussians[idx];
     g.pos    -= dPos * learningRatePos;
-    g.sigma  -= dSigma * learningRatePos;
+    g.sigma  -= dSigma * learningRateSigma;
     g.weight -= dWeight * learningRateWeight;
     g.sigma = max(0.01, g.sigma);
     g.weight = max(0.0, g.weight);
