@@ -1,51 +1,133 @@
 // training.slang
 
-// --- DEFINITIONS ---
-static const uint MAX_GAUSSIANS_PER_TILE = 64; 
+// Training workgroup dimensions (must match kernel dispatch)
+static const uint TRAIN_WG_X = 4;
+static const uint TRAIN_WG_Y = 4;
+static const uint TRAIN_WG_Z = 4;
+static const uint TRAIN_WG_SIZE = TRAIN_WG_X * TRAIN_WG_Y * TRAIN_WG_Z;
 
-// --- BINDINGS ---
-struct Gaussian { float3 pos; float sigma; float weight; };
+// DEFINITIONS
+static const uint MAX_GAUSSIANS_PER_TILE = 64;
 
+// PARAMETER LAYOUT CONFIGURATION
+static const uint PARAM_POS_X = 0;
+static const uint PARAM_POS_Y = 1;
+static const uint PARAM_POS_Z = 2;
+static const uint PARAM_SIGMA = 3;
+static const uint PARAM_WEIGHT = 4;
+static const uint PARAMS_PER_GAUSSIAN = 5;
+
+// Learning rate groups (indices to learningRates arr)
+static const uint LR_GROUP_POSITION = 0;
+static const uint LR_GROUP_SIGMA = 1;
+static const uint LR_GROUP_WEIGHT = 2;
+static const uint NUM_LR_GROUPS = 3;
+
+// GAUSSIAN STRUCTURE
+struct Gaussian 
+{
+    float3 pos;
+    float sigma;
+    float weight;
+    
+    static float getParam(uint gaussianID, uint paramID)
+    {
+        return asfloat(gGaussianParamsRaw[gaussianID * PARAMS_PER_GAUSSIAN + paramID]);
+    }
+    
+    static void setParam(uint gaussianID, uint paramID, float value)
+    {
+        gGaussianParamsRaw[gaussianID * PARAMS_PER_GAUSSIAN + paramID] = asuint(value);
+    }
+    
+    // Convenience loaders
+    static Gaussian load(uint gaussianID)
+    {
+        Gaussian g;
+        g.pos.x = getParam(gaussianID, PARAM_POS_X);
+        g.pos.y = getParam(gaussianID, PARAM_POS_Y);
+        g.pos.z = getParam(gaussianID, PARAM_POS_Z);
+        g.sigma = getParam(gaussianID, PARAM_SIGMA);
+        g.weight = getParam(gaussianID, PARAM_WEIGHT);
+        return g;
+    }
+    
+    static void store(uint gaussianID, Gaussian g)
+    {
+        setParam(gaussianID, PARAM_POS_X, g.pos.x);
+        setParam(gaussianID, PARAM_POS_Y, g.pos.y);
+        setParam(gaussianID, PARAM_POS_Z, g.pos.z);
+        setParam(gaussianID, PARAM_SIGMA, g.sigma);
+        setParam(gaussianID, PARAM_WEIGHT, g.weight);
+    }
+};
+
+// BINDINGS
 [[vk::binding(0)]] Texture3D<float> ReferenceVol;
-[[vk::binding(1)]] RWStructuredBuffer<Gaussian> gGaussians;
+[[vk::binding(1)]] RWStructuredBuffer<uint> gGaussianParamsRaw;  // Raw floab buffer
 [[vk::binding(2)]] RWStructuredBuffer<uint> gGradientsRaw;
-
-// --- NEW: THE TILE BUFFER ---
-// flattened size = (Res/4)^3 * MAX_GAUSSIANS_PER_TILE
-// Content: List of Gaussian Indices. 
-// We also need a counter buffer to know how many are in each tile.
 [[vk::binding(3)]] RWStructuredBuffer<uint> gTileContent; 
 [[vk::binding(4)]] RWStructuredBuffer<uint> gTileCounts; 
+[[vk::binding(5)]] RWStructuredBuffer<float> gAdamFirstMoment;
+[[vk::binding(6)]] RWStructuredBuffer<float> gAdamSecondMoment;
+
+groupshared float reductionBuffer[TRAIN_WG_SIZE];
+
 
 cbuffer TrainParams {
     uint3 volumeResolution;
     uint  gaussianCount;
     float3 minWorld;
     float3 maxWorld;
-    float learningRatePos;
-    float learningRateSigma;
-    float learningRateWeight;
-    uint3 tileResolution; // volumeResolution / TILE_SIZE
+    
+    // Generic learning rates (indexed by LR_GROUP_*)
+    float learningRates[NUM_LR_GROUPS];
+    
+    uint3 tileResolution;
     uint totalTiles;
     uint tileSize;
+    
+    float adamBeta1;
+    float adamBeta2;
+    float adamEpsilon;
+    uint adamIteration;
 };
 
-// --- HELPERS ---
+// Maps each parameter to its learning rate group and constraints
+struct ParamMetadata
+{
+    uint lrGroup;
+    float minVal;
+    float maxVal;
+};
+
+static const ParamMetadata PARAM_META[PARAMS_PER_GAUSSIAN] = {
+    { LR_GROUP_POSITION, -1e6, 1e6 },   // pos.x
+    { LR_GROUP_POSITION, -1e6, 1e6 },   // pos.y
+    { LR_GROUP_POSITION, -1e6, 1e6 },   // pos.z
+    { LR_GROUP_SIGMA,    0.01, 1e6 },   // sigma
+    { LR_GROUP_WEIGHT,   0.0,  1.0 },   // weight
+};
+
+// HELPERS
 int3 WorldToVoxel(float3 pos) {
     float3 uvw = (pos - minWorld) / (maxWorld - minWorld);
     return int3(floor(uvw * float3(volumeResolution)));
 }
 
-// Map a Voxel Coordinate to a Flattened Tile Index
 uint GetTileIndex(uint3 voxelID) {
     uint3 tileID = voxelID / tileSize;
-    // Clamp to be safe
     tileID = min(tileID, tileResolution - 1);
-    // Flatten: z * (w*h) + y * w + x
     return tileID.z * (tileResolution.x * tileResolution.y) + tileID.y * tileResolution.x + tileID.x;
 }
 
-// --- KERNEL 1: CLEAR TILES ---
+// Compute local thread index within workgroup
+uint GetLocalThreadIndex(uint3 tid) {
+    uint3 local = tid % uint3(TRAIN_WG_X, TRAIN_WG_Y, TRAIN_WG_Z);
+    return local.x + local.y * TRAIN_WG_X + local.z * TRAIN_WG_X * TRAIN_WG_Y;
+}
+
+// CLEAR TILES
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void clear_tiles(uint3 tid : SV_DispatchThreadID)
@@ -54,36 +136,28 @@ void clear_tiles(uint3 tid : SV_DispatchThreadID)
     gTileCounts[tid.x] = 0;
 }
 
-// --- KERNEL 2: BIN GAUSSIANS (The Tiler) ---
-// One thread per Gaussian. Writes itself into the tiles it touches.
+// BIN GAUSSIANS
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void bin_gaussians(uint3 tid : SV_DispatchThreadID) {
     uint gid = tid.x;
     if (gid >= gaussianCount) return;
 
-    Gaussian g = gGaussians[gid];
+    Gaussian g = Gaussian::load(gid);
     
-    // 1. Calculate Bounding Box in Tile Space
-    float radius = g.sigma;
+    float radius = g.sigma * 3.0;
     int3 min_vox = WorldToVoxel(g.pos - radius);
     int3 max_vox = WorldToVoxel(g.pos + radius);
     
     uint3 min_tile = max(int3(0), min_vox) / tileSize;
     uint3 max_tile = min(int3(volumeResolution)/tileSize - 1, max_vox / tileSize);
     
-    // 2. Loop over touched tiles and append ID
     for (uint z = min_tile.z; z <= max_tile.z; ++z) {
         for (uint y = min_tile.y; y <= max_tile.y; ++y) {
             for (uint x = min_tile.x; x <= max_tile.x; ++x) {
-                
                 uint tileIdx = z * (tileResolution.x * tileResolution.y) + y * tileResolution.x + x;
-                
-                // Atomic Increment to get slot
                 uint slot;
                 InterlockedAdd(gTileCounts[tileIdx], 1, slot);
-                
-                // If tile is not full, write ID
                 if (slot < MAX_GAUSSIANS_PER_TILE) {
                     uint bufferIdx = tileIdx * MAX_GAUSSIANS_PER_TILE + slot;
                     gTileContent[bufferIdx] = gid;
@@ -93,7 +167,7 @@ void bin_gaussians(uint3 tid : SV_DispatchThreadID) {
     }
 }
 
-// --- STANDARD ATOMIC ACCUMULATORS ---
+// ATOMIC GRADIENT ACCUMULATION
 void atomicAccumulate(uint idx, float val) {
     if (val == 0.0) return;
     for (;;) {
@@ -107,22 +181,34 @@ void atomicAccumulate(uint idx, float val) {
     }
 }
 
-[BackwardDerivative(load_pos_bwd)]
-float3 load_pos(uint index) { return gGaussians[index].pos; }
-void load_pos_bwd(uint index, float3 dOut) {
-    uint base = index * 5;
-    atomicAccumulate(base+0, dOut.x);
-    atomicAccumulate(base+1, dOut.y);
-    atomicAccumulate(base+2, dOut.z);
+// DIFFERENTIABLE PARAMETER LOADERS
+[BackwardDerivative(loadParam_bwd)]
+float loadParam(uint gaussianID, uint paramID, uint localThreadIdx) {
+    return asfloat(gGaussianParamsRaw[gaussianID * PARAMS_PER_GAUSSIAN + paramID]);
 }
-[BackwardDerivative(load_sigma_bwd)]
-float load_sigma(uint index) { return gGaussians[index].sigma; }
-void load_sigma_bwd(uint index, float dOut) { atomicAccumulate(index*5+3, dOut); }
-[BackwardDerivative(load_weight_bwd)]
-float load_weight(uint index) { return gGaussians[index].weight; }
-void load_weight_bwd(uint index, float dOut) { atomicAccumulate(index*5+4, dOut); }
 
-// --- MATH ---
+void loadParam_bwd(uint gaussianID, uint paramID, uint localThreadIdx, float dOut) {
+    // Validate local thread index
+    if (localThreadIdx >= TRAIN_WG_SIZE) return;
+    
+    // Write gradient to shared memory
+    reductionBuffer[localThreadIdx] = dOut;
+    GroupMemoryBarrierWithGroupSync();
+    
+    // Binary reduction - automatically adapts to TRAIN_WG_SIZE
+    for (uint stride = TRAIN_WG_SIZE / 2; stride > 0; stride >>= 1) {
+        if (localThreadIdx < stride) {
+            reductionBuffer[localThreadIdx] += reductionBuffer[localThreadIdx + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    
+    // Thread 0 writes accumulated gradient
+    if (localThreadIdx == 0) {
+        atomicAccumulate(gaussianID * PARAMS_PER_GAUSSIAN + paramID, reductionBuffer[0]);
+    }
+}
+
 [Differentiable]
 float gaussian_math(float3 p, float3 mu, float sigma) {
     float3 d = p - mu;
@@ -130,7 +216,6 @@ float gaussian_math(float3 p, float3 mu, float sigma) {
     return exp(-0.5 * r2 / (sigma * sigma));
 }
 
-// --- DENSITY CALCULATION (TILED) ---
 [Differentiable]
 float compute_density_tiled(no_diff uint3 tid, no_diff float3 worldPos) {
     float density = 0.0;
@@ -138,23 +223,26 @@ float compute_density_tiled(no_diff uint3 tid, no_diff float3 worldPos) {
     uint tileIdx = GetTileIndex(tid);
     uint count = gTileCounts[tileIdx];
     count = min(count, MAX_GAUSSIANS_PER_TILE);
+
+    uint localThreadIdx = GetLocalThreadIndex(tid);
     
-    // FIX 1: [ForceUnroll]
-    // This forces the compiler to generate the code for all 64 iterations,
-    // which ensures the custom derivative (load_pos_bwd) is correctly linked.
     [ForceUnroll] 
     for(uint i=0; i<MAX_GAUSSIANS_PER_TILE; ++i) {
-        // Dynamic check to break early (simulates dynamic loop)
         if (i >= count) break;
 
         uint gid = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + i];
         
-        float3 g_pos = load_pos(gid);
-        float  g_sigma = load_sigma(gid);
-        float  g_weight = load_weight(gid);
+        // Load via generic accessor
+        float3 g_pos = float3(
+            loadParam(gid, PARAM_POS_X, localThreadIdx),
+            loadParam(gid, PARAM_POS_Y, localThreadIdx),
+            loadParam(gid, PARAM_POS_Z, localThreadIdx)
+        );
+        float g_sigma = loadParam(gid, PARAM_SIGMA, localThreadIdx);
+        float g_weight = loadParam(gid, PARAM_WEIGHT, localThreadIdx);
         
         float3 d = worldPos - g_pos;
-        if (no_diff(dot(d,d) > (g_sigma)*(g_sigma))) continue;
+        if (no_diff(dot(d,d) > (g_sigma * 3.0)*(g_sigma * 3.0))) continue;
 
         density += g_weight * gaussian_math(worldPos, g_pos, g_sigma);
     }
@@ -178,35 +266,106 @@ float compute_loss(
     return diff * diff;
 }
 
-// --- TRAIN KERNEL ---
+// TRAINING
 [shader("compute")]
-[numthreads(4, 4, 4)]
+[numthreads(TRAIN_WG_X, TRAIN_WG_Y, TRAIN_WG_Z)]
 void train_main(uint3 tid : SV_DispatchThreadID) {
     if (any(tid >= volumeResolution)) return;
-    // Note: We removed 'gaussianCount' from signature as it's not needed for the tiled loop
     bwd_diff(compute_loss)(tid, minWorld, maxWorld, volumeResolution, 1.0);
 }
 
-// --- GRADIENT CLEAR & OPTIMIZER REMAIN THE SAME ---
+// CLEAR GRADIENTS
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void clear_gradients(uint3 tid : SV_DispatchThreadID) {
-    if (tid.x < gaussianCount * 5) gGradientsRaw[tid.x] = 0;
+    if (tid.x < gaussianCount * PARAMS_PER_GAUSSIAN) {
+        gGradientsRaw[tid.x] = 0;
+    }
 }
+
+// SGD OPTIMIZER (GENERIC)
 [shader("compute")]
 [numthreads(256, 1, 1)]
-void optimizer_main(uint3 tid : SV_DispatchThreadID) {
+void optimizer_sgd(uint3 tid : SV_DispatchThreadID) {
+    uint gid = tid.x;
+    if (gid >= gaussianCount) return;
+    
+    // Process all parameters generically
+    for (uint paramID = 0; paramID < PARAMS_PER_GAUSSIAN; ++paramID) {
+        uint idx = gid * PARAMS_PER_GAUSSIAN + paramID;
+        float gradient = asfloat(gGradientsRaw[idx]);
+        float currentVal = asfloat(gGaussianParamsRaw[idx]);
+        
+        // Get metadata
+        ParamMetadata meta = PARAM_META[paramID];
+        float lr = learningRates[meta.lrGroup];
+        
+        // Update
+        float newVal = currentVal - gradient * lr;
+        
+        // Clamp
+        newVal = clamp(newVal, meta.minVal, meta.maxVal);
+        
+        gGaussianParamsRaw[idx] = asuint(newVal);
+    }
+}
+
+// ADAM OPTIMIZER
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void optimizer_adam(uint3 tid : SV_DispatchThreadID) {
+    uint gid = tid.x;
+    if (gid >= gaussianCount) return;
+    
+    // Bias correction terms (computed once per Gaussian)
+    float beta1_pow = pow(adamBeta1, float(adamIteration));
+    float beta2_pow = pow(adamBeta2, float(adamIteration));
+    
+    // Process all parameters generically
+    for (uint paramID = 0; paramID < PARAMS_PER_GAUSSIAN; ++paramID) {
+        uint idx = gid * PARAMS_PER_GAUSSIAN + paramID;
+        
+        float g_t = asfloat(gGradientsRaw[idx]);
+        float currentVal = asfloat(gGaussianParamsRaw[idx]);
+        
+        // Load previous moments
+        float m_t_prev = gAdamFirstMoment[idx];
+        float v_t_prev = gAdamSecondMoment[idx];
+        
+        // Update moments
+        float m_t = adamBeta1 * m_t_prev + (1.0 - adamBeta1) * g_t;
+        float v_t = adamBeta2 * v_t_prev + (1.0 - adamBeta2) * (g_t * g_t);
+        
+        // Store moments
+        gAdamFirstMoment[idx] = m_t;
+        gAdamSecondMoment[idx] = v_t;
+        
+        // Bias correction
+        float m_t_hat = m_t / (1.0 - beta1_pow);
+        float v_t_hat = v_t / (1.0 - beta2_pow);
+        
+        // Get metadata
+        ParamMetadata meta = PARAM_META[paramID];
+        float lr = learningRates[meta.lrGroup];
+        
+        // Compute update
+        float update = (lr / (sqrt(v_t_hat) + adamEpsilon)) * m_t_hat;
+        float newVal = currentVal - update;
+        
+        // Clamp
+        newVal = clamp(newVal, meta.minVal, meta.maxVal);
+        
+        gGaussianParamsRaw[idx] = asuint(newVal);
+    }
+}
+
+// INITIALIZE ADAM STATE
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void init_adam_state(uint3 tid : SV_DispatchThreadID) {
     uint idx = tid.x;
-    if (idx >= gaussianCount) return;
-    uint base = idx * 5;
-    float3 dPos   = float3(asfloat(gGradientsRaw[base]), asfloat(gGradientsRaw[base+1]), asfloat(gGradientsRaw[base+2]));
-    float dSigma  = asfloat(gGradientsRaw[base+3]);
-    float dWeight = asfloat(gGradientsRaw[base+4]);
-    Gaussian g = gGaussians[idx];
-    g.pos    -= dPos * learningRatePos;
-    g.sigma  -= dSigma * learningRateSigma;
-    g.weight -= dWeight * learningRateWeight;
-    g.sigma = max(0.01, g.sigma);
-    g.weight = max(0.0, g.weight);
-    gGaussians[idx] = g;
+    if (idx >= gaussianCount * PARAMS_PER_GAUSSIAN) return;
+    
+    gAdamFirstMoment[idx] = 0.0;
+    gAdamSecondMoment[idx] = 0.0;
 }

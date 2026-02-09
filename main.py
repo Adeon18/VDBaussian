@@ -10,11 +10,21 @@ from slangpy.math import uint3
 import random
 import openvdb as vdb
 import itertools
+import time
+
 
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
+
+ENABLE_PROFILING = True  # Toggle detailed timing measurements
+PROFILE_EVERY_N_FRAMES = 10  # Only profile every N iterations to reduce overhead
+PROFILE_WAIT_FOR_GPU = False
+
+# Debug Output
+PRINT_TILE_STATS = True  # Print tiling statistics
+PRINT_GRADIENT_STATS = True # Print gradient statistics
 
 VDB_FILE = "cloud_01_variant_0000.vdb" 
 VOL_SIZE = 128
@@ -36,6 +46,60 @@ CAMERA_SENSITIVITY = 0.1
 # ==========================================
 # DATA & LOGIC CLASSES
 # ==========================================
+
+class ProfilingContext:
+    """
+    Lightweight profiling context manager.
+    Zero overhead when ENABLE_PROFILING=False.
+    """
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self.timings = {}
+        self.current_label = None
+        self.start_time = None
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, *args):
+        pass
+    
+    def start(self, label):
+        """Start timing a labeled section"""
+        if not self.enabled:
+            return
+        self.current_label = label
+        self.start_time = time.perf_counter()
+    
+    def stop(self):
+        """Stop timing current section"""
+        if not self.enabled or self.current_label is None:
+            return
+        elapsed = time.perf_counter() - self.start_time
+        self.timings[self.current_label] = elapsed
+        self.current_label = None
+    
+    def print_summary(self, title="Profiling Results"):
+        """Print timing summary"""
+        if not self.enabled or not self.timings:
+            return
+        
+        print(f"\n{'='*60}")
+        print(f"{title:^60}")
+        print(f"{'='*60}")
+        
+        total = sum(self.timings.values())
+        
+        # Sort by time (slowest first)
+        sorted_timings = sorted(self.timings.items(), key=lambda x: x[1], reverse=True)
+        
+        for label, t in sorted_timings:
+            percent = (t / total * 100) if total > 0 else 0
+            print(f"  {label:30s}: {t*1000:7.2f} ms  ({percent:5.1f}%)")
+        
+        print(f"  {'-'*58}")
+        print(f"  {'TOTAL':30s}: {total*1000:7.2f} ms")
+        print(f"{'='*60}\n")
 
 class Settings:
     def __init__(self):
@@ -223,6 +287,24 @@ def convert_grid_to_gaussians(grid, config):
     print(f"Generated {len(gaussians)} gaussians.")
     return np.array(gaussians, dtype=np.float32)
     
+class TrainingConfig:
+    """Configurable training hyperparameters"""
+    def __init__(self):
+        # SGD Learning Rates
+        self.learning_rate_pos = 0.01
+        self.learning_rate_sigma = 0.001
+        self.learning_rate_weight = 0.01
+        
+        # Adam Hyperparameters
+        self.adam_beta1 = 0.9
+        self.adam_beta2 = 0.999
+        self.adam_epsilon = 1e-8
+        self.use_adam = True  # Toggle between SGD and Adam
+        
+        # Gaussian Generation
+        self.probability_scale = 0.01
+        self.sigma_scale = 5.0
+        self.jitter_scale = 100.0
 
 # ==========================================
 # RENDERER SYSTEM
@@ -269,13 +351,18 @@ class Renderer:
             label="GaussianVolume"
         )
 
-        self.gaussian_buffer = None
-        self.gaussian_count = 0
-
         self.gaussian_raster_program = device.load_program("3drasterizer.slang", ["main"])
         self.gaussian_raster_pipeline = device.create_compute_pipeline(program=self.gaussian_raster_program)
 
         self.use_gaussian_volume = False
+
+        self.gaussian_buffer = None
+        self.gaussian_count = 0
+        self.adam_iteration = 1  # Track iteration for bias correction
+        
+        # Adam state buffers (initialized later)
+        self.adam_first_moment = None
+        self.adam_second_moment = None
 
         self.check_hot_reload()
     
@@ -308,6 +395,20 @@ class Renderer:
             memory_type=spy.MemoryType.device_local
         )
 
+        self.adam_first_moment = self.device.create_buffer(
+            element_count=self.gaussian_count * 5,
+            struct_size=4,
+            usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
+            memory_type=spy.MemoryType.device_local
+        )
+        
+        self.adam_second_moment = self.device.create_buffer(
+            element_count=self.gaussian_count * 5,
+            struct_size=4,
+            usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
+            memory_type=spy.MemoryType.device_local
+        )
+
         print("Compiling Kernels...")
         
         prog_clear_grads = self.device.load_program("training.slang", ["clear_gradients"])
@@ -322,15 +423,42 @@ class Renderer:
         prog_train = self.device.load_program("training.slang", ["train_main"])
         self.pipe_train = self.device.create_compute_pipeline(program=prog_train)
 
-        prog_optim = self.device.load_program("training.slang", ["optimizer_main"])
-        self.pipe_optim = self.device.create_compute_pipeline(program=prog_optim)
+        prog_optim_sgd = self.device.load_program("training.slang", ["optimizer_sgd"])
+        self.pipe_optim_sgd = self.device.create_compute_pipeline(program=prog_optim_sgd)
+        
+        prog_optim_adam = self.device.load_program("training.slang", ["optimizer_adam"])
+        self.pipe_optim_adam = self.device.create_compute_pipeline(program=prog_optim_adam)
+        
+        prog_init_adam = self.device.load_program("training.slang", ["init_adam_state"])
+        self.pipe_init_adam = self.device.create_compute_pipeline(program=prog_init_adam)
+        
+        
+        # Initialize Adam state to zeros
+        self._init_adam_state()
+    
+    def _init_adam_state(self):
+        """Initialize Adam momentum buffers to zero"""
+        cmd = self.device.create_command_encoder()
+        
+        with cmd.begin_compute_pass() as cp:
+            root_object = cp.bind_pipeline(self.pipe_init_adam)
+            cursor = spy.ShaderCursor(root_object)
+            cursor["gAdamFirstMoment"] = self.adam_first_moment
+            cursor["gAdamSecondMoment"] = self.adam_second_moment
+            cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
+            
+            threads = self.gaussian_count * 5
+            cp.dispatch(thread_count=(threads, 1, 1))
+        
+        self.device.submit_command_buffer(cmd.finish())
+        self.adam_iteration = 1
 
     def run_training_step(self, vol_min, vol_max, train_config):
         cmd = self.device.create_command_encoder()
         
         total_tiles = self.tile_res[0] * self.tile_res[1] * self.tile_res[2]
 
-        # Clear Gradients
+        # 1. Clear Gradients
         with cmd.begin_compute_pass() as cp:
             root_object = cp.bind_pipeline(self.pipe_clear_grads)
             cursor = spy.ShaderCursor(root_object)
@@ -338,10 +466,10 @@ class Renderer:
             cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
             cursor["TrainParams"]["tileSize"] = TILE_SIZE
             
-            threads = self.gaussian_count * 5
+            threads = self.gaussian_count * 5  # Still 5 params per Gaussian
             cp.dispatch(thread_count=(threads, 1, 1))
             
-        # Clear Tiles
+        # 2. Clear Tiles
         with cmd.begin_compute_pass() as cp:
             root_object = cp.bind_pipeline(self.pipe_clear_tiles)
             cursor = spy.ShaderCursor(root_object)
@@ -349,15 +477,14 @@ class Renderer:
             cursor["TrainParams"]["tileResolution"] = self.tile_res
             cursor["TrainParams"]["totalTiles"] = total_tiles
             cursor["TrainParams"]["tileSize"] = TILE_SIZE
-
             cp.dispatch(thread_count=(total_tiles, 1, 1))
 
-        # Bin Gaussians
+        # 3. Bin Gaussians
         with cmd.begin_compute_pass() as cp:
             root_object = cp.bind_pipeline(self.pipe_bin)
             cursor = spy.ShaderCursor(root_object)
             
-            cursor["gGaussians"] = self.gaussian_buffer
+            cursor["gGaussianParamsRaw"] = self.gaussian_buffer
             cursor["gTileContent"] = self.tile_content
             cursor["gTileCounts"] = self.tile_counts
             cursor["TrainParams"]["volumeResolution"] = (VOL_SIZE, VOL_SIZE, VOL_SIZE)
@@ -366,16 +493,15 @@ class Renderer:
             cursor["TrainParams"]["minWorld"] = tuple(vol_min)
             cursor["TrainParams"]["maxWorld"] = tuple(vol_max)
             cursor["TrainParams"]["tileSize"] = TILE_SIZE
-            
             cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
 
-        # Train
+        # 4. Train
         with cmd.begin_compute_pass() as cp:
             root_object = cp.bind_pipeline(self.pipe_train)
             cursor = spy.ShaderCursor(root_object)
             
             cursor["ReferenceVol"] = self.volume_tex 
-            cursor["gGaussians"] = self.gaussian_buffer
+            cursor["gGaussianParamsRaw"] = self.gaussian_buffer
             cursor["gGradientsRaw"] = self.grad_buffer
             cursor["gTileContent"] = self.tile_content
             cursor["gTileCounts"] = self.tile_counts
@@ -384,25 +510,42 @@ class Renderer:
             cursor["TrainParams"]["minWorld"] = tuple(vol_min)
             cursor["TrainParams"]["maxWorld"] = tuple(vol_max)
             cursor["TrainParams"]["tileSize"] = TILE_SIZE
-            
             cp.dispatch(thread_count=(VOL_SIZE, VOL_SIZE, VOL_SIZE))
 
-        # Optimize
+        # 5. Optimize
+        pipeline = self.pipe_optim_adam if train_config.use_adam else self.pipe_optim_sgd
+        
         with cmd.begin_compute_pass() as cp:
-            root_object = cp.bind_pipeline(self.pipe_optim)
+            root_object = cp.bind_pipeline(pipeline)
             cursor = spy.ShaderCursor(root_object)
             
-            cursor["gGaussians"] = self.gaussian_buffer
+            cursor["gGaussianParamsRaw"] = self.gaussian_buffer
             cursor["gGradientsRaw"] = self.grad_buffer
             cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
-            cursor["TrainParams"]["learningRatePos"] = train_config.learning_rate_pos
-            cursor["TrainParams"]["learningRateWeight"] = train_config.learning_rate_weight
-            cursor["TrainParams"]["learningRateSigma"] = train_config.learning_rate_sigma
+            
+            # Pack learning rates as array
+            cursor["TrainParams"]["learningRates"] = [
+                train_config.learning_rate_pos,
+                train_config.learning_rate_sigma,
+                train_config.learning_rate_weight
+            ]
+            
             cursor["TrainParams"]["tileSize"] = TILE_SIZE
+            
+            if train_config.use_adam:
+                cursor["gAdamFirstMoment"] = self.adam_first_moment
+                cursor["gAdamSecondMoment"] = self.adam_second_moment
+                cursor["TrainParams"]["adamBeta1"] = train_config.adam_beta1
+                cursor["TrainParams"]["adamBeta2"] = train_config.adam_beta2
+                cursor["TrainParams"]["adamEpsilon"] = train_config.adam_epsilon
+                cursor["TrainParams"]["adamIteration"] = self.adam_iteration
             
             cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
 
         self.device.submit_command_buffer(cmd.finish())
+        
+        if train_config.use_adam:
+            self.adam_iteration += 1
 
     def resize(self, w, h):
         if w == self.width and h == self.height: 
@@ -712,18 +855,45 @@ class App:
         imgui.end()
 
         if imgui.begin("Training"):
+            imgui.text("Optimizer")
+            imgui.separator()
+            
+            _, self.train_config.use_adam = imgui.checkbox("Use Adam Optimizer", self.train_config.use_adam)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Adam: Adaptive learning with momentum (faster, smoother)\nSGD: Simple gradient descent")
+            
+            imgui.dummy((0, 10))
             imgui.text("Learning Rates")
             imgui.separator()
-            _, self.train_config.learning_rate_pos = imgui.slider_float("Position", self.train_config.learning_rate_pos, 0.0001, 0.1, format="%.4f")
-            _, self.train_config.learning_rate_sigma = imgui.slider_float("Sigma", self.train_config.learning_rate_sigma, 0.00001, 0.01, format="%.5f")
-            _, self.train_config.learning_rate_weight = imgui.slider_float("Weight", self.train_config.learning_rate_weight, 0.001, 0.1, format="%.4f")
+            _, self.train_config.learning_rate_pos = imgui.slider_float(
+                "Position", self.train_config.learning_rate_pos, 0.0001, 0.1, format="%.4f")
+            _, self.train_config.learning_rate_sigma = imgui.slider_float(
+                "Sigma", self.train_config.learning_rate_sigma, 0.00001, 0.01, format="%.5f")
+            _, self.train_config.learning_rate_weight = imgui.slider_float(
+                "Weight", self.train_config.learning_rate_weight, 0.001, 0.1, format="%.4f")
+            
+            if self.train_config.use_adam:
+                imgui.dummy((0, 10))
+                imgui.text("Adam Hyperparameters")
+                imgui.separator()
+                _, self.train_config.adam_beta1 = imgui.slider_float(
+                    "Beta1 (Momentum)", self.train_config.adam_beta1, 0.8, 0.999, format="%.3f")
+                _, self.train_config.adam_beta2 = imgui.slider_float(
+                    "Beta2 (Variance)", self.train_config.adam_beta2, 0.9, 0.9999, format="%.4f")
+                _, self.train_config.adam_epsilon = imgui.slider_float(
+                    "Epsilon", self.train_config.adam_epsilon, 1e-10, 1e-6, format="%.2e")
+                
+                imgui.text(f"Iteration: {self.renderer.adam_iteration}")
             
             imgui.dummy((0, 10))
             imgui.text("Gaussian Generation")
             imgui.separator()
-            _, self.train_config.probability_scale = imgui.slider_float("Spawn Probability", self.train_config.probability_scale, 0.001, 0.1, format="%.4f")
-            _, self.train_config.sigma_scale = imgui.slider_float("Initial Sigma Scale", self.train_config.sigma_scale, 1.0, 20.0)
-            _, self.train_config.jitter_scale = imgui.slider_float("Position Jitter", self.train_config.jitter_scale, 0.0, 200.0)
+            _, self.train_config.probability_scale = imgui.slider_float(
+                "Spawn Probability", self.train_config.probability_scale, 0.001, 0.1, format="%.4f")
+            _, self.train_config.sigma_scale = imgui.slider_float(
+                "Initial Sigma Scale", self.train_config.sigma_scale, 1.0, 20.0)
+            _, self.train_config.jitter_scale = imgui.slider_float(
+                "Position Jitter", self.train_config.jitter_scale, 0.0, 200.0)
 
             imgui.separator()
             if imgui.button("Regenerate Gaussians"):
@@ -738,7 +908,8 @@ class App:
                 self.is_training = not self.is_training
             
             if self.is_training:
-                imgui.text_colored((0, 1, 0, 1), "TRAINING ACTIVE")
+                optimizer_name = "ADAM" if self.train_config.use_adam else "SGD"
+                imgui.text_colored((0, 1, 0, 1), f"TRAINING ACTIVE ({optimizer_name})")
             
         imgui.end()
 
