@@ -188,14 +188,11 @@ float loadParam(uint gaussianID, uint paramID, uint localThreadIdx) {
 }
 
 void loadParam_bwd(uint gaussianID, uint paramID, uint localThreadIdx, float dOut) {
-    // Validate local thread index
     if (localThreadIdx >= TRAIN_WG_SIZE) return;
     
-    // Write gradient to shared memory
     reductionBuffer[localThreadIdx] = dOut;
     GroupMemoryBarrierWithGroupSync();
     
-    // Binary reduction - automatically adapts to TRAIN_WG_SIZE
     for (uint stride = TRAIN_WG_SIZE / 2; stride > 0; stride >>= 1) {
         if (localThreadIdx < stride) {
             reductionBuffer[localThreadIdx] += reductionBuffer[localThreadIdx + stride];
@@ -203,7 +200,6 @@ void loadParam_bwd(uint gaussianID, uint paramID, uint localThreadIdx, float dOu
         GroupMemoryBarrierWithGroupSync();
     }
     
-    // Thread 0 writes accumulated gradient
     if (localThreadIdx == 0) {
         atomicAccumulate(gaussianID * PARAMS_PER_GAUSSIAN + paramID, reductionBuffer[0]);
     }

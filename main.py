@@ -331,6 +331,12 @@ class Renderer:
             width=VOL_SIZE, height=VOL_SIZE, depth=VOL_SIZE,
             usage=spy.TextureUsage.shader_resource, label="VDBVolume"
         )
+
+        self.tile_res = (
+            (VOL_SIZE + TILE_SIZE - 1) // TILE_SIZE,
+            (VOL_SIZE + TILE_SIZE - 1) // TILE_SIZE,
+            (VOL_SIZE + TILE_SIZE - 1) // TILE_SIZE
+        )
         
         cmd = device.create_command_encoder()
         cmd.upload_texture_data(self.volume_tex, [volume_data])
@@ -351,8 +357,9 @@ class Renderer:
             label="GaussianVolume"
         )
 
-        self.gaussian_raster_program = device.load_program("3drasterizer.slang", ["main"])
-        self.gaussian_raster_pipeline = device.create_compute_pipeline(program=self.gaussian_raster_program)
+        self._needs_rebinning = True
+        prog_raster_tiled = self.device.load_program("3drasterizer.slang", ["rasterize_tiled"])
+        self.pipe_raster_tiled = self.device.create_compute_pipeline(program=prog_raster_tiled)
 
         self.use_gaussian_volume = False
 
@@ -364,14 +371,12 @@ class Renderer:
         self.adam_first_moment = None
         self.adam_second_moment = None
 
+        self._training_initialized = False
+
         self.check_hot_reload()
     
     def init_training(self):
-        self.tile_res = (
-            (VOL_SIZE + TILE_SIZE - 1) // TILE_SIZE,
-            (VOL_SIZE + TILE_SIZE - 1) // TILE_SIZE,
-            (VOL_SIZE + TILE_SIZE - 1) // TILE_SIZE
-        )
+
         total_tiles = self.tile_res[0] * self.tile_res[1] * self.tile_res[2]
         
         self.grad_buffer = self.device.create_buffer(
@@ -409,29 +414,31 @@ class Renderer:
             memory_type=spy.MemoryType.device_local
         )
 
-        print("Compiling Kernels...")
-        
-        prog_clear_grads = self.device.load_program("training.slang", ["clear_gradients"])
-        self.pipe_clear_grads = self.device.create_compute_pipeline(program=prog_clear_grads)
-        
-        prog_clear_tiles = self.device.load_program("training.slang", ["clear_tiles"])
-        self.pipe_clear_tiles = self.device.create_compute_pipeline(program=prog_clear_tiles)
+        if not self._training_initialized:
+            print("Compiling Kernels...")
+            
+            prog_clear_grads = self.device.load_program("training.slang", ["clear_gradients"])
+            self.pipe_clear_grads = self.device.create_compute_pipeline(program=prog_clear_grads)
+            
+            prog_clear_tiles = self.device.load_program("training.slang", ["clear_tiles"])
+            self.pipe_clear_tiles = self.device.create_compute_pipeline(program=prog_clear_tiles)
 
-        prog_bin = self.device.load_program("training.slang", ["bin_gaussians"])
-        self.pipe_bin = self.device.create_compute_pipeline(program=prog_bin)
+            prog_bin = self.device.load_program("training.slang", ["bin_gaussians"])
+            self.pipe_bin = self.device.create_compute_pipeline(program=prog_bin)
 
-        prog_train = self.device.load_program("training.slang", ["train_main"])
-        self.pipe_train = self.device.create_compute_pipeline(program=prog_train)
+            prog_train = self.device.load_program("training.slang", ["train_main"])
+            self.pipe_train = self.device.create_compute_pipeline(program=prog_train)
 
-        prog_optim_sgd = self.device.load_program("training.slang", ["optimizer_sgd"])
-        self.pipe_optim_sgd = self.device.create_compute_pipeline(program=prog_optim_sgd)
-        
-        prog_optim_adam = self.device.load_program("training.slang", ["optimizer_adam"])
-        self.pipe_optim_adam = self.device.create_compute_pipeline(program=prog_optim_adam)
-        
-        prog_init_adam = self.device.load_program("training.slang", ["init_adam_state"])
-        self.pipe_init_adam = self.device.create_compute_pipeline(program=prog_init_adam)
-        
+            prog_optim_sgd = self.device.load_program("training.slang", ["optimizer_sgd"])
+            self.pipe_optim_sgd = self.device.create_compute_pipeline(program=prog_optim_sgd)
+            
+            prog_optim_adam = self.device.load_program("training.slang", ["optimizer_adam"])
+            self.pipe_optim_adam = self.device.create_compute_pipeline(program=prog_optim_adam)
+            
+            prog_init_adam = self.device.load_program("training.slang", ["init_adam_state"])
+            self.pipe_init_adam = self.device.create_compute_pipeline(program=prog_init_adam)
+            self._training_initialized = True
+
         
         # Initialize Adam state to zeros
         self._init_adam_state()
@@ -468,32 +475,34 @@ class Renderer:
             
             threads = self.gaussian_count * 5  # Still 5 params per Gaussian
             cp.dispatch(thread_count=(threads, 1, 1))
-            
-        # 2. Clear Tiles
-        with cmd.begin_compute_pass() as cp:
-            root_object = cp.bind_pipeline(self.pipe_clear_tiles)
-            cursor = spy.ShaderCursor(root_object)
-            cursor["gTileCounts"] = self.tile_counts
-            cursor["TrainParams"]["tileResolution"] = self.tile_res
-            cursor["TrainParams"]["totalTiles"] = total_tiles
-            cursor["TrainParams"]["tileSize"] = TILE_SIZE
-            cp.dispatch(thread_count=(total_tiles, 1, 1))
+        
+        if self._needs_rebinning:
+            # 2. Clear Tiles
+            with cmd.begin_compute_pass() as cp:
+                root_object = cp.bind_pipeline(self.pipe_clear_tiles)
+                cursor = spy.ShaderCursor(root_object)
+                cursor["gTileCounts"] = self.tile_counts
+                cursor["TrainParams"]["tileResolution"] = self.tile_res
+                cursor["TrainParams"]["totalTiles"] = total_tiles
+                cursor["TrainParams"]["tileSize"] = TILE_SIZE
+                cp.dispatch(thread_count=(total_tiles, 1, 1))
 
-        # 3. Bin Gaussians
-        with cmd.begin_compute_pass() as cp:
-            root_object = cp.bind_pipeline(self.pipe_bin)
-            cursor = spy.ShaderCursor(root_object)
-            
-            cursor["gGaussianParamsRaw"] = self.gaussian_buffer
-            cursor["gTileContent"] = self.tile_content
-            cursor["gTileCounts"] = self.tile_counts
-            cursor["TrainParams"]["volumeResolution"] = (VOL_SIZE, VOL_SIZE, VOL_SIZE)
-            cursor["TrainParams"]["tileResolution"] = self.tile_res
-            cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
-            cursor["TrainParams"]["minWorld"] = tuple(vol_min)
-            cursor["TrainParams"]["maxWorld"] = tuple(vol_max)
-            cursor["TrainParams"]["tileSize"] = TILE_SIZE
-            cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
+            # 3. Bin Gaussians
+            with cmd.begin_compute_pass() as cp:
+                root_object = cp.bind_pipeline(self.pipe_bin)
+                cursor = spy.ShaderCursor(root_object)
+                
+                cursor["gGaussianParamsRaw"] = self.gaussian_buffer
+                cursor["gTileContent"] = self.tile_content
+                cursor["gTileCounts"] = self.tile_counts
+                cursor["TrainParams"]["volumeResolution"] = (VOL_SIZE, VOL_SIZE, VOL_SIZE)
+                cursor["TrainParams"]["tileResolution"] = self.tile_res
+                cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
+                cursor["TrainParams"]["minWorld"] = tuple(vol_min)
+                cursor["TrainParams"]["maxWorld"] = tuple(vol_max)
+                cursor["TrainParams"]["tileSize"] = TILE_SIZE
+                cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
+            self._needs_rebinning = False
 
         # 4. Train
         with cmd.begin_compute_pass() as cp:
@@ -543,6 +552,7 @@ class Renderer:
             cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
 
         self.device.submit_command_buffer(cmd.finish())
+        self._needs_rebinning = True
         
         if train_config.use_adam:
             self.adam_iteration += 1
@@ -648,35 +658,56 @@ class Renderer:
         glBlitFramebuffer(0, 0, self.width, self.height, 0, 0, self.width, self.height, GL_COLOR_BUFFER_BIT, GL_NEAREST)
         glDeleteFramebuffers(1, [fb])
     
-    def rasterize_gaussians(self, gaussians, vol_min, vol_max):
-        if gaussians is not None:
-            self.gaussian_count = len(gaussians)
-            self.gaussian_buffer = self.device.create_buffer(
-                element_count=self.gaussian_count,
-                struct_size=20,
-                usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
-                memory_type=spy.MemoryType.device_local,
-                data=gaussians 
-            )
+    def rasterize_gaussians(self, vol_min, vol_max):
 
         cmd = self.device.create_command_encoder()
         cmd.clear_texture_float(self.gaussian_volume_tex)
         cmd.set_texture_state(self.gaussian_volume_tex, spy.ResourceState.unordered_access)
 
-        with cmd.begin_compute_pass() as cp:
-            cursor = spy.ShaderCursor(cp.bind_pipeline(self.gaussian_raster_pipeline))
+        total_tiles = self.tile_res[0] * self.tile_res[1] * self.tile_res[2]
+        if self._needs_rebinning:
+            # 2. Clear Tiles
+            with cmd.begin_compute_pass() as cp:
+                root_object = cp.bind_pipeline(self.pipe_clear_tiles)
+                cursor = spy.ShaderCursor(root_object)
+                cursor["gTileCounts"] = self.tile_counts
+                cursor["TrainParams"]["tileResolution"] = self.tile_res
+                cursor["TrainParams"]["totalTiles"] = total_tiles
+                cursor["TrainParams"]["tileSize"] = TILE_SIZE
+                cp.dispatch(thread_count=(total_tiles, 1, 1))
 
+            # 3. Bin Gaussians
+            with cmd.begin_compute_pass() as cp:
+                root_object = cp.bind_pipeline(self.pipe_bin)
+                cursor = spy.ShaderCursor(root_object)
+                
+                cursor["gGaussianParamsRaw"] = self.gaussian_buffer
+                cursor["gTileContent"] = self.tile_content
+                cursor["gTileCounts"] = self.tile_counts
+                cursor["TrainParams"]["volumeResolution"] = (VOL_SIZE, VOL_SIZE, VOL_SIZE)
+                cursor["TrainParams"]["tileResolution"] = self.tile_res
+                cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
+                cursor["TrainParams"]["minWorld"] = tuple(vol_min)
+                cursor["TrainParams"]["maxWorld"] = tuple(vol_max)
+                cursor["TrainParams"]["tileSize"] = TILE_SIZE
+                cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
+            self._needs_rebinning = False
+
+        with cmd.begin_compute_pass() as cp:
+            root_object = cp.bind_pipeline(self.pipe_raster_tiled)
+            cursor = spy.ShaderCursor(root_object)
+            
             cursor["gGaussians"] = self.gaussian_buffer
             cursor["gGaussianVolume"] = self.gaussian_volume_tex
-
-            cursor["GaussianParams"]["volumeMinWorld"] = tuple(vol_min)
-            cursor["GaussianParams"]["volumeMaxWorld"] = tuple(vol_max)
-            cursor["GaussianParams"]["gaussianCount"] = self.gaussian_count
-            cursor["GaussianParams"]["volumeResolution"] = (VOL_SIZE, VOL_SIZE, VOL_SIZE)
-            cursor["GaussianParams"]["voxelSize"] = 1.0
-
-            groups = uint3(VOL_SIZE, VOL_SIZE, VOL_SIZE)
-            cp.dispatch(groups)
+            cursor["gTileContent"] = self.tile_content
+            cursor["gTileCounts"] = self.tile_counts
+            cursor["RasterParams"]["volumeResolution"] = (VOL_SIZE, VOL_SIZE, VOL_SIZE)
+            cursor["RasterParams"]["tileResolution"] = self.tile_res
+            cursor["RasterParams"]["tileSize"] = TILE_SIZE
+            cursor["RasterParams"]["volumeMinWorld"] = tuple(vol_min)
+            cursor["RasterParams"]["volumeMaxWorld"] = tuple(vol_max)
+            
+            cp.dispatch(thread_count=(VOL_SIZE, VOL_SIZE, VOL_SIZE))
 
         self.device.submit_command_buffer(cmd.finish())
         print(f"Rasterized {self.gaussian_count} gaussians")
@@ -713,14 +744,23 @@ class App:
         example_dir = Path(__file__).parent
         self.device = spy.Device(enable_debug_layers=True, compiler_options={"include_paths": [example_dir]})
         
-        grid = load_vdb_grid(VDB_FILE)
-        self.vol_min_world, self.vol_max_world, vol_data = convert_grid_to_dense_volume(grid, VOL_SIZE)
-        self.gaussians = convert_grid_to_gaussians(grid, self.train_config)
+        self.grid = load_vdb_grid(VDB_FILE)
+        self.vol_min_world, self.vol_max_world, vol_data = convert_grid_to_dense_volume(self.grid, VOL_SIZE)
+        self.gaussians = convert_grid_to_gaussians(self.grid, self.train_config)
 
         self.renderer = Renderer(self.device, vol_data)
         self.renderer.resize(self.width, self.height)
-        self.renderer.rasterize_gaussians(self.gaussians, self.vol_min_world, self.vol_max_world)
+        self.renderer.gaussian_count = len(self.gaussians)
+        self.renderer.gaussian_buffer = self.device.create_buffer(
+                element_count=self.renderer.gaussian_count,
+                struct_size=20,
+                usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+                memory_type=spy.MemoryType.device_local,
+                data=self.gaussians 
+            )
         self.renderer.init_training()
+        self.renderer.rasterize_gaussians(self.vol_min_world, self.vol_max_world)
+
 
     def run(self):
         last_time = glfw.get_time()
@@ -764,7 +804,7 @@ class App:
                     else:
                         print(f"[OK] Training Running. Refs: {total_refs}, GradMax: {np.max(np.abs(grad_debug)):.6f}")
                     
-                    self.renderer.rasterize_gaussians(None, self.vol_min_world, self.vol_max_world)
+                    self.renderer.rasterize_gaussians(self.vol_min_world, self.vol_max_world)
                     
                 self.renderer.render(self.camera, self.settings)
                 self.renderer.update_display()
@@ -897,10 +937,18 @@ class App:
 
             imgui.separator()
             if imgui.button("Regenerate Gaussians"):
-                grid = load_vdb_grid(VDB_FILE)
-                self.gaussians = convert_grid_to_gaussians(grid, self.train_config)
-                self.renderer.rasterize_gaussians(self.gaussians, self.vol_min_world, self.vol_max_world)
+                self.gaussians = convert_grid_to_gaussians(self.grid, self.train_config)
+                self.renderer.gaussian_count = len(self.gaussians)
+                self.renderer.gaussian_buffer = self.device.create_buffer(
+                        element_count=self.renderer.gaussian_count,
+                        struct_size=20,
+                        usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+                        memory_type=spy.MemoryType.device_local,
+                        data=self.gaussians 
+                    )
                 self.renderer.init_training()
+                self.renderer._needs_rebinning = True
+                self.renderer.rasterize_gaussians(self.vol_min_world, self.vol_max_world)
                 print("Gaussians regenerated!")
 
             imgui.dummy((0, 10))

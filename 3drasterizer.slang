@@ -1,67 +1,71 @@
 struct Gaussian
 {
-    float3 pos;     // world space
+    float3 pos;
     float  sigma;
     float  weight;
 };
 
-StructuredBuffer<Gaussian> gGaussians;
-RWTexture3D<float> gGaussianVolume;
+[[vk::binding(0)]] StructuredBuffer<Gaussian> gGaussians;
+[[vk::binding(1)]] RWTexture3D<float> gGaussianVolume;
+[[vk::binding(2)]] StructuredBuffer<uint> gTileContent;
+[[vk::binding(3)]] StructuredBuffer<uint> gTileCounts;
 
-cbuffer GaussianParams
+cbuffer RasterParams
 {
     uint3 volumeResolution;
-    uint  gaussianCount;
-
-    float voxelSize;       // Not strictly used if you use min/max world, but good to have
+    uint3 tileResolution;
+    uint  tileSize;
     float3 volumeMinWorld;
     float3 volumeMaxWorld;
 };
 
-// Optimization: Pre-calculate constants if possible, or define them here
-static const float CUTOFF_RADIUS = 3.0; // Evaluate out to 3 sigmas (99.7% of mass)
+static const uint MAX_GAUSSIANS_PER_TILE = 64;
+static const float CUTOFF_RADIUS = 3.0;
 
-[numthreads(1, 1, 1)]
-void main(uint3 tid : SV_DispatchThreadID)
+uint GetTileIndex(uint3 voxelID) {
+    uint3 tileID = voxelID / tileSize;
+    tileID = min(tileID, tileResolution - 1);
+    return tileID.z * (tileResolution.x * tileResolution.y) + 
+           tileID.y * tileResolution.x + tileID.x;
+}
+
+[shader("compute")]
+[numthreads(4, 4, 4)]  // Match training workgroup size
+void rasterize_tiled(uint3 tid : SV_DispatchThreadID)
 {
     if (any(tid >= volumeResolution))
         return;
 
-    // 1. Calculate World Position of this Voxel
+    // Calculate world position
     float3 uvw = (float3(tid) + 0.5) / float3(volumeResolution);
     float3 worldPos = volumeMinWorld + uvw * (volumeMaxWorld - volumeMinWorld);
 
+    // Get tile index
+    uint tileIdx = GetTileIndex(tid);
+    uint count = gTileCounts[tileIdx];
+    count = min(count, MAX_GAUSSIANS_PER_TILE);
+
     float density = 0.0;
 
-    // 2. Optimized Loop
-    for (uint i = 0; i < gaussianCount; ++i)
+    // ONLY loop through Gaussians in this tile!
+    for (uint i = 0; i < count; ++i)
     {
-        Gaussian g = gGaussians[i];
+        uint gid = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + i];
+        Gaussian g = gGaussians[gid];
 
-        // OPTIMIZATION: AABB Check
-        // If this voxel is too far from the gaussian center, skip the expensive exp()
         float3 d = worldPos - g.pos;
         float maxDist = g.sigma * CUTOFF_RADIUS;
 
-        // Quick axis-aligned rejection (manhattan or bounding box) is faster than dot(d,d)
-        if (abs(d.x) > maxDist || abs(d.y) > maxDist || abs(d.z) > maxDist) 
-            continue;
-
+        // Distance check
         float r2 = dot(d, d);
-        
-        // Exact radius check
-        if (r2 > maxDist * maxDist) 
+        if (r2 > maxDist * maxDist)
             continue;
 
+        // Gaussian contribution
         float invSigma2 = 1.0 / (g.sigma * g.sigma);
-        
-        // Standard Gaussian Falloff
         float contribution = exp(-0.5 * r2 * invSigma2);
-        
-        // Accumulate
         density += g.weight * contribution;
     }
 
-    // 3. Write Output
     gGaussianVolume[tid] = density;
 }
