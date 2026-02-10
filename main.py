@@ -42,6 +42,14 @@ CAMERA_START_POS = [0.0, 0.0, 2.5]
 CAMERA_SPEED = 2.0
 CAMERA_SENSITIVITY = 0.1
 
+class DebugMode:
+    NONE = 0
+    LOSS = 1
+    GRADIENT_MAGNITUDE = 2
+    TILE_DENSITY = 3
+    GAUSSIAN_OVERLAP = 4
+    PREDICTION_VS_TARGET = 5
+
 
 # ==========================================
 # DATA & LOGIC CLASSES
@@ -374,6 +382,26 @@ class Renderer:
         self._training_initialized = False
 
         self.check_hot_reload()
+
+        # Debug
+        self.debug_tex = device.create_texture(
+            type=spy.TextureType.texture_3d,
+            format=spy.Format.rgba32_float,
+            width=VOL_SIZE, height=VOL_SIZE, depth=VOL_SIZE,
+            usage=spy.TextureUsage.unordered_access | spy.TextureUsage.shader_resource,
+            label="DebugVolume"
+        )
+        
+        self.debug_mode = 0
+        self.debug_scale = 1.0
+        
+        # Load debug raymarcher
+        prog_debug = device.load_program("debug_raymarch.slang", ["vertex_main", "fragment_main"])
+        self.debug_pipeline = device.create_render_pipeline(
+            program=prog_debug,
+            input_layout=device.create_input_layout(input_elements=[], vertex_streams=[]),
+            targets=[{"format": spy.Format.rgba32_float}]
+        )
     
     def init_training(self):
 
@@ -514,11 +542,18 @@ class Renderer:
             cursor["gGradientsRaw"] = self.grad_buffer
             cursor["gTileContent"] = self.tile_content
             cursor["gTileCounts"] = self.tile_counts
+            # Debug
+            cursor["gDebugVolume"] = self.debug_tex
+            
             cursor["TrainParams"]["volumeResolution"] = (VOL_SIZE, VOL_SIZE, VOL_SIZE)
             cursor["TrainParams"]["tileResolution"] = self.tile_res
             cursor["TrainParams"]["minWorld"] = tuple(vol_min)
             cursor["TrainParams"]["maxWorld"] = tuple(vol_max)
             cursor["TrainParams"]["tileSize"] = TILE_SIZE
+            # Debug
+            cursor["TrainParams"]["debugMode"] = self.debug_mode
+            cursor["TrainParams"]["debugScale"] = self.debug_scale
+
             cp.dispatch(thread_count=(VOL_SIZE, VOL_SIZE, VOL_SIZE))
 
         # 5. Optimize
@@ -593,8 +628,37 @@ class Renderer:
         except Exception as e:
             self.error_msg = str(e)
             print("Shader Compile Error (Safe)")
-
+    
     def render(self, camera, settings):
+        if self.debug_mode > 0:
+            self.render_debug(camera)
+        else:
+            self.render_main(camera, settings)
+
+    def render_debug(self, camera):
+        """Debug visualization using raymarcher"""
+        self.cam_buffer.copy_from_numpy(camera.get_gpu_data(self.width / self.height))
+        
+        cmd = self.device.create_command_encoder()
+        cmd.set_texture_state(self.debug_tex, spy.ResourceState.shader_resource)
+
+        with cmd.begin_render_pass({"color_attachments": [{"view": self.screen_tex.create_view({})}]}) as rp:
+            rp.bind_pipeline(self.debug_pipeline)
+            cursor = spy.ShaderCursor(rp.bind_pipeline(self.debug_pipeline))
+            
+            cursor["debugVolume"] = self.debug_tex
+            cursor["camera"] = self.cam_buffer
+            cursor["linearSampler"] = self.linear_sampler
+            
+            rp.set_render_state({
+                "viewports": [spy.Viewport.from_size(self.width, self.height)],
+                "scissor_rects": [spy.ScissorRect.from_size(self.width, self.height)]
+            })
+            rp.draw({"vertex_count": 3})
+
+        self.device.submit_command_buffer(cmd.finish())
+
+    def render_main(self, camera, settings):
         if not self.pipeline: 
             return
 
@@ -958,6 +1022,45 @@ class App:
             if self.is_training:
                 optimizer_name = "ADAM" if self.train_config.use_adam else "SGD"
                 imgui.text_colored((0, 1, 0, 1), f"TRAINING ACTIVE ({optimizer_name})")
+            
+
+            # Debug
+            imgui.dummy((0, 10))
+            imgui.text("Debug Visualization")
+            imgui.separator()
+            
+            debug_modes = [
+                "None (Normal Render)",
+                "Loss Heatmap",
+                "Gradient Magnitude",
+                "Tile Gaussian Count",
+                "Gaussian Overlap",
+                "Prediction Error"
+            ]
+            
+            clicked, self.renderer.debug_mode = imgui.combo(
+                "Debug Mode", 
+                self.renderer.debug_mode, 
+                debug_modes
+            )
+            
+            if self.renderer.debug_mode > 0:
+                _, self.renderer.debug_scale = imgui.slider_float(
+                    "Debug Scale", 
+                    self.renderer.debug_scale, 
+                    0.1, 10.0
+                )
+                
+                if imgui.is_item_hovered():
+                    tooltips = {
+                        1: "Green=low loss, Yellow=medium, Red=high loss",
+                        2: "Gradient magnitude: Green=small updates, Red=large updates",
+                        3: "Gaussian density per tile: Green=sparse, Red=dense",
+                        4: "Gaussian overlap: Green=few, Red=many overlapping",
+                        5: "Blue=underpredicted, White=accurate, Red=overpredicted"
+                    }
+                    if self.renderer.debug_mode in tooltips:
+                        imgui.set_tooltip(tooltips[self.renderer.debug_mode])
             
         imgui.end()
 

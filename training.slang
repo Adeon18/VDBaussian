@@ -70,6 +70,7 @@ struct Gaussian
 [[vk::binding(4)]] RWStructuredBuffer<uint> gTileCounts; 
 [[vk::binding(5)]] RWStructuredBuffer<float> gAdamFirstMoment;
 [[vk::binding(6)]] RWStructuredBuffer<float> gAdamSecondMoment;
+[[vk::binding(7)]] RWTexture3D<float4> gDebugVolume;
 
 groupshared float reductionBuffer[TRAIN_WG_SIZE];
 
@@ -91,7 +92,19 @@ cbuffer TrainParams {
     float adamBeta2;
     float adamEpsilon;
     uint adamIteration;
+
+    // Debug
+    uint debugMode;
+    float debugScale;
 };
+
+// Debug
+static const uint DEBUG_NONE = 0;
+static const uint DEBUG_LOSS = 1;
+static const uint DEBUG_GRADIENT_MAG = 2;
+static const uint DEBUG_TILE_DENSITY = 3;
+static const uint DEBUG_OVERLAP = 4;
+static const uint DEBUG_PRED_VS_TARGET = 5;
 
 // Maps each parameter to its learning rate group and constraints
 struct ParamMetadata
@@ -125,6 +138,33 @@ uint GetTileIndex(uint3 voxelID) {
 uint GetLocalThreadIndex(uint3 tid) {
     uint3 local = tid % uint3(TRAIN_WG_X, TRAIN_WG_Y, TRAIN_WG_Z);
     return local.x + local.y * TRAIN_WG_X + local.z * TRAIN_WG_X * TRAIN_WG_Y;
+}
+
+// Color mapping helpers
+float3 heatmapColor(float t) {
+    // Green → Yellow → Red heatmap
+    t = clamp(t, 0.0, 1.0);
+    
+    if (t < 0.5) {
+        // Green to Yellow
+        return lerp(float3(0.0, 1.0, 0.0), float3(1.0, 1.0, 0.0), t * 2.0);
+    } else {
+        // Yellow to Red
+        return lerp(float3(1.0, 1.0, 0.0), float3(1.0, 0.0, 0.0), (t - 0.5) * 2.0);
+    }
+}
+
+float3 divergingColor(float t) {
+    // Blue (negative) → White (zero) → Red (positive)
+    t = clamp(t * 0.5 + 0.5, 0.0, 1.0);
+    
+    if (t < 0.5) {
+        // Blue to White
+        return lerp(float3(0.0, 0.0, 1.0), float3(1.0, 1.0, 1.0), t * 2.0);
+    } else {
+        // White to Red
+        return lerp(float3(1.0, 1.0, 1.0), float3(1.0, 0.0, 0.0), (t - 0.5) * 2.0);
+    }
 }
 
 // CLEAR TILES
@@ -267,7 +307,79 @@ float compute_loss(
 [numthreads(TRAIN_WG_X, TRAIN_WG_Y, TRAIN_WG_Z)]
 void train_main(uint3 tid : SV_DispatchThreadID) {
     if (any(tid >= volumeResolution)) return;
+    
+    // Compute loss (triggers backward pass)
+    float loss = compute_loss(tid, minWorld, maxWorld, volumeResolution);
     bwd_diff(compute_loss)(tid, minWorld, maxWorld, volumeResolution, 1.0);
+    
+    // Debug visualization
+    if (debugMode != DEBUG_NONE) {
+        float3 uvw = (float3(tid) + 0.5) / float3(volumeResolution);
+        float3 worldPos = minWorld + uvw * (maxWorld - minWorld);
+        
+        float debugValue = 0.0;
+        float3 debugColor = float3(0.0);
+        float debugAlpha = 0.0;
+        
+        if (debugMode == DEBUG_LOSS) {
+            // Visualize per-voxel loss
+            debugValue = loss * debugScale;
+            debugColor = heatmapColor(debugValue);
+            debugAlpha = min(loss * debugScale * 10.0, 1.0); // Make high-loss areas opaque
+        }
+        else if (debugMode == DEBUG_GRADIENT_MAG) {
+            // Visualize gradient magnitude at this voxel
+            // We'd need to compute gradients for all Gaussians affecting this voxel
+            uint tileIdx = GetTileIndex(tid);
+            uint count = gTileCounts[tileIdx];
+            count = min(count, MAX_GAUSSIANS_PER_TILE);
+            
+            float totalGradMag = 0.0;
+            for (uint i = 0; i < count; ++i) {
+                uint gid = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + i];
+                
+                // Sum gradient magnitudes for this Gaussian
+                float gradMag = 0.0;
+                for (uint p = 0; p < PARAMS_PER_GAUSSIAN; ++p) {
+                    float g = asfloat(gGradientsRaw[gid * PARAMS_PER_GAUSSIAN + p]);
+                    gradMag += abs(g);
+                }
+                totalGradMag += gradMag;
+            }
+            
+            debugValue = totalGradMag * debugScale;
+            debugColor = heatmapColor(debugValue);
+            debugAlpha = min(totalGradMag * debugScale, 1.0);
+        }
+        else if (debugMode == DEBUG_TILE_DENSITY) {
+            // Visualize how many Gaussians affect this tile
+            uint tileIdx = GetTileIndex(tid);
+            uint count = gTileCounts[tileIdx];
+            
+            debugValue = float(count) / float(MAX_GAUSSIANS_PER_TILE);
+            debugColor = heatmapColor(debugValue);
+            debugAlpha = debugValue;
+        }
+        else if (debugMode == DEBUG_OVERLAP) {
+            // Visualize Gaussian overlap count at this voxel
+            float density = compute_density_tiled(tid, worldPos);
+            debugValue = density * debugScale;
+            debugColor = heatmapColor(debugValue);
+            debugAlpha = min(density * debugScale, 1.0);
+        }
+        else if (debugMode == DEBUG_PRED_VS_TARGET) {
+            // Visualize prediction error (blue=under, red=over)
+            float predicted = compute_density_tiled(tid, worldPos);
+            float target = ReferenceVol[tid];
+            float error = predicted - target;
+            
+            debugValue = error * debugScale;
+            debugColor = divergingColor(debugValue);
+            debugAlpha = min(abs(error) * debugScale * 2.0, 1.0);
+        }
+        
+        gDebugVolume[tid] = float4(debugColor, debugAlpha);
+    }
 }
 
 // CLEAR GRADIENTS
