@@ -106,6 +106,26 @@ static const uint DEBUG_TILE_DENSITY = 3;
 static const uint DEBUG_OVERLAP = 4;
 static const uint DEBUG_PRED_VS_TARGET = 5;
 
+// Scale factors for different debug modes
+static const float DEBUG_LOSS_SCALE = 20.0;           // Loss values typically 0.0-0.05
+static const float DEBUG_GRADIENT_SCALE = 5.0;        // Gradients typically 0.0-0.2
+static const float DEBUG_TILE_SCALE = 1.0 / 32.0;    // Tile counts 0-64
+static const float DEBUG_OVERLAP_SCALE = 2.0;         // Density typically 0.0-0.5
+static const float DEBUG_ERROR_SCALE = 10.0;          // Prediction error typically -0.1 to +0.1
+
+// Opacity scaling (how quickly debug vis becomes opaque)
+static const float DEBUG_ALPHA_MULT_LOSS = 100.0;
+static const float DEBUG_ALPHA_MULT_GRADIENT = 50.0;
+static const float DEBUG_ALPHA_MULT_TILE = 2.0;
+static const float DEBUG_ALPHA_MULT_OVERLAP = 5.0;
+static const float DEBUG_ALPHA_MULT_ERROR = 20.0;
+
+// Heatmap thresholds for color mapping
+static const float HEATMAP_LOW_THRESHOLD = 0.2;    // Below this = mostly green
+static const float HEATMAP_HIGH_THRESHOLD = 0.8;   // Above this = mostly red
+
+
+
 // Maps each parameter to its learning rate group and constraints
 struct ParamMetadata
 {
@@ -140,31 +160,127 @@ uint GetLocalThreadIndex(uint3 tid) {
     return local.x + local.y * TRAIN_WG_X + local.z * TRAIN_WG_X * TRAIN_WG_Y;
 }
 
-// Color mapping helpers
 float3 heatmapColor(float t) {
-    // Green → Yellow → Red heatmap
+    // Improved heatmap with better distribution
     t = clamp(t, 0.0, 1.0);
     
-    if (t < 0.5) {
-        // Green to Yellow
-        return lerp(float3(0.0, 1.0, 0.0), float3(1.0, 1.0, 0.0), t * 2.0);
+    // Apply power curve for better visual distribution
+    t = pow(t, 0.7);  // Makes mid-range more visible
+    
+    if (t < 0.33) {
+        // Green to Yellow-Green
+        return lerp(float3(0.0, 0.8, 0.0), float3(0.5, 1.0, 0.0), t * 3.0);
+    } else if (t < 0.67) {
+        // Yellow-Green to Orange
+        return lerp(float3(0.5, 1.0, 0.0), float3(1.0, 0.6, 0.0), (t - 0.33) * 3.0);
     } else {
-        // Yellow to Red
-        return lerp(float3(1.0, 1.0, 0.0), float3(1.0, 0.0, 0.0), (t - 0.5) * 2.0);
+        // Orange to Red
+        return lerp(float3(1.0, 0.6, 0.0), float3(1.0, 0.0, 0.0), (t - 0.67) * 3.0);
     }
 }
 
 float3 divergingColor(float t) {
-    // Blue (negative) → White (zero) → Red (positive)
-    t = clamp(t * 0.5 + 0.5, 0.0, 1.0);
+    // Improved diverging colormap
+    // Blue (under) → White (zero) → Red (over)
+    t = clamp(t, -1.0, 1.0);
     
-    if (t < 0.5) {
-        // Blue to White
-        return lerp(float3(0.0, 0.0, 1.0), float3(1.0, 1.0, 1.0), t * 2.0);
+    if (t < -0.1) {
+        // Strong blue for significant underprediction
+        float blend = clamp((-t - 0.1) / 0.9, 0.0, 1.0);
+        return lerp(float3(0.7, 0.9, 1.0), float3(0.0, 0.0, 1.0), blend);
+    } else if (t < 0.1) {
+        // White zone for small errors
+        float blend = t / 0.1 * 0.5 + 0.5;  // 0.0 to 1.0
+        return lerp(float3(0.7, 0.9, 1.0), float3(1.0, 0.9, 0.7), blend);
     } else {
-        // White to Red
-        return lerp(float3(1.0, 1.0, 1.0), float3(1.0, 0.0, 0.0), (t - 0.5) * 2.0);
+        // Strong red for significant overprediction
+        float blend = clamp((t - 0.1) / 0.9, 0.0, 1.0);
+        return lerp(float3(1.0, 0.9, 0.7), float3(1.0, 0.0, 0.0), blend);
     }
+}
+
+[shader("compute")]
+[numthreads(TRAIN_WG_X, TRAIN_WG_Y, TRAIN_WG_Z)]
+void compute_debug(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid >= volumeResolution)) return;
+    if (debugMode == DEBUG_NONE) return;
+    
+    float3 uvw = (float3(tid) + 0.5) / float3(volumeResolution);
+    float3 worldPos = minWorld + uvw * (maxWorld - minWorld);
+    
+    float rawValue = 0.0;
+    float normalizedValue = 0.0;
+    float3 debugColor = float3(0.0);
+    float debugAlpha = 0.0;
+    
+    if (debugMode == DEBUG_LOSS) {
+        // Compute loss at this voxel
+        float predicted = compute_density_tiled(tid, worldPos);
+        float target = ReferenceVol[tid];
+        float diff = predicted - target;
+        float loss = diff * diff;
+        
+        rawValue = loss;
+        normalizedValue = loss * DEBUG_LOSS_SCALE * debugScale;
+        debugColor = heatmapColor(normalizedValue);
+        debugAlpha = min(loss * DEBUG_ALPHA_MULT_LOSS * debugScale, 1.0);
+    }
+    else if (debugMode == DEBUG_GRADIENT_MAG) {
+        // Sum gradient magnitudes for all Gaussians affecting this voxel
+        uint tileIdx = GetTileIndex(tid);
+        uint count = gTileCounts[tileIdx];
+        count = min(count, MAX_GAUSSIANS_PER_TILE);
+        
+        float totalGradMag = 0.0;
+        for (uint i = 0; i < count; ++i) {
+            uint gid = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + i];
+            
+            float gradMag = 0.0;
+            for (uint p = 0; p < PARAMS_PER_GAUSSIAN; ++p) {
+                float g = asfloat(gGradientsRaw[gid * PARAMS_PER_GAUSSIAN + p]);
+                gradMag += g * g;  // L2 norm squared
+            }
+            totalGradMag += sqrt(gradMag);  // L2 norm
+        }
+        
+        rawValue = totalGradMag;
+        normalizedValue = totalGradMag * DEBUG_GRADIENT_SCALE * debugScale;
+        debugColor = heatmapColor(normalizedValue);
+        debugAlpha = min(totalGradMag * DEBUG_ALPHA_MULT_GRADIENT * debugScale, 1.0);
+    }
+    else if (debugMode == DEBUG_TILE_DENSITY) {
+        // Visualize Gaussian count per tile
+        uint tileIdx = GetTileIndex(tid);
+        uint count = gTileCounts[tileIdx];
+        
+        rawValue = float(count);
+        normalizedValue = float(count) * DEBUG_TILE_SCALE * debugScale;
+        debugColor = heatmapColor(normalizedValue);
+        debugAlpha = normalizedValue;
+    }
+    else if (debugMode == DEBUG_OVERLAP) {
+        // Visualize Gaussian density
+        float density = compute_density_tiled(tid, worldPos);
+        
+        rawValue = density;
+        normalizedValue = density * DEBUG_OVERLAP_SCALE * debugScale;
+        debugColor = heatmapColor(normalizedValue);
+        debugAlpha = min(density * DEBUG_ALPHA_MULT_OVERLAP * debugScale, 1.0);
+    }
+    else if (debugMode == DEBUG_PRED_VS_TARGET) {
+        // Visualize prediction error
+        float predicted = compute_density_tiled(tid, worldPos);
+        float target = ReferenceVol[tid];
+        float error = predicted - target;
+        
+        rawValue = error;
+        normalizedValue = error * DEBUG_ERROR_SCALE * debugScale;
+        debugColor = divergingColor(normalizedValue);
+        debugAlpha = min(abs(error) * DEBUG_ALPHA_MULT_ERROR * debugScale, 1.0);
+    }
+    
+    // Store: RGB = color, A = alpha (for compositing)
+    gDebugVolume[tid] = float4(debugColor, debugAlpha);
 }
 
 // CLEAR TILES
@@ -308,78 +424,7 @@ float compute_loss(
 void train_main(uint3 tid : SV_DispatchThreadID) {
     if (any(tid >= volumeResolution)) return;
     
-    // Compute loss (triggers backward pass)
-    float loss = compute_loss(tid, minWorld, maxWorld, volumeResolution);
     bwd_diff(compute_loss)(tid, minWorld, maxWorld, volumeResolution, 1.0);
-    
-    // Debug visualization
-    if (debugMode != DEBUG_NONE) {
-        float3 uvw = (float3(tid) + 0.5) / float3(volumeResolution);
-        float3 worldPos = minWorld + uvw * (maxWorld - minWorld);
-        
-        float debugValue = 0.0;
-        float3 debugColor = float3(0.0);
-        float debugAlpha = 0.0;
-        
-        if (debugMode == DEBUG_LOSS) {
-            // Visualize per-voxel loss
-            debugValue = loss * debugScale;
-            debugColor = heatmapColor(debugValue);
-            debugAlpha = min(loss * debugScale * 10.0, 1.0); // Make high-loss areas opaque
-        }
-        else if (debugMode == DEBUG_GRADIENT_MAG) {
-            // Visualize gradient magnitude at this voxel
-            // We'd need to compute gradients for all Gaussians affecting this voxel
-            uint tileIdx = GetTileIndex(tid);
-            uint count = gTileCounts[tileIdx];
-            count = min(count, MAX_GAUSSIANS_PER_TILE);
-            
-            float totalGradMag = 0.0;
-            for (uint i = 0; i < count; ++i) {
-                uint gid = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + i];
-                
-                // Sum gradient magnitudes for this Gaussian
-                float gradMag = 0.0;
-                for (uint p = 0; p < PARAMS_PER_GAUSSIAN; ++p) {
-                    float g = asfloat(gGradientsRaw[gid * PARAMS_PER_GAUSSIAN + p]);
-                    gradMag += abs(g);
-                }
-                totalGradMag += gradMag;
-            }
-            
-            debugValue = totalGradMag * debugScale;
-            debugColor = heatmapColor(debugValue);
-            debugAlpha = min(totalGradMag * debugScale, 1.0);
-        }
-        else if (debugMode == DEBUG_TILE_DENSITY) {
-            // Visualize how many Gaussians affect this tile
-            uint tileIdx = GetTileIndex(tid);
-            uint count = gTileCounts[tileIdx];
-            
-            debugValue = float(count) / float(MAX_GAUSSIANS_PER_TILE);
-            debugColor = heatmapColor(debugValue);
-            debugAlpha = debugValue;
-        }
-        else if (debugMode == DEBUG_OVERLAP) {
-            // Visualize Gaussian overlap count at this voxel
-            float density = compute_density_tiled(tid, worldPos);
-            debugValue = density * debugScale;
-            debugColor = heatmapColor(debugValue);
-            debugAlpha = min(density * debugScale, 1.0);
-        }
-        else if (debugMode == DEBUG_PRED_VS_TARGET) {
-            // Visualize prediction error (blue=under, red=over)
-            float predicted = compute_density_tiled(tid, worldPos);
-            float target = ReferenceVol[tid];
-            float error = predicted - target;
-            
-            debugValue = error * debugScale;
-            debugColor = divergingColor(debugValue);
-            debugAlpha = min(abs(error) * debugScale * 2.0, 1.0);
-        }
-        
-        gDebugVolume[tid] = float4(debugColor, debugAlpha);
-    }
 }
 
 // CLEAR GRADIENTS

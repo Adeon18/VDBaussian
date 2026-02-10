@@ -366,6 +366,7 @@ class Renderer:
         )
 
         self._needs_rebinning = True
+        self._needs_rasterization = True
         prog_raster_tiled = self.device.load_program("3drasterizer.slang", ["rasterize_tiled"])
         self.pipe_raster_tiled = self.device.create_compute_pipeline(program=prog_raster_tiled)
 
@@ -375,7 +376,7 @@ class Renderer:
         self.gaussian_count = 0
         self.adam_iteration = 1  # Track iteration for bias correction
         
-        # Adam state buffers (initialized later)
+        # Adam state buffers
         self.adam_first_moment = None
         self.adam_second_moment = None
 
@@ -465,9 +466,13 @@ class Renderer:
             
             prog_init_adam = self.device.load_program("training.slang", ["init_adam_state"])
             self.pipe_init_adam = self.device.create_compute_pipeline(program=prog_init_adam)
+
+            prog_debug = self.device.load_program("training.slang", ["compute_debug"])
+            self.pipe_debug_only = self.device.create_compute_pipeline(program=prog_debug)
+
             self._training_initialized = True
 
-        
+        self.debug_needs_update = True
         # Initialize Adam state to zeros
         self._init_adam_state()
     
@@ -487,6 +492,42 @@ class Renderer:
         
         self.device.submit_command_buffer(cmd.finish())
         self.adam_iteration = 1
+
+    def update_debug_visualization(self, vol_min, vol_max):
+        """
+        Update debug visualization WITHOUT running training.
+        Call this when debug mode changes or user wants to refresh.
+        """
+        if self.debug_mode == 0:
+            return
+        
+        cmd = self.device.create_command_encoder()
+        
+        # Just run the debug computation kernel (no training)
+        with cmd.begin_compute_pass() as cp:
+            root_object = cp.bind_pipeline(self.pipe_debug_only)  # New pipeline!
+            cursor = spy.ShaderCursor(root_object)
+            
+            cursor["ReferenceVol"] = self.volume_tex 
+            cursor["gGaussianParamsRaw"] = self.gaussian_buffer
+            cursor["gGradientsRaw"] = self.grad_buffer
+            cursor["gTileContent"] = self.tile_content
+            cursor["gTileCounts"] = self.tile_counts
+            cursor["gDebugVolume"] = self.debug_tex
+            
+            cursor["TrainParams"]["volumeResolution"] = (VOL_SIZE, VOL_SIZE, VOL_SIZE)
+            cursor["TrainParams"]["tileResolution"] = self.tile_res
+            cursor["TrainParams"]["minWorld"] = tuple(vol_min)
+            cursor["TrainParams"]["maxWorld"] = tuple(vol_max)
+            cursor["TrainParams"]["tileSize"] = TILE_SIZE
+            cursor["TrainParams"]["debugMode"] = self.debug_mode
+            cursor["TrainParams"]["debugScale"] = self.debug_scale
+            cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
+            
+            cp.dispatch(thread_count=(VOL_SIZE, VOL_SIZE, VOL_SIZE))
+        
+        self.device.submit_command_buffer(cmd.finish())
+        self.debug_needs_update = False
 
     def run_training_step(self, vol_min, vol_max, train_config):
         cmd = self.device.create_command_encoder()
@@ -542,17 +583,12 @@ class Renderer:
             cursor["gGradientsRaw"] = self.grad_buffer
             cursor["gTileContent"] = self.tile_content
             cursor["gTileCounts"] = self.tile_counts
-            # Debug
-            cursor["gDebugVolume"] = self.debug_tex
-            
+
             cursor["TrainParams"]["volumeResolution"] = (VOL_SIZE, VOL_SIZE, VOL_SIZE)
             cursor["TrainParams"]["tileResolution"] = self.tile_res
             cursor["TrainParams"]["minWorld"] = tuple(vol_min)
             cursor["TrainParams"]["maxWorld"] = tuple(vol_max)
             cursor["TrainParams"]["tileSize"] = TILE_SIZE
-            # Debug
-            cursor["TrainParams"]["debugMode"] = self.debug_mode
-            cursor["TrainParams"]["debugScale"] = self.debug_scale
 
             cp.dispatch(thread_count=(VOL_SIZE, VOL_SIZE, VOL_SIZE))
 
@@ -588,6 +624,8 @@ class Renderer:
 
         self.device.submit_command_buffer(cmd.finish())
         self._needs_rebinning = True
+        self.debug_needs_update = True
+        self._needs_rasterization = True
         
         if train_config.use_adam:
             self.adam_iteration += 1
@@ -774,6 +812,7 @@ class Renderer:
             cp.dispatch(thread_count=(VOL_SIZE, VOL_SIZE, VOL_SIZE))
 
         self.device.submit_command_buffer(cmd.finish())
+        self._needs_rasterization = False
         print(f"Rasterized {self.gaussian_count} gaussians")
 
 
@@ -867,7 +906,11 @@ class App:
                         print(f"[ALERT] Tiler works ({total_refs} refs) but Gradients are ZERO.")
                     else:
                         print(f"[OK] Training Running. Refs: {total_refs}, GradMax: {np.max(np.abs(grad_debug)):.6f}")
-                    
+                
+                if self.renderer.debug_needs_update and self.renderer.debug_mode > 0:
+                    self.renderer.update_debug_visualization(self.vol_min_world, self.vol_max_world)
+                
+                if self.renderer._needs_rasterization and self.renderer.use_gaussian_volume:
                     self.renderer.rasterize_gaussians(self.vol_min_world, self.vol_max_world)
                     
                 self.renderer.render(self.camera, self.settings)
@@ -1026,41 +1069,122 @@ class App:
 
             # Debug
             imgui.dummy((0, 10))
-            imgui.text("Debug Visualization")
-            imgui.separator()
-            
-            debug_modes = [
-                "None (Normal Render)",
-                "Loss Heatmap",
-                "Gradient Magnitude",
-                "Tile Gaussian Count",
-                "Gaussian Overlap",
-                "Prediction Error"
-            ]
-            
-            clicked, self.renderer.debug_mode = imgui.combo(
-                "Debug Mode", 
-                self.renderer.debug_mode, 
-                debug_modes
+        imgui.text("Debug Visualization")
+        imgui.separator()
+        
+        debug_modes = [
+            "None (Normal Render)",
+            "Loss Heatmap",
+            "Gradient Magnitude",
+            "Tile Gaussian Count",
+            "Gaussian Overlap",
+            "Prediction Error"
+        ]
+        
+        old_mode = self.renderer.debug_mode
+        clicked, self.renderer.debug_mode = imgui.combo(
+            "Debug Mode", 
+            self.renderer.debug_mode, 
+            debug_modes
+        )
+        
+        # Refresh debug when mode changes
+        if self.renderer.debug_mode != old_mode:
+            self.renderer.debug_needs_update = True
+        
+        if self.renderer.debug_mode > 0:
+            old_scale = self.renderer.debug_scale
+            _, self.renderer.debug_scale = imgui.slider_float(
+                "Visualization Scale", 
+                self.renderer.debug_scale, 
+                0.1, 5.0
             )
             
-            if self.renderer.debug_mode > 0:
-                _, self.renderer.debug_scale = imgui.slider_float(
-                    "Debug Scale", 
-                    self.renderer.debug_scale, 
-                    0.1, 10.0
+            # Refresh debug when scale changes
+            if abs(self.renderer.debug_scale - old_scale) > 0.01:
+                self.renderer.debug_needs_update = True
+            
+            # Mode-specific information
+            imgui.dummy((0, 5))
+            
+            if self.renderer.debug_mode == 1:  # Loss
+                imgui.text_colored((0.7, 0.7, 0.7, 1), "Loss Heatmap")
+                imgui.text_wrapped(
+                    "Green: Low loss (< 0.05) - well fitted\n"
+                    "Yellow: Medium loss (0.05-0.1) - needs improvement\n"
+                    "Red: High loss (> 0.1) - poor fit, add Gaussians"
                 )
+                imgui.separator()
+                imgui.text(f"Typical range: 0.0 - 0.05")
+                imgui.text(f"Scale multiplier: {self.renderer.debug_scale:.2f}x")
                 
-                if imgui.is_item_hovered():
-                    tooltips = {
-                        1: "Green=low loss, Yellow=medium, Red=high loss",
-                        2: "Gradient magnitude: Green=small updates, Red=large updates",
-                        3: "Gaussian density per tile: Green=sparse, Red=dense",
-                        4: "Gaussian overlap: Green=few, Red=many overlapping",
-                        5: "Blue=underpredicted, White=accurate, Red=overpredicted"
-                    }
-                    if self.renderer.debug_mode in tooltips:
-                        imgui.set_tooltip(tooltips[self.renderer.debug_mode])
+            elif self.renderer.debug_mode == 2:  # Gradients
+                imgui.text_colored((0.7, 0.7, 0.7, 1), "Gradient Magnitude")
+                imgui.text_wrapped(
+                    "Shows where optimizer is making changes.\n"
+                    "Green: Small gradients (< 0.04) - converged\n"
+                    "Yellow: Medium gradients (0.04-0.1)\n"
+                    "Red: Large gradients (> 0.1) - active learning"
+                )
+                imgui.separator()
+                
+                # Show actual gradient stats
+                if hasattr(self.renderer, 'grad_buffer') and self.renderer.grad_buffer:
+                    grad_bytes = self.renderer.grad_buffer.to_numpy()
+                    grad_debug = grad_bytes.view(dtype=np.float32)
+                    grad_nonzero = grad_debug[grad_debug != 0]
+                    if len(grad_nonzero) > 0:
+                        imgui.text(f"Current gradients:")
+                        imgui.text(f"  Max: {np.max(np.abs(grad_nonzero)):.6f}")
+                        imgui.text(f"  Mean: {np.mean(np.abs(grad_nonzero)):.6f}")
+                        imgui.text(f"  Active: {len(grad_nonzero)}/{len(grad_debug)}")
+                
+            elif self.renderer.debug_mode == 3:  # Tile density
+                imgui.text_colored((0.7, 0.7, 0.7, 1), "Tile Gaussian Count")
+                imgui.text_wrapped(
+                    "Shows Gaussian distribution efficiency.\n"
+                    "Green: Sparse (< 16 Gaussians/tile)\n"
+                    "Yellow: Medium (16-32)\n"
+                    "Red: Dense (> 32) - may need larger tiles"
+                )
+                imgui.separator()
+                
+                # Show tile stats
+                if hasattr(self.renderer, 'tile_counts') and self.renderer.tile_counts:
+                    tile_debug = self.renderer.tile_counts.to_numpy().view(dtype=np.uint32)
+                    total_refs = np.sum(tile_debug)
+                    occupied = np.sum(tile_debug > 0)
+                    if occupied > 0:
+                        imgui.text(f"Tile statistics:")
+                        imgui.text(f"  Total refs: {total_refs:,}")
+                        imgui.text(f"  Avg/tile: {total_refs/occupied:.1f}")
+                        imgui.text(f"  Max/tile: {np.max(tile_debug)}")
+                
+            elif self.renderer.debug_mode == 4:  # Overlap
+                imgui.text_colored((0.7, 0.7, 0.7, 1), "Gaussian Overlap")
+                imgui.text_wrapped(
+                    "Shows combined Gaussian density.\n"
+                    "Green: Low density (< 0.25)\n"
+                    "Yellow: Medium density (0.25-0.5)\n"
+                    "Red: High density (> 0.5)"
+                )
+                imgui.separator()
+                imgui.text(f"Typical range: 0.0 - 1.0")
+                
+            elif self.renderer.debug_mode == 5:  # Error
+                imgui.text_colored((0.7, 0.7, 0.7, 1), "Prediction Error")
+                imgui.text_wrapped(
+                    "Compares prediction vs. ground truth.\n"
+                    "Blue: Underpredicting (add Gaussians)\n"
+                    "White: Accurate (< ±0.02 error)\n"
+                    "Red: Overpredicting (reduce weights)"
+                )
+                imgui.separator()
+                imgui.text(f"Error range: -0.1 to +0.1")
+            
+            imgui.dummy((0, 5))
+            if imgui.button("Refresh Debug View"):
+                self.renderer.debug_needs_update = True
             
         imgui.end()
 
