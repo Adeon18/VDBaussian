@@ -286,9 +286,9 @@ class TrainingConfig:
     """Configurable training hyperparameters"""
     def __init__(self):
         # SGD Learning Rates
-        self.learning_rate_pos = 0.02
-        self.learning_rate_sigma = 0.002
-        self.learning_rate_weight = 0.01
+        self.learning_rate_pos = 0.1
+        self.learning_rate_sigma = 0.01
+        self.learning_rate_weight = 0.1
         
         # Adam Hyperparameters
         self.adam_beta1 = 0.9
@@ -297,9 +297,9 @@ class TrainingConfig:
         self.use_adam = True  # Toggle between SGD and Adam
         
         # Gaussian Generation
-        self.probability_scale = 0.01
-        self.sigma_scale = 5.0
-        self.jitter_scale = 100.0
+        self.probability_scale = 0.02
+        self.sigma_scale = 2.0
+        self.jitter_scale = 5.0
 
 # ==========================================
 # RENDERER SYSTEM
