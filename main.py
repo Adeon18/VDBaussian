@@ -189,19 +189,6 @@ class Camera:
         return data
 
 
-class TrainingConfig:
-    """Configurable training hyperparameters"""
-    def __init__(self):
-        self.learning_rate_pos = 0.01
-        self.learning_rate_sigma = 0.001
-        self.learning_rate_weight = 0.01
-        
-        # Gaussian Generation
-        self.probability_scale = 0.01
-        self.sigma_scale = 5.0
-        self.jitter_scale = 100.0
-
-
 def load_vdb_grid(vdb_path):
     print(f"Loading VDB file: {vdb_path}...")
     try:
@@ -299,8 +286,8 @@ class TrainingConfig:
     """Configurable training hyperparameters"""
     def __init__(self):
         # SGD Learning Rates
-        self.learning_rate_pos = 0.01
-        self.learning_rate_sigma = 0.001
+        self.learning_rate_pos = 0.02
+        self.learning_rate_sigma = 0.002
         self.learning_rate_weight = 0.01
         
         # Adam Hyperparameters
@@ -403,6 +390,18 @@ class Renderer:
             input_layout=device.create_input_layout(input_elements=[], vertex_streams=[]),
             targets=[{"format": spy.Format.rgba32_float}]
         )
+
+        self.gradient_health = {
+            'status': 'unknown',  # 'healthy', 'exploding', 'vanishing', 'dead'
+            'mean': 0.0,
+            'max': 0.0,
+            'min': 0.0,
+            'active_ratio': 0.0,
+            'recommendation': ''
+        }
+        
+        self.loss_history = []
+        self.grad_mean_history = []
     
     def init_training(self):
 
@@ -492,6 +491,100 @@ class Renderer:
         
         self.device.submit_command_buffer(cmd.finish())
         self.adam_iteration = 1
+
+
+    def analyze_gradients(self):
+        """Analyze gradient health - CALIBRATED FOR VOLUMETRIC FITTING. This function are just suggestions for me"""
+        if not hasattr(self, 'grad_buffer') or self.grad_buffer is None:
+            return
+        
+        grad_bytes = self.grad_buffer.to_numpy()
+        grads = grad_bytes.view(dtype=np.float32)
+        
+        grad_abs = np.abs(grads)
+        nonzero_grads = grad_abs[grad_abs > 1e-10]
+        
+        if len(nonzero_grads) == 0:
+            self.gradient_health = {
+                'status': 'dead',
+                'mean': 0.0,
+                'max': 0.0,
+                'min': 0.0,
+                'active_ratio': 0.0,
+                'recommendation': 'No gradients! Check if training is running.'
+            }
+            return
+        
+        mean_grad = np.mean(nonzero_grads)
+        max_grad = np.max(nonzero_grads)
+        min_grad = np.min(nonzero_grads)
+        active_ratio = len(nonzero_grads) / len(grads)
+        
+        self.grad_mean_history.append(mean_grad)
+        if len(self.grad_mean_history) > 100:
+            self.grad_mean_history.pop(0)
+        
+        status = 'healthy'
+        recommendation = 'Training normally. Gradients reflect prediction error.'
+        
+        # Check for TRUE exploding gradients (much higher thresholds!)
+        if max_grad > 50.0: 
+            status = 'exploding'
+            recommendation = 'CRITICAL: Gradients exploding! Reduce learning rates by 10×'
+        elif max_grad > 20.0:
+            status = 'high'
+            recommendation = 'Gradients high but manageable. Consider reducing LRs by 2× if loss oscillates.'
+        
+        # Early training (high error = high gradients)
+        elif mean_grad > 1.0:
+            status = 'early'
+            recommendation = 'Early training - high gradients are normal as error is large.'
+        
+        # Check for vanishing gradients
+        elif mean_grad < 1e-5:
+            status = 'vanishing'
+            if mean_grad < 1e-7:
+                recommendation = 'CRITICAL: Gradients vanishing! Increase learning rates by 10×'
+            else:
+                recommendation = 'Gradients getting small. May need higher learning rates or have converged.'
+        
+        # Check for convergence
+        elif mean_grad < 0.001 and len(self.grad_mean_history) > 20:
+            recent = self.grad_mean_history[-20:]
+            std = np.std(recent)
+            if std < mean_grad * 0.1:
+                status = 'converged'
+                recommendation = 'Gradients stable and small. Training likely converged!'
+        
+        # Check trend (is it improving?)
+        if status == 'healthy' and len(self.grad_mean_history) > 20:
+            recent = self.grad_mean_history[-20:]
+            older = self.grad_mean_history[-40:-20] if len(self.grad_mean_history) >= 40 else self.grad_mean_history[:-20]
+            
+            if len(older) > 0:
+                recent_mean = np.mean(recent)
+                older_mean = np.mean(older)
+                
+                if recent_mean < older_mean * 0.8:
+                    status = 'improving'
+                    recommendation = 'Gradients decreasing - loss is improving! Keep current settings.'
+                elif recent_mean > older_mean * 1.2:
+                    status = 'diverging'
+                    recommendation = 'Gradients increasing - may be diverging. Consider reducing learning rates.'
+        
+        # Check for sparse activation
+        if active_ratio < 0.3:
+            status = 'sparse'
+            recommendation = f'Only {active_ratio*100:.1f}% Gaussians active. Increase sigma_scale or add more Gaussians.'
+        
+        self.gradient_health = {
+            'status': status,
+            'mean': mean_grad,
+            'max': max_grad,
+            'min': min_grad,
+            'active_ratio': active_ratio,
+            'recommendation': recommendation
+        }
 
     def update_debug_visualization(self, vol_min, vol_max):
         """
@@ -867,6 +960,7 @@ class App:
 
     def run(self):
         last_time = glfw.get_time()
+        frame_count = 0
         
         while not glfw.window_should_close(self.window):
             curr_time = glfw.get_time()
@@ -906,6 +1000,17 @@ class App:
                         print(f"[ALERT] Tiler works ({total_refs} refs) but Gradients are ZERO.")
                     else:
                         print(f"[OK] Training Running. Refs: {total_refs}, GradMax: {np.max(np.abs(grad_debug)):.6f}")
+                    
+                    # Analyze gradients every frame
+                    self.renderer.analyze_gradients()
+                    
+                    # Track loss every 10 frames
+                    if frame_count % 10 == 0:
+                        loss = self.compute_current_loss()
+                        self.renderer.loss_history.append(loss)
+                        if len(self.renderer.loss_history) > 200:
+                            self.renderer.loss_history.pop(0)
+                    
                 
                 if self.renderer.debug_needs_update and self.renderer.debug_mode > 0:
                     self.renderer.update_debug_visualization(self.vol_min_world, self.vol_max_world)
@@ -915,6 +1020,9 @@ class App:
                     
                 self.renderer.render(self.camera, self.settings)
                 self.renderer.update_display()
+
+                frame_count += 1
+
             except Exception as e:
                 print(f"Runtime Render Error: {e}")
 
@@ -1188,11 +1296,142 @@ class App:
             
         imgui.end()
 
+        if imgui.begin("Training Health Monitor"):
+            health = self.renderer.gradient_health
+            
+            # Status indicator with color
+            imgui.text("Gradient Status:")
+            imgui.same_line()
+            
+            status_colors = {
+                'healthy': (0.0, 1.0, 0.0, 1.0),      # Green
+                'converged': (0.0, 0.8, 1.0, 1.0),    # Cyan
+                'exploding': (1.0, 0.0, 0.0, 1.0),    # Red
+                'vanishing': (1.0, 0.5, 0.0, 1.0),    # Orange
+                'dead': (0.5, 0.0, 0.0, 1.0),         # Dark red
+                'sparse': (1.0, 1.0, 0.0, 1.0),       # Yellow
+                'unknown': (0.5, 0.5, 0.5, 1.0)       # Gray
+            }
+            
+            color = status_colors.get(health['status'], (1, 1, 1, 1))
+            imgui.text_colored(color, health['status'].upper())
+            
+            # Gradient statistics
+            imgui.separator()
+            imgui.text("Gradient Statistics:")
+            imgui.text(f"  Mean: {health['mean']:.6f}")
+            imgui.text(f"  Max:  {health['max']:.6f}")
+            imgui.text(f"  Min:  {health['min']:.6f}")
+            imgui.text(f"  Active: {health['active_ratio']*100:.1f}%")
+            
+            # Recommendation box
+            imgui.dummy((0, 5))
+            imgui.separator()
+            
+            if health['status'] in ['exploding', 'vanishing', 'dead', 'sparse']:
+                # Warning box
+                imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(1, 1, 0, 1))
+                imgui.text_wrapped(f"⚠️  {health['recommendation']}")
+                imgui.pop_style_color()
+                
+                # Quick fix buttons
+                imgui.dummy((0, 5))
+                
+                if health['status'] == 'exploding':
+                    if imgui.button("Fix: Reduce LRs by 5×"):
+                        self.train_config.learning_rate_pos /= 5.0
+                        self.train_config.learning_rate_sigma /= 5.0
+                        self.train_config.learning_rate_weight /= 5.0
+                        print(f"Reduced learning rates by 5×")
+                    
+                    imgui.same_line()
+                    if imgui.button("Reset Adam State"):
+                        self.renderer._init_adam_state()
+                        print("Adam state reset")
+                
+                elif health['status'] == 'vanishing':
+                    if imgui.button("Fix: Increase LRs by 5×"):
+                        self.train_config.learning_rate_pos *= 5.0
+                        self.train_config.learning_rate_sigma *= 5.0
+                        self.train_config.learning_rate_weight *= 5.0
+                        print(f"Increased learning rates by 5×")
+                
+                elif health['status'] == 'sparse':
+                    if imgui.button("Fix: Increase Sigma Scale"):
+                        self.train_config.sigma_scale *= 1.5
+                        imgui.text_colored((1, 1, 0, 1), "Note: Regenerate Gaussians to apply!")
+            
+            else:
+                # All good
+                imgui.text_colored((0, 1, 0, 1), f"✓ {health['recommendation']}")
+            
+            # Loss trend
+            imgui.dummy((0, 10))
+            imgui.separator()
+            imgui.text("Loss Trend:")
+            
+            if len(self.renderer.loss_history) > 2:
+                loss_array = np.array(self.renderer.loss_history[-100:], dtype=np.float32)
+                imgui.plot_lines(
+                    "##loss_trend",
+                    loss_array,
+                    scale_min=0.0,
+                    scale_max=np.max(loss_array) * 1.1 if len(loss_array) > 0 else 1.0,
+                    graph_size=(300, 80)
+                )
+                
+                current_loss = self.renderer.loss_history[-1]
+                imgui.text(f"Current: {current_loss:.6f}")
+                
+                # Loss trend analysis
+                if len(loss_array) > 10:
+                    recent = loss_array[-10:]
+                    prev = loss_array[-20:-10] if len(loss_array) >= 20 else loss_array[:-10]
+                    
+                    improvement = np.mean(prev) - np.mean(recent) if len(prev) > 0 else 0
+                    
+                    if improvement > 0.001:
+                        imgui.text_colored((0, 1, 0, 1), f"↓ Improving ({improvement:.6f}/10 iter)")
+                    elif improvement < -0.001:
+                        imgui.text_colored((1, 0, 0, 1), f"↑ Worsening ({-improvement:.6f}/10 iter)")
+                    else:
+                        imgui.text_colored((1, 1, 0, 1), "→ Plateaued")
+            
+            # Gradient magnitude trend
+            imgui.dummy((0, 10))
+            imgui.text("Gradient Magnitude Trend:")
+            
+            if len(self.renderer.grad_mean_history) > 2:
+                grad_array = np.array(self.renderer.grad_mean_history[-100:], dtype=np.float32)
+                imgui.plot_lines(
+                    "##grad_trend",
+                    grad_array,
+                    scale_min=0.0,
+                    scale_max=np.max(grad_array) * 1.1 if len(grad_array) > 0 else 1.0,
+                    graph_size=(300, 80)
+                )
+        
+        imgui.end()
+
     def cleanup(self):
         imgui.backends.opengl3_shutdown()
         imgui.backends.glfw_shutdown()
         imgui.destroy_context()
         glfw.terminate()
+    
+    def compute_current_loss(self):
+        """Compute MSE loss between Gaussian volume and reference"""
+        # Only rasterize if we're using Gaussian volume
+        if self.renderer.use_gaussian_volume:
+            vol = self.renderer.gaussian_volume_tex.to_numpy()
+        else:
+            # Need to rasterize temporarily
+            self.renderer.rasterize_gaussians(self.vol_min_world, self.vol_max_world)
+            vol = self.renderer.gaussian_volume_tex.to_numpy()
+        
+        ref = self.renderer.volume_tex.to_numpy()
+        diff = vol - ref
+        return np.mean(diff * diff)
 
 
 # ==========================================
