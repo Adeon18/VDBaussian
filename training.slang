@@ -1,5 +1,10 @@
 // training.slang
 
+// This is set by host but if not - a safe default
+#ifndef GAUSSIAN_TYPE
+#define GAUSSIAN_TYPE 1  // 0 = Isotropic, 1 = Anisotropic
+#endif
+
 // Training workgroup dimensions (must match kernel dispatch)
 static const uint TRAIN_WG_X = 4;
 static const uint TRAIN_WG_Y = 4;
@@ -9,58 +14,203 @@ static const uint TRAIN_WG_SIZE = TRAIN_WG_X * TRAIN_WG_Y * TRAIN_WG_Z;
 // DEFINITIONS
 static const uint MAX_GAUSSIANS_PER_TILE = 64;
 
-// PARAMETER LAYOUT CONFIGURATION
-static const uint PARAM_POS_X = 0;
-static const uint PARAM_POS_Y = 1;
-static const uint PARAM_POS_Z = 2;
-static const uint PARAM_SIGMA = 3;
-static const uint PARAM_WEIGHT = 4;
-static const uint PARAMS_PER_GAUSSIAN = 5;
-
-// Learning rate groups (indices to learningRates arr)
-static const uint LR_GROUP_POSITION = 0;
-static const uint LR_GROUP_SIGMA = 1;
-static const uint LR_GROUP_WEIGHT = 2;
-static const uint NUM_LR_GROUPS = 3;
-
-// GAUSSIAN STRUCTURE
-struct Gaussian 
+// Maps each parameter to its learning rate group and constraints
+struct ParamMetadata
 {
-    float3 pos;
-    float sigma;
-    float weight;
-    
-    static float getParam(uint gaussianID, uint paramID)
-    {
-        return asfloat(gGaussianParamsRaw[gaussianID * PARAMS_PER_GAUSSIAN + paramID]);
-    }
-    
-    static void setParam(uint gaussianID, uint paramID, float value)
-    {
-        gGaussianParamsRaw[gaussianID * PARAMS_PER_GAUSSIAN + paramID] = asuint(value);
-    }
-    
-    // Convenience loaders
-    static Gaussian load(uint gaussianID)
-    {
-        Gaussian g;
-        g.pos.x = getParam(gaussianID, PARAM_POS_X);
-        g.pos.y = getParam(gaussianID, PARAM_POS_Y);
-        g.pos.z = getParam(gaussianID, PARAM_POS_Z);
-        g.sigma = getParam(gaussianID, PARAM_SIGMA);
-        g.weight = getParam(gaussianID, PARAM_WEIGHT);
-        return g;
-    }
-    
-    static void store(uint gaussianID, Gaussian g)
-    {
-        setParam(gaussianID, PARAM_POS_X, g.pos.x);
-        setParam(gaussianID, PARAM_POS_Y, g.pos.y);
-        setParam(gaussianID, PARAM_POS_Z, g.pos.z);
-        setParam(gaussianID, PARAM_SIGMA, g.sigma);
-        setParam(gaussianID, PARAM_WEIGHT, g.weight);
-    }
+    uint lrGroup;
+    float minVal;
+    float maxVal;
 };
+
+#if GAUSSIAN_TYPE == 0
+    // ISOTROPIC GAUSSIAN
+    static const uint PARAMS_PER_GAUSSIAN = 5;
+    
+    static const uint PARAM_POS_X = 0;
+    static const uint PARAM_POS_Y = 1;
+    static const uint PARAM_POS_Z = 2;
+    static const uint PARAM_SIGMA = 3;
+    static const uint PARAM_WEIGHT = 4;
+    
+    static const uint LR_GROUP_POSITION = 0;
+    static const uint LR_GROUP_SIGMA = 1;
+    static const uint LR_GROUP_WEIGHT = 2;
+    static const uint NUM_LR_GROUPS = 3;
+    
+    struct Gaussian {
+        float3 pos;
+        float sigma;
+        float weight;
+        
+        static Gaussian load(uint gaussianID) {
+            Gaussian g;
+            g.pos.x = asfloat(gGaussianParamsRaw[gaussianID * 5 + 0]);
+            g.pos.y = asfloat(gGaussianParamsRaw[gaussianID * 5 + 1]);
+            g.pos.z = asfloat(gGaussianParamsRaw[gaussianID * 5 + 2]);
+            g.sigma = asfloat(gGaussianParamsRaw[gaussianID * 5 + 3]);
+            g.weight = asfloat(gGaussianParamsRaw[gaussianID * 5 + 4]);
+            return g;
+        }
+        
+        static void store(uint gaussianID, Gaussian g) {
+            gGaussianParamsRaw[gaussianID * 5 + 0] = asuint(g.pos.x);
+            gGaussianParamsRaw[gaussianID * 5 + 1] = asuint(g.pos.y);
+            gGaussianParamsRaw[gaussianID * 5 + 2] = asuint(g.pos.z);
+            gGaussianParamsRaw[gaussianID * 5 + 3] = asuint(g.sigma);
+            gGaussianParamsRaw[gaussianID * 5 + 4] = asuint(g.weight);
+        }
+    };
+    
+    static const ParamMetadata PARAM_META[5] = {
+        { LR_GROUP_POSITION, -1e6, 1e6 },   // pos.x
+        { LR_GROUP_POSITION, -1e6, 1e6 },   // pos.y
+        { LR_GROUP_POSITION, -1e6, 1e6 },   // pos.z
+        { LR_GROUP_SIGMA,    0.01, 1e6 },   // sigma
+        { LR_GROUP_WEIGHT,   0.0,  1.0 },   // weight
+    };
+    
+#elif GAUSSIAN_TYPE == 1
+    // ANISOTROPIC GAUSSIAN
+    static const uint PARAMS_PER_GAUSSIAN = 11;
+    
+    static const uint PARAM_POS_X = 0;
+    static const uint PARAM_POS_Y = 1;
+    static const uint PARAM_POS_Z = 2;
+    static const uint PARAM_SCALE_X = 3;
+    static const uint PARAM_SCALE_Y = 4;
+    static const uint PARAM_SCALE_Z = 5;
+    static const uint PARAM_QUAT_W = 6;
+    static const uint PARAM_QUAT_X = 7;
+    static const uint PARAM_QUAT_Y = 8;
+    static const uint PARAM_QUAT_Z = 9;
+    static const uint PARAM_WEIGHT = 10;
+    
+    static const uint LR_GROUP_POSITION = 0;
+    static const uint LR_GROUP_SCALE = 1;
+    static const uint LR_GROUP_ROTATION = 2;
+    static const uint LR_GROUP_WEIGHT = 3;
+    static const uint NUM_LR_GROUPS = 4;
+    
+    struct Gaussian {
+        float3 pos;
+        float3 scale;      // Anisotropic scale (sx, sy, sz)
+        float4 rotation;   // Quaternion (w, x, y, z)
+        float weight;
+        
+        static Gaussian load(uint gaussianID) {
+            Gaussian g;
+            uint base = gaussianID * 11;
+            g.pos.x = asfloat(gGaussianParamsRaw[base + 0]);
+            g.pos.y = asfloat(gGaussianParamsRaw[base + 1]);
+            g.pos.z = asfloat(gGaussianParamsRaw[base + 2]);
+            g.scale.x = asfloat(gGaussianParamsRaw[base + 3]);
+            g.scale.y = asfloat(gGaussianParamsRaw[base + 4]);
+            g.scale.z = asfloat(gGaussianParamsRaw[base + 5]);
+            g.rotation.w = asfloat(gGaussianParamsRaw[base + 6]);
+            g.rotation.x = asfloat(gGaussianParamsRaw[base + 7]);
+            g.rotation.y = asfloat(gGaussianParamsRaw[base + 8]);
+            g.rotation.z = asfloat(gGaussianParamsRaw[base + 9]);
+            g.weight = asfloat(gGaussianParamsRaw[base + 10]);
+            return g;
+        }
+        
+        static void store(uint gaussianID, Gaussian g) {
+            uint base = gaussianID * 11;
+            gGaussianParamsRaw[base + 0] = asuint(g.pos.x);
+            gGaussianParamsRaw[base + 1] = asuint(g.pos.y);
+            gGaussianParamsRaw[base + 2] = asuint(g.pos.z);
+            gGaussianParamsRaw[base + 3] = asuint(g.scale.x);
+            gGaussianParamsRaw[base + 4] = asuint(g.scale.y);
+            gGaussianParamsRaw[base + 5] = asuint(g.scale.z);
+            gGaussianParamsRaw[base + 6] = asuint(g.rotation.w);
+            gGaussianParamsRaw[base + 7] = asuint(g.rotation.x);
+            gGaussianParamsRaw[base + 8] = asuint(g.rotation.y);
+            gGaussianParamsRaw[base + 9] = asuint(g.rotation.z);
+            gGaussianParamsRaw[base + 10] = asuint(g.weight);
+        }
+    };
+    
+    static const ParamMetadata PARAM_META[11] = {
+        { LR_GROUP_POSITION, -1e6, 1e6 },    // pos.x
+        { LR_GROUP_POSITION, -1e6, 1e6 },    // pos.y
+        { LR_GROUP_POSITION, -1e6, 1e6 },    // pos.z
+        { LR_GROUP_SCALE,    0.01, 1e6 },    // scale.x
+        { LR_GROUP_SCALE,    0.01, 1e6 },    // scale.y
+        { LR_GROUP_SCALE,    0.01, 1e6 },    // scale.z
+        { LR_GROUP_ROTATION, -1.0, 1.0 },    // quat.w
+        { LR_GROUP_ROTATION, -1.0, 1.0 },    // quat.x
+        { LR_GROUP_ROTATION, -1.0, 1.0 },    // quat.y
+        { LR_GROUP_ROTATION, -1.0, 1.0 },    // quat.z
+        { LR_GROUP_WEIGHT,   0.0,  1.0 },    // weight
+    };
+    
+#endif
+
+#if GAUSSIAN_TYPE == 0
+    // ISOTROPIC: Simple spherical Gaussian
+    [Differentiable]
+    float gaussian_math(float3 p, float3 mu, float sigma) {
+        float3 d = p - mu;
+        float r2 = dot(d, d);
+        return exp(-0.5 * r2 / (sigma * sigma));
+    }
+    
+    float get_gaussian_radius(Gaussian g) {
+        return g.sigma * 3.0;  // 3σ cutoff
+    }
+    
+#elif GAUSSIAN_TYPE == 1
+    // ANISOTROPIC: 3D covariance Gaussian
+    
+    // Quaternion to rotation matrix
+    float3x3 quat_to_matrix(float4 q) {
+        // Normalize quaternion
+        q = normalize(q);
+        
+        float xx = q.x * q.x;
+        float yy = q.y * q.y;
+        float zz = q.z * q.z;
+        float xy = q.x * q.y;
+        float xz = q.x * q.z;
+        float yz = q.y * q.z;
+        float wx = q.w * q.x;
+        float wy = q.w * q.y;
+        float wz = q.w * q.z;
+        
+        float3x3 R;
+        R[0] = float3(1.0 - 2.0*(yy + zz), 2.0*(xy - wz), 2.0*(xz + wy));
+        R[1] = float3(2.0*(xy + wz), 1.0 - 2.0*(xx + zz), 2.0*(yz - wx));
+        R[2] = float3(2.0*(xz - wy), 2.0*(yz + wx), 1.0 - 2.0*(xx + yy));
+        
+        return R;
+    }
+    
+    [Differentiable]
+    float gaussian_math_aniso(float3 p, float3 mu, float3 scale, float4 quat) {
+        float3 d = p - mu;
+        
+        // Build covariance matrix: Σ = R * S * S^T * R^T
+        float3x3 R = no_diff quat_to_matrix(quat);
+        
+        // Transform to local space: d_local = R^T * d
+        float3 d_local = mul(d, R);  // Note: mul(vector, matrix) = vector * matrix^T
+        
+        // Apply inverse scale: d_scaled = d_local / scale
+        float3 d_scaled = d_local / scale;
+        
+        // Mahalanobis distance: dist = d_scaled^T * d_scaled
+        float dist2 = dot(d_scaled, d_scaled);
+        
+        return exp(-0.5 * dist2);
+    }
+    
+    float get_gaussian_radius(Gaussian g) {
+        // Conservative estimate: 3σ of largest axis
+        return max(max(g.scale.x, g.scale.y), g.scale.z) * 3.0;
+    }
+    
+#endif
+
 
 // BINDINGS
 [[vk::binding(0)]] Texture3D<float> ReferenceVol;
@@ -82,7 +232,7 @@ cbuffer TrainParams {
     float3 maxWorld;
     
     // Generic learning rates (indexed by LR_GROUP_*)
-    float learningRates[NUM_LR_GROUPS];
+    float learningRates[4];
     
     uint3 tileResolution;
     uint totalTiles;
@@ -123,24 +273,6 @@ static const float DEBUG_ALPHA_MULT_ERROR = 20.0;
 // Heatmap thresholds for color mapping
 static const float HEATMAP_LOW_THRESHOLD = 0.2;    // Below this = mostly green
 static const float HEATMAP_HIGH_THRESHOLD = 0.8;   // Above this = mostly red
-
-
-
-// Maps each parameter to its learning rate group and constraints
-struct ParamMetadata
-{
-    uint lrGroup;
-    float minVal;
-    float maxVal;
-};
-
-static const ParamMetadata PARAM_META[PARAMS_PER_GAUSSIAN] = {
-    { LR_GROUP_POSITION, -1e6, 1e6 },   // pos.x
-    { LR_GROUP_POSITION, -1e6, 1e6 },   // pos.y
-    { LR_GROUP_POSITION, -1e6, 1e6 },   // pos.z
-    { LR_GROUP_SIGMA,    0.01, 1e6 },   // sigma
-    { LR_GROUP_WEIGHT,   0.0,  1.0 },   // weight
-};
 
 // HELPERS
 int3 WorldToVoxel(float3 pos) {
@@ -301,7 +433,7 @@ void bin_gaussians(uint3 tid : SV_DispatchThreadID) {
 
     Gaussian g = Gaussian::load(gid);
     
-    float radius = g.sigma * 3.0;
+    float radius = get_gaussian_radius(g);
     int3 min_vox = WorldToVoxel(g.pos - radius);
     int3 max_vox = WorldToVoxel(g.pos + radius);
     
@@ -362,13 +494,6 @@ void loadParam_bwd(uint gaussianID, uint paramID, uint localThreadIdx, float dOu
 }
 
 [Differentiable]
-float gaussian_math(float3 p, float3 mu, float sigma) {
-    float3 d = p - mu;
-    float r2 = dot(d, d);
-    return exp(-0.5 * r2 / (sigma * sigma));
-}
-
-[Differentiable]
 float compute_density_tiled(no_diff uint3 tid, no_diff float3 worldPos) {
     float density = 0.0;
     
@@ -384,19 +509,48 @@ float compute_density_tiled(no_diff uint3 tid, no_diff float3 worldPos) {
 
         uint gid = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + i];
         
-        // Load via generic accessor
-        float3 g_pos = float3(
-            loadParam(gid, PARAM_POS_X, localThreadIdx),
-            loadParam(gid, PARAM_POS_Y, localThreadIdx),
-            loadParam(gid, PARAM_POS_Z, localThreadIdx)
-        );
-        float g_sigma = loadParam(gid, PARAM_SIGMA, localThreadIdx);
-        float g_weight = loadParam(gid, PARAM_WEIGHT, localThreadIdx);
-        
-        float3 d = worldPos - g_pos;
-        if (no_diff(dot(d,d) > (g_sigma * 3.0)*(g_sigma * 3.0))) continue;
-
-        density += g_weight * gaussian_math(worldPos, g_pos, g_sigma);
+        #if GAUSSIAN_TYPE == 0
+            // ISOTROPIC
+            float3 g_pos = float3(
+                loadParam(gid, PARAM_POS_X, localThreadIdx),
+                loadParam(gid, PARAM_POS_Y, localThreadIdx),
+                loadParam(gid, PARAM_POS_Z, localThreadIdx)
+            );
+            float g_sigma = loadParam(gid, PARAM_SIGMA, localThreadIdx);
+            float g_weight = loadParam(gid, PARAM_WEIGHT, localThreadIdx);
+            
+            float3 d = worldPos - g_pos;
+            if (no_diff(dot(d,d) > (g_sigma * 3.0)*(g_sigma * 3.0))) continue;
+            
+            density += g_weight * gaussian_math(worldPos, g_pos, g_sigma);
+            
+        #elif GAUSSIAN_TYPE == 1
+            // ANISOTROPIC
+            float3 g_pos = float3(
+                loadParam(gid, PARAM_POS_X, localThreadIdx),
+                loadParam(gid, PARAM_POS_Y, localThreadIdx),
+                loadParam(gid, PARAM_POS_Z, localThreadIdx)
+            );
+            float3 g_scale = float3(
+                loadParam(gid, PARAM_SCALE_X, localThreadIdx),
+                loadParam(gid, PARAM_SCALE_Y, localThreadIdx),
+                loadParam(gid, PARAM_SCALE_Z, localThreadIdx)
+            );
+            float4 g_quat = float4(
+                loadParam(gid, PARAM_QUAT_W, localThreadIdx),
+                loadParam(gid, PARAM_QUAT_X, localThreadIdx),
+                loadParam(gid, PARAM_QUAT_Y, localThreadIdx),
+                loadParam(gid, PARAM_QUAT_Z, localThreadIdx)
+            );
+            float g_weight = loadParam(gid, PARAM_WEIGHT, localThreadIdx);
+            
+            // Conservative culling (use largest axis)
+            float max_scale = max(max(g_scale.x, g_scale.y), g_scale.z);
+            float3 d = worldPos - g_pos;
+            if (no_diff(dot(d,d) > (max_scale * 3.0)*(max_scale * 3.0))) continue;
+            
+            density += g_weight * gaussian_math_aniso(worldPos, g_pos, g_scale, g_quat);
+        #endif
     }
     return density;
 }

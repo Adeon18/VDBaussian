@@ -241,11 +241,11 @@ def convert_grid_to_dense_volume(grid, size):
 
 
 def convert_grid_to_gaussians(grid, config):
-    """Stochastically sample VDB grid to create Gaussians"""
+    """Generate Gaussians matching the configured type"""
     if grid is None: 
         return np.array([], dtype=np.float32)
 
-    print("Generating Gaussians from grid...")
+    print(f"Generating Gaussians from grid (type: {config.gaussian_type})...")
     accessor = grid.getAccessor()
     bbox = grid.evalActiveVoxelBoundingBox()
     min_i, max_i = np.array(bbox[0]), np.array(bbox[1])
@@ -271,32 +271,98 @@ def convert_grid_to_gaussians(grid, config):
                 jitter = (np.random.rand(3) - 0.5) * voxel_size * config.jitter_scale
                 position = center + jitter
                 
-                sigma = voxel_size * config.sigma_scale
                 weight = value
+                
+                if config.gaussian_type == GaussianType.ISOTROPIC:
+                    # 5 params: pos(3), sigma(1), weight(1)
+                    sigma = voxel_size * config.sigma_scale
+                    gaussians.append((
+                        position[0], position[1], position[2],
+                        sigma, weight
+                    ))
+                    
+                elif config.gaussian_type == GaussianType.ANISOTROPIC:
+                    # 11 params: pos(3), scale(3), quat(4), weight(1)
+                    
+                    # Initialize scale (start isotropic-ish)
+                    base_scale = voxel_size * 0.5
+                    scale_x = base_scale * (0.8 + 0.4 * random.random())  # ±20% variation
+                    scale_y = base_scale * (0.8 + 0.4 * random.random())
+                    scale_z = base_scale * (0.8 + 0.4 * random.random())
+                    
+                    # Initialize rotation (identity quaternion with small random rotation)
+                    # Start with identity quaternion (w=1, x=y=z=0)
+                    quat_w = 1.0
+                    quat_x = 0.0
+                    quat_y = 0.0
+                    quat_z = 0.0
+                    
+                    # Optionally add small random rotation
+                    if random.random() > 0.5:  # 50% get random orientation
+                        # Random axis
+                        axis = np.random.randn(3)
+                        axis = axis / np.linalg.norm(axis)
+                        
+                        # Small random angle (±30 degrees)
+                        angle = (random.random() - 0.5) * np.pi / 3.0
+                        
+                        # Axis-angle to quaternion
+                        half_angle = angle / 2.0
+                        s = np.sin(half_angle)
+                        quat_w = np.cos(half_angle)
+                        quat_x = axis[0] * s
+                        quat_y = axis[1] * s
+                        quat_z = axis[2] * s
+                    
+                    # CRITICAL: Normalize quaternion!
+                    quat_length = np.sqrt(quat_w**2 + quat_x**2 + quat_y**2 + quat_z**2)
+                    if quat_length > 1e-8:
+                        quat_w /= quat_length
+                        quat_x /= quat_length
+                        quat_y /= quat_length
+                        quat_z /= quat_length
+                    else:
+                        # Fallback to identity if degenerate
+                        quat_w = 1.0
+                        quat_x = 0.0
+                        quat_y = 0.0
+                        quat_z = 0.0
+                    
+                    gaussians.append((
+                        position[0], position[1], position[2],
+                        base_scale, base_scale, base_scale,
+                        1.0, 0.0, 0.0, 0.0,
+                        weight
+                    ))
 
-                gaussians.append((
-                    position[0], position[1], position[2],
-                    sigma, weight
-                ))
-
-    print(f"Generated {len(gaussians)} gaussians.")
+    print(f"Generated {len(gaussians)} gaussians (type {config.gaussian_type}).")
     return np.array(gaussians, dtype=np.float32)
     
+class GaussianType:
+    ISOTROPIC = 0      # 5 params: pos(3), sigma(1), weight(1)
+    ANISOTROPIC = 1    # 11 params: pos(3), scale(3), rotation(4), weight(1)
+
 class TrainingConfig:
-    """Configurable training hyperparameters"""
     def __init__(self):
-        # SGD Learning Rates
+        # Existing params
         self.learning_rate_pos = 0.1
         self.learning_rate_sigma = 0.01
         self.learning_rate_weight = 0.1
         
-        # Adam Hyperparameters
+        # Gaussian type selection
+        self.gaussian_type = GaussianType.ANISOTROPIC
+        
+        # Anisotropic-specific learning rates
+        self.learning_rate_scale = 0.01   # For 3D scale
+        self.learning_rate_rotation = 0.005  # For quaternion rotation
+        
+        # Adam params
         self.adam_beta1 = 0.9
         self.adam_beta2 = 0.999
         self.adam_epsilon = 1e-8
-        self.use_adam = True  # Toggle between SGD and Adam
+        self.use_adam = True
         
-        # Gaussian Generation
+        # Generation params
         self.probability_scale = 0.02
         self.sigma_scale = 2.0
         self.jitter_scale = 5.0
@@ -304,6 +370,12 @@ class TrainingConfig:
 # ==========================================
 # RENDERER SYSTEM
 # ==========================================
+
+def gauss_type_to_param_count(gtype):
+    if (gtype == GaussianType.ANISOTROPIC):
+        return 11
+    elif (gtype == GaussianType.ISOTROPIC):
+        return 5
 
 class Renderer:
     def __init__(self, device, volume_data):
@@ -354,8 +426,6 @@ class Renderer:
 
         self._needs_rebinning = True
         self._needs_rasterization = True
-        prog_raster_tiled = self.device.load_program("3drasterizer.slang", ["rasterize_tiled"])
-        self.pipe_raster_tiled = self.device.create_compute_pipeline(program=prog_raster_tiled)
 
         self.use_gaussian_volume = False
 
@@ -402,41 +472,142 @@ class Renderer:
         
         self.loss_history = []
         self.grad_mean_history = []
+
+        # Gaussian type
+        self.gaussian_type = GaussianType.ANISOTROPIC
+        self.params_per_gaussian = gauss_type_to_param_count(self.gaussian_type)
+        self.gaussian_struct_size = self.params_per_gaussian * 4 # 4 bytes
+
+        self._load_rasterizer()
+    
+    def _load_rasterizer(self):
+        """Load rasterizer shader with current Gaussian type"""
+        defines_source = f"#define GAUSSIAN_TYPE {self.gaussian_type}\n"
+    
+        prog_raster_tiled = self.device.load_program(
+            "3drasterizer.slang", 
+            ["rasterize_tiled"],
+            additional_source=defines_source
+        )
+        self.pipe_raster_tiled = self.device.create_compute_pipeline(program=prog_raster_tiled)
+        
+        print(f"Rasterizer loaded for GAUSSIAN_TYPE={self.gaussian_type}")
+    
+    def set_gaussian_type(self, gaussian_type):
+        """Change Gaussian representation type"""
+        old_type = self.gaussian_type
+        self.gaussian_type = gaussian_type
+        
+        if gaussian_type == GaussianType.ISOTROPIC:
+            self.params_per_gaussian = 5
+            self.gaussian_struct_size = 20
+        elif gaussian_type == GaussianType.ANISOTROPIC:
+            self.params_per_gaussian = 11
+            self.gaussian_struct_size = 44
+        
+        # Reload shaders with new type
+        if old_type != gaussian_type:
+            print(f"Recompiling shaders for new Gaussian type...")
+            self._load_rasterizer()
+            self._load_training_shaders()
+        
+        print(f"Gaussian type: {gaussian_type}, {self.params_per_gaussian} params")
+    
+    def _load_training_shaders(self):
+        """Load all training shaders with current Gaussian type"""
+    
+        # Prepend define to source
+        defines_source = f"#define GAUSSIAN_TYPE {self.gaussian_type}\n"
+        
+        print("Compiling training kernels...")
+        
+        prog_clear_grads = self.device.load_program(
+            "training.slang", ["clear_gradients"],
+            additional_source=defines_source
+        )
+        self.pipe_clear_grads = self.device.create_compute_pipeline(program=prog_clear_grads)
+        
+        prog_clear_tiles = self.device.load_program(
+            "training.slang", ["clear_tiles"],
+            additional_source=defines_source
+        )
+        self.pipe_clear_tiles = self.device.create_compute_pipeline(program=prog_clear_tiles)
+        
+        prog_bin = self.device.load_program(
+            "training.slang", ["bin_gaussians"],
+            additional_source=defines_source
+        )
+        self.pipe_bin = self.device.create_compute_pipeline(program=prog_bin)
+        
+        prog_train = self.device.load_program(
+            "training.slang", ["train_main"],
+            additional_source=defines_source
+        )
+        self.pipe_train = self.device.create_compute_pipeline(program=prog_train)
+        
+        prog_optim_sgd = self.device.load_program(
+            "training.slang", ["optimizer_sgd"],
+            additional_source=defines_source
+        )
+        self.pipe_optim_sgd = self.device.create_compute_pipeline(program=prog_optim_sgd)
+        
+        prog_optim_adam = self.device.load_program(
+            "training.slang", ["optimizer_adam"],
+            additional_source=defines_source
+        )
+        self.pipe_optim_adam = self.device.create_compute_pipeline(program=prog_optim_adam)
+        
+        prog_init_adam = self.device.load_program(
+            "training.slang", ["init_adam_state"],
+            additional_source=defines_source
+        )
+        self.pipe_init_adam = self.device.create_compute_pipeline(program=prog_init_adam)
+        
+        prog_debug = self.device.load_program(
+            "training.slang", ["compute_debug"],
+            additional_source=defines_source
+        )
+        self.pipe_debug_only = self.device.create_compute_pipeline(program=prog_debug)
+        
+        print(f"Training kernels compiled for GAUSSIAN_TYPE={self.gaussian_type}")
+
     
     def init_training(self):
 
         total_tiles = self.tile_res[0] * self.tile_res[1] * self.tile_res[2]
         
+        # Gradient buffer size depends on Gaussian type
         self.grad_buffer = self.device.create_buffer(
-            element_count=self.gaussian_count * 5,
+            element_count=self.gaussian_count * self.params_per_gaussian,
             struct_size=4,
             usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
             memory_type=spy.MemoryType.device_local
         )
-        
+
         self.tile_content = self.device.create_buffer(
             element_count=total_tiles * MAX_GAUSSIANS_PER_TILE,
             struct_size=4,
             usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
             memory_type=spy.MemoryType.device_local
         )
-        
+
         self.tile_counts = self.device.create_buffer(
             element_count=total_tiles, 
             struct_size=4,
             usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
             memory_type=spy.MemoryType.device_local
         )
-
+        
+        # Adam buffers also depend on param count
         self.adam_first_moment = self.device.create_buffer(
-            element_count=self.gaussian_count * 5,
+            element_count=self.gaussian_count * self.params_per_gaussian,
             struct_size=4,
             usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
             memory_type=spy.MemoryType.device_local
         )
         
         self.adam_second_moment = self.device.create_buffer(
-            element_count=self.gaussian_count * 5,
+            element_count=self.gaussian_count * self.params_per_gaussian,
             struct_size=4,
             usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
             memory_type=spy.MemoryType.device_local
@@ -445,29 +616,7 @@ class Renderer:
         if not self._training_initialized:
             print("Compiling Kernels...")
             
-            prog_clear_grads = self.device.load_program("training.slang", ["clear_gradients"])
-            self.pipe_clear_grads = self.device.create_compute_pipeline(program=prog_clear_grads)
-            
-            prog_clear_tiles = self.device.load_program("training.slang", ["clear_tiles"])
-            self.pipe_clear_tiles = self.device.create_compute_pipeline(program=prog_clear_tiles)
-
-            prog_bin = self.device.load_program("training.slang", ["bin_gaussians"])
-            self.pipe_bin = self.device.create_compute_pipeline(program=prog_bin)
-
-            prog_train = self.device.load_program("training.slang", ["train_main"])
-            self.pipe_train = self.device.create_compute_pipeline(program=prog_train)
-
-            prog_optim_sgd = self.device.load_program("training.slang", ["optimizer_sgd"])
-            self.pipe_optim_sgd = self.device.create_compute_pipeline(program=prog_optim_sgd)
-            
-            prog_optim_adam = self.device.load_program("training.slang", ["optimizer_adam"])
-            self.pipe_optim_adam = self.device.create_compute_pipeline(program=prog_optim_adam)
-            
-            prog_init_adam = self.device.load_program("training.slang", ["init_adam_state"])
-            self.pipe_init_adam = self.device.create_compute_pipeline(program=prog_init_adam)
-
-            prog_debug = self.device.load_program("training.slang", ["compute_debug"])
-            self.pipe_debug_only = self.device.create_compute_pipeline(program=prog_debug)
+            self._load_training_shaders()
 
             self._training_initialized = True
 
@@ -486,7 +635,7 @@ class Renderer:
             cursor["gAdamSecondMoment"] = self.adam_second_moment
             cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
             
-            threads = self.gaussian_count * 5
+            threads = self.gaussian_count * self.params_per_gaussian
             cp.dispatch(thread_count=(threads, 1, 1))
         
         self.device.submit_command_buffer(cmd.finish())
@@ -635,7 +784,7 @@ class Renderer:
             cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
             cursor["TrainParams"]["tileSize"] = TILE_SIZE
             
-            threads = self.gaussian_count * 5  # Still 5 params per Gaussian
+            threads = self.gaussian_count * self.params_per_gaussian
             cp.dispatch(thread_count=(threads, 1, 1))
         
         if self._needs_rebinning:
@@ -696,12 +845,22 @@ class Renderer:
             cursor["gGradientsRaw"] = self.grad_buffer
             cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
             
-            # Pack learning rates as array
-            cursor["TrainParams"]["learningRates"] = [
-                train_config.learning_rate_pos,
-                train_config.learning_rate_sigma,
-                train_config.learning_rate_weight
-            ]
+            if self.gaussian_type == GaussianType.ISOTROPIC:
+                # Isotropic: [pos, sigma, weight, UNUSED]
+                cursor["TrainParams"]["learningRates"] = [
+                    train_config.learning_rate_pos,      # LR_GROUP_POSITION
+                    train_config.learning_rate_sigma,    # LR_GROUP_SIGMA
+                    train_config.learning_rate_weight,   # LR_GROUP_WEIGHT
+                    0.0  # Unused (padding)
+                ]
+            elif self.gaussian_type == GaussianType.ANISOTROPIC:
+                # Anisotropic: [pos, scale, rotation, weight]
+                cursor["TrainParams"]["learningRates"] = [
+                    train_config.learning_rate_pos,       # LR_GROUP_POSITION
+                    train_config.learning_rate_scale,     # LR_GROUP_SCALE
+                    train_config.learning_rate_rotation,  # LR_GROUP_ROTATION
+                    train_config.learning_rate_weight     # LR_GROUP_WEIGHT
+                ]
             
             cursor["TrainParams"]["tileSize"] = TILE_SIZE
             
@@ -948,12 +1107,12 @@ class App:
         self.renderer.resize(self.width, self.height)
         self.renderer.gaussian_count = len(self.gaussians)
         self.renderer.gaussian_buffer = self.device.create_buffer(
-                element_count=self.renderer.gaussian_count,
-                struct_size=20,
-                usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
-                memory_type=spy.MemoryType.device_local,
-                data=self.gaussians 
-            )
+            element_count=self.renderer.gaussian_count,
+            struct_size=self.renderer.gaussian_struct_size,
+            usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+            memory_type=spy.MemoryType.device_local,
+            data=self.gaussians 
+        )
         self.renderer.init_training()
         self.renderer.rasterize_gaussians(self.vol_min_world, self.vol_max_world)
 
@@ -1122,11 +1281,20 @@ class App:
             imgui.separator()
             _, self.train_config.learning_rate_pos = imgui.slider_float(
                 "Position", self.train_config.learning_rate_pos, 0.0001, 0.1, format="%.4f")
-            _, self.train_config.learning_rate_sigma = imgui.slider_float(
-                "Sigma", self.train_config.learning_rate_sigma, 0.00001, 0.01, format="%.5f")
+           
             _, self.train_config.learning_rate_weight = imgui.slider_float(
                 "Weight", self.train_config.learning_rate_weight, 0.001, 0.1, format="%.4f")
-            
+            if self.train_config.gaussian_type == GaussianType.ANISOTROPIC:
+                imgui.dummy((0, 5))
+                imgui.text("Anisotropic Learning Rates:")
+                _, self.train_config.learning_rate_scale = imgui.slider_float(
+                    "Scale", self.train_config.learning_rate_scale, 0.001, 0.1, format="%.4f")
+                _, self.train_config.learning_rate_rotation = imgui.slider_float(
+                    "Rotation", self.train_config.learning_rate_rotation, 0.0001, 0.01, format="%.5f")
+            elif self.train_config.gaussian_type == GaussianType.ISOTROPIC:
+                 _, self.train_config.learning_rate_sigma = imgui.slider_float(
+                    "Sigma", self.train_config.learning_rate_sigma, 0.00001, 0.01, format="%.5f")
+
             if self.train_config.use_adam:
                 imgui.dummy((0, 10))
                 imgui.text("Adam Hyperparameters")
@@ -1139,6 +1307,61 @@ class App:
                     "Epsilon", self.train_config.adam_epsilon, 1e-10, 1e-6, format="%.2e")
                 
                 imgui.text(f"Iteration: {self.renderer.adam_iteration}")
+            
+
+            # GAUSSIAN REPRESENTATION
+            imgui.separator()
+            imgui.text("Gaussian Representation")
+            imgui.separator()
+            
+            if not hasattr(self, '_pending_gaussian_type_change'):
+                self._pending_gaussian_type_change = False
+
+            gaussian_types = ["Isotropic (5 params)", "Anisotropic (11 params)"]
+            old_type = self.train_config.gaussian_type
+
+            _, self.train_config.gaussian_type = imgui.combo(
+                "Gaussian Type",
+                self.train_config.gaussian_type,
+                gaussian_types
+            )
+            # Detect type change
+            if self.train_config.gaussian_type != old_type:
+                self._pending_gaussian_type_change = True
+            # Show warning and button if there's a pending change
+            if self._pending_gaussian_type_change:
+                imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(1, 1, 0, 1))
+                imgui.text("⚠️ Gaussian type changed! Regenerate to apply.")
+                imgui.pop_style_color()
+                
+                if imgui.button("Apply Type Change"):
+                    self.renderer.set_gaussian_type(self.train_config.gaussian_type)
+                    
+                    # Regenerate Gaussians with new type
+                    self.gaussians = convert_grid_to_gaussians(self.grid, self.train_config)
+                    self.renderer.gaussian_count = len(self.gaussians)
+                    self.renderer.gaussian_buffer = self.device.create_buffer(
+                        element_count=self.renderer.gaussian_count,
+                        struct_size=self.renderer.gaussian_struct_size,
+                        usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+                        memory_type=spy.MemoryType.device_local,
+                        data=self.gaussians 
+                    )
+                    self.renderer.init_training()
+                    self.renderer._needs_rebinning = True
+                    self.renderer.rasterize_gaussians(self.vol_min_world, self.vol_max_world)
+                    
+                    # Clear flag
+                    self._pending_gaussian_type_change = False
+                    print(f"Applied Gaussian type change! Now using {gaussian_types[self.train_config.gaussian_type]}")
+                
+                imgui.same_line()
+                if imgui.button("Cancel"):
+                    # Revert to renderer's current type
+                    self.train_config.gaussian_type = self.renderer.gaussian_type
+                    self._pending_gaussian_type_change = False
+            
+            
             
             imgui.dummy((0, 10))
             imgui.text("Gaussian Generation")
@@ -1155,12 +1378,12 @@ class App:
                 self.gaussians = convert_grid_to_gaussians(self.grid, self.train_config)
                 self.renderer.gaussian_count = len(self.gaussians)
                 self.renderer.gaussian_buffer = self.device.create_buffer(
-                        element_count=self.renderer.gaussian_count,
-                        struct_size=20,
-                        usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
-                        memory_type=spy.MemoryType.device_local,
-                        data=self.gaussians 
-                    )
+                    element_count=self.renderer.gaussian_count,
+                    struct_size=self.renderer.gaussian_struct_size,
+                    usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+                    memory_type=spy.MemoryType.device_local,
+                    data=self.gaussians 
+                )
                 self.renderer.init_training()
                 self.renderer._needs_rebinning = True
                 self.renderer.rasterize_gaussians(self.vol_min_world, self.vol_max_world)
