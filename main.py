@@ -12,19 +12,12 @@ import openvdb as vdb
 import itertools
 import time
 
-
-
-# ==========================================
-# CONFIGURATION
-# ==========================================
-
-ENABLE_PROFILING = True  # Toggle detailed timing measurements
-PROFILE_EVERY_N_FRAMES = 10  # Only profile every N iterations to reduce overhead
+ENABLE_PROFILING = True
+PROFILE_EVERY_N_FRAMES = 10
 PROFILE_WAIT_FOR_GPU = False
 
-# Debug Output
-PRINT_TILE_STATS = True  # Print tiling statistics
-PRINT_GRADIENT_STATS = True # Print gradient statistics
+PRINT_TILE_STATS = True
+PRINT_GRADIENT_STATS = True
 
 VDB_FILE = "cloud_01_variant_0000.vdb" 
 VOL_SIZE = 128
@@ -32,12 +25,10 @@ SHADER_FILE = "hybrid.slang"
 TILE_SIZE = 4
 MAX_GAUSSIANS_PER_TILE = 64
 
-# Window Settings
 WINDOW_WIDTH = 1024
 WINDOW_HEIGHT = 768
 WINDOW_TITLE = "VDB Editor"
 
-# Camera Defaults
 CAMERA_START_POS = [0.0, 0.0, 2.5]
 CAMERA_SPEED = 2.0
 CAMERA_SENSITIVITY = 0.1
@@ -50,16 +41,7 @@ class DebugMode:
     GAUSSIAN_OVERLAP = 4
     PREDICTION_VS_TARGET = 5
 
-
-# ==========================================
-# DATA & LOGIC CLASSES
-# ==========================================
-
 class ProfilingContext:
-    """
-    Lightweight profiling context manager.
-    Zero overhead when ENABLE_PROFILING=False.
-    """
     def __init__(self, enabled=True):
         self.enabled = enabled
         self.timings = {}
@@ -73,14 +55,12 @@ class ProfilingContext:
         pass
     
     def start(self, label):
-        """Start timing a labeled section"""
         if not self.enabled:
             return
         self.current_label = label
         self.start_time = time.perf_counter()
     
     def stop(self):
-        """Stop timing current section"""
         if not self.enabled or self.current_label is None:
             return
         elapsed = time.perf_counter() - self.start_time
@@ -88,7 +68,6 @@ class ProfilingContext:
         self.current_label = None
     
     def print_summary(self, title="Profiling Results"):
-        """Print timing summary"""
         if not self.enabled or not self.timings:
             return
         
@@ -98,7 +77,6 @@ class ProfilingContext:
         
         total = sum(self.timings.values())
         
-        # Sort by time (slowest first)
         sorted_timings = sorted(self.timings.items(), key=lambda x: x[1], reverse=True)
         
         for label, t in sorted_timings:
@@ -111,14 +89,12 @@ class ProfilingContext:
 
 class Settings:
     def __init__(self):
-        # Raymarcher
         self.step_size = 0.015
         self.density_scale = 40.0
         self.density_curve = 1.0
         self.step_count = 256
         self.smoke_color = [0.9, 0.95, 1.0]
 
-        # Lighting
         self.light_penetration = 0.15
         self.phase_g = 0.4
         
@@ -134,7 +110,6 @@ class Settings:
     
     def get_sun_dir(self):
         return self.sun_direction
-
 
 class Camera:
     def __init__(self, w, h):
@@ -188,7 +163,6 @@ class Camera:
         data[12:15] = self.up * 0.5
         return data
 
-
 def load_vdb_grid(vdb_path):
     print(f"Loading VDB file: {vdb_path}...")
     try:
@@ -202,9 +176,7 @@ def load_vdb_grid(vdb_path):
         print(f"Error loading VDB: {e}")
         return None
 
-
 def convert_grid_to_dense_volume(grid, size):
-    """Convert sparse VDB grid to dense 3D texture"""
     if grid is None:
         print("Error! Grid is None!")
         return None
@@ -239,9 +211,7 @@ def convert_grid_to_dense_volume(grid, size):
     
     return min_w, max_w, np.ascontiguousarray(data, dtype=np.float32)
 
-
 def convert_grid_to_gaussians(grid, config):
-    """Stochastically sample VDB grid to create Gaussians"""
     if grid is None: 
         return np.array([], dtype=np.float32)
 
@@ -271,39 +241,54 @@ def convert_grid_to_gaussians(grid, config):
                 jitter = (np.random.rand(3) - 0.5) * voxel_size * config.jitter_scale
                 position = center + jitter
                 
-                sigma = voxel_size * config.sigma_scale
+                base_scale = voxel_size * config.sigma_scale
+                
+                scale_x = base_scale * (0.5 + 1.0 * random.random())
+                scale_y = base_scale * (0.5 + 1.0 * random.random())
+                scale_z = base_scale * (0.5 + 1.0 * random.random())
+                
+                u1 = random.random()
+                u2 = random.random()
+                u3 = random.random()
+                
+                quat_w = np.sqrt(1 - u1) * np.sin(2 * np.pi * u2)
+                quat_x = np.sqrt(1 - u1) * np.cos(2 * np.pi * u2)
+                quat_y = np.sqrt(u1) * np.sin(2 * np.pi * u3)
+                quat_z = np.sqrt(u1) * np.cos(2 * np.pi * u3)
+                
+                quat_length = np.sqrt(quat_w**2 + quat_x**2 + quat_y**2 + quat_z**2)
+                quat_w /= quat_length
+                quat_x /= quat_length
+                quat_y /= quat_length
+                quat_z /= quat_length
+                
                 weight = value
 
                 gaussians.append((
                     position[0], position[1], position[2],
-                    sigma, weight
+                    scale_x, scale_y, scale_z,
+                    quat_w, quat_x, quat_y, quat_z,
+                    weight
                 ))
 
     print(f"Generated {len(gaussians)} gaussians.")
     return np.array(gaussians, dtype=np.float32)
     
 class TrainingConfig:
-    """Configurable training hyperparameters"""
     def __init__(self):
-        # SGD Learning Rates
         self.learning_rate_pos = 0.1
-        self.learning_rate_sigma = 0.01
+        self.learning_rate_scale = 0.01
+        self.learning_rate_rotation = 0.005
         self.learning_rate_weight = 0.1
         
-        # Adam Hyperparameters
         self.adam_beta1 = 0.9
         self.adam_beta2 = 0.999
         self.adam_epsilon = 1e-8
-        self.use_adam = True  # Toggle between SGD and Adam
+        self.use_adam = True
         
-        # Gaussian Generation
         self.probability_scale = 0.02
         self.sigma_scale = 2.0
         self.jitter_scale = 5.0
-
-# ==========================================
-# RENDERER SYSTEM
-# ==========================================
 
 class Renderer:
     def __init__(self, device, volume_data):
@@ -361,9 +346,8 @@ class Renderer:
 
         self.gaussian_buffer = None
         self.gaussian_count = 0
-        self.adam_iteration = 1  # Track iteration for bias correction
+        self.adam_iteration = 1
         
-        # Adam state buffers
         self.adam_first_moment = None
         self.adam_second_moment = None
 
@@ -371,7 +355,6 @@ class Renderer:
 
         self.check_hot_reload()
 
-        # Debug
         self.debug_tex = device.create_texture(
             type=spy.TextureType.texture_3d,
             format=spy.Format.rgba32_float,
@@ -383,7 +366,6 @@ class Renderer:
         self.debug_mode = 0
         self.debug_scale = 1.0
         
-        # Load debug raymarcher
         prog_debug = device.load_program("debug_raymarch.slang", ["vertex_main", "fragment_main"])
         self.debug_pipeline = device.create_render_pipeline(
             program=prog_debug,
@@ -392,7 +374,7 @@ class Renderer:
         )
 
         self.gradient_health = {
-            'status': 'unknown',  # 'healthy', 'exploding', 'vanishing', 'dead'
+            'status': 'unknown',
             'mean': 0.0,
             'max': 0.0,
             'min': 0.0,
@@ -404,11 +386,10 @@ class Renderer:
         self.grad_mean_history = []
     
     def init_training(self):
-
         total_tiles = self.tile_res[0] * self.tile_res[1] * self.tile_res[2]
         
         self.grad_buffer = self.device.create_buffer(
-            element_count=self.gaussian_count * 5,
+            element_count=self.gaussian_count * 11,
             struct_size=4,
             usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
             memory_type=spy.MemoryType.device_local
@@ -429,14 +410,14 @@ class Renderer:
         )
 
         self.adam_first_moment = self.device.create_buffer(
-            element_count=self.gaussian_count * 5,
+            element_count=self.gaussian_count * 11,
             struct_size=4,
             usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
             memory_type=spy.MemoryType.device_local
         )
         
         self.adam_second_moment = self.device.create_buffer(
-            element_count=self.gaussian_count * 5,
+            element_count=self.gaussian_count * 11,
             struct_size=4,
             usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
             memory_type=spy.MemoryType.device_local
@@ -472,11 +453,9 @@ class Renderer:
             self._training_initialized = True
 
         self.debug_needs_update = True
-        # Initialize Adam state to zeros
         self._init_adam_state()
     
     def _init_adam_state(self):
-        """Initialize Adam momentum buffers to zero"""
         cmd = self.device.create_command_encoder()
         
         with cmd.begin_compute_pass() as cp:
@@ -486,15 +465,13 @@ class Renderer:
             cursor["gAdamSecondMoment"] = self.adam_second_moment
             cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
             
-            threads = self.gaussian_count * 5
+            threads = self.gaussian_count * 11
             cp.dispatch(thread_count=(threads, 1, 1))
         
         self.device.submit_command_buffer(cmd.finish())
         self.adam_iteration = 1
 
-
     def analyze_gradients(self):
-        """Analyze gradient health - CALIBRATED FOR VOLUMETRIC FITTING. This function are just suggestions for me"""
         if not hasattr(self, 'grad_buffer') or self.grad_buffer is None:
             return
         
@@ -527,7 +504,6 @@ class Renderer:
         status = 'healthy'
         recommendation = 'Training normally. Gradients reflect prediction error.'
         
-        # Check for TRUE exploding gradients (much higher thresholds!)
         if max_grad > 50.0: 
             status = 'exploding'
             recommendation = 'CRITICAL: Gradients exploding! Reduce learning rates by 10×'
@@ -535,12 +511,10 @@ class Renderer:
             status = 'high'
             recommendation = 'Gradients high but manageable. Consider reducing LRs by 2× if loss oscillates.'
         
-        # Early training (high error = high gradients)
         elif mean_grad > 1.0:
             status = 'early'
             recommendation = 'Early training - high gradients are normal as error is large.'
         
-        # Check for vanishing gradients
         elif mean_grad < 1e-5:
             status = 'vanishing'
             if mean_grad < 1e-7:
@@ -548,7 +522,6 @@ class Renderer:
             else:
                 recommendation = 'Gradients getting small. May need higher learning rates or have converged.'
         
-        # Check for convergence
         elif mean_grad < 0.001 and len(self.grad_mean_history) > 20:
             recent = self.grad_mean_history[-20:]
             std = np.std(recent)
@@ -556,7 +529,6 @@ class Renderer:
                 status = 'converged'
                 recommendation = 'Gradients stable and small. Training likely converged!'
         
-        # Check trend (is it improving?)
         if status == 'healthy' and len(self.grad_mean_history) > 20:
             recent = self.grad_mean_history[-20:]
             older = self.grad_mean_history[-40:-20] if len(self.grad_mean_history) >= 40 else self.grad_mean_history[:-20]
@@ -572,7 +544,6 @@ class Renderer:
                     status = 'diverging'
                     recommendation = 'Gradients increasing - may be diverging. Consider reducing learning rates.'
         
-        # Check for sparse activation
         if active_ratio < 0.3:
             status = 'sparse'
             recommendation = f'Only {active_ratio*100:.1f}% Gaussians active. Increase sigma_scale or add more Gaussians.'
@@ -587,18 +558,13 @@ class Renderer:
         }
 
     def update_debug_visualization(self, vol_min, vol_max):
-        """
-        Update debug visualization WITHOUT running training.
-        Call this when debug mode changes or user wants to refresh.
-        """
         if self.debug_mode == 0:
             return
         
         cmd = self.device.create_command_encoder()
         
-        # Just run the debug computation kernel (no training)
         with cmd.begin_compute_pass() as cp:
-            root_object = cp.bind_pipeline(self.pipe_debug_only)  # New pipeline!
+            root_object = cp.bind_pipeline(self.pipe_debug_only)
             cursor = spy.ShaderCursor(root_object)
             
             cursor["ReferenceVol"] = self.volume_tex 
@@ -627,7 +593,6 @@ class Renderer:
         
         total_tiles = self.tile_res[0] * self.tile_res[1] * self.tile_res[2]
 
-        # 1. Clear Gradients
         with cmd.begin_compute_pass() as cp:
             root_object = cp.bind_pipeline(self.pipe_clear_grads)
             cursor = spy.ShaderCursor(root_object)
@@ -635,11 +600,10 @@ class Renderer:
             cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
             cursor["TrainParams"]["tileSize"] = TILE_SIZE
             
-            threads = self.gaussian_count * 5  # Still 5 params per Gaussian
+            threads = self.gaussian_count * 11
             cp.dispatch(thread_count=(threads, 1, 1))
         
         if self._needs_rebinning:
-            # 2. Clear Tiles
             with cmd.begin_compute_pass() as cp:
                 root_object = cp.bind_pipeline(self.pipe_clear_tiles)
                 cursor = spy.ShaderCursor(root_object)
@@ -649,7 +613,6 @@ class Renderer:
                 cursor["TrainParams"]["tileSize"] = TILE_SIZE
                 cp.dispatch(thread_count=(total_tiles, 1, 1))
 
-            # 3. Bin Gaussians
             with cmd.begin_compute_pass() as cp:
                 root_object = cp.bind_pipeline(self.pipe_bin)
                 cursor = spy.ShaderCursor(root_object)
@@ -666,7 +629,6 @@ class Renderer:
                 cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
             self._needs_rebinning = False
 
-        # 4. Train
         with cmd.begin_compute_pass() as cp:
             root_object = cp.bind_pipeline(self.pipe_train)
             cursor = spy.ShaderCursor(root_object)
@@ -685,7 +647,6 @@ class Renderer:
 
             cp.dispatch(thread_count=(VOL_SIZE, VOL_SIZE, VOL_SIZE))
 
-        # 5. Optimize
         pipeline = self.pipe_optim_adam if train_config.use_adam else self.pipe_optim_sgd
         
         with cmd.begin_compute_pass() as cp:
@@ -696,10 +657,10 @@ class Renderer:
             cursor["gGradientsRaw"] = self.grad_buffer
             cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
             
-            # Pack learning rates as array
             cursor["TrainParams"]["learningRates"] = [
                 train_config.learning_rate_pos,
-                train_config.learning_rate_sigma,
+                train_config.learning_rate_scale,
+                train_config.learning_rate_rotation,
                 train_config.learning_rate_weight
             ]
             
@@ -767,7 +728,6 @@ class Renderer:
             self.render_main(camera, settings)
 
     def render_debug(self, camera):
-        """Debug visualization using raymarcher"""
         self.cam_buffer.copy_from_numpy(camera.get_gpu_data(self.width / self.height))
         
         cmd = self.device.create_command_encoder()
@@ -854,14 +814,12 @@ class Renderer:
         glDeleteFramebuffers(1, [fb])
     
     def rasterize_gaussians(self, vol_min, vol_max):
-
         cmd = self.device.create_command_encoder()
         cmd.clear_texture_float(self.gaussian_volume_tex)
         cmd.set_texture_state(self.gaussian_volume_tex, spy.ResourceState.unordered_access)
 
         total_tiles = self.tile_res[0] * self.tile_res[1] * self.tile_res[2]
         if self._needs_rebinning:
-            # 2. Clear Tiles
             with cmd.begin_compute_pass() as cp:
                 root_object = cp.bind_pipeline(self.pipe_clear_tiles)
                 cursor = spy.ShaderCursor(root_object)
@@ -871,7 +829,6 @@ class Renderer:
                 cursor["TrainParams"]["tileSize"] = TILE_SIZE
                 cp.dispatch(thread_count=(total_tiles, 1, 1))
 
-            # 3. Bin Gaussians
             with cmd.begin_compute_pass() as cp:
                 root_object = cp.bind_pipeline(self.pipe_bin)
                 cursor = spy.ShaderCursor(root_object)
@@ -908,11 +865,6 @@ class Renderer:
         self._needs_rasterization = False
         print(f"Rasterized {self.gaussian_count} gaussians")
 
-
-# ==========================================
-# APP CLASS
-# ==========================================
-
 class App:
     def __init__(self):
         if not glfw.init(): 
@@ -948,15 +900,14 @@ class App:
         self.renderer.resize(self.width, self.height)
         self.renderer.gaussian_count = len(self.gaussians)
         self.renderer.gaussian_buffer = self.device.create_buffer(
-                element_count=self.renderer.gaussian_count,
-                struct_size=20,
-                usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
-                memory_type=spy.MemoryType.device_local,
-                data=self.gaussians 
-            )
+            element_count=self.renderer.gaussian_count,
+            struct_size=44,
+            usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+            memory_type=spy.MemoryType.device_local,
+            data=self.gaussians 
+        )
         self.renderer.init_training()
         self.renderer.rasterize_gaussians(self.vol_min_world, self.vol_max_world)
-
 
     def run(self):
         last_time = glfw.get_time()
@@ -1001,16 +952,13 @@ class App:
                     else:
                         print(f"[OK] Training Running. Refs: {total_refs}, GradMax: {np.max(np.abs(grad_debug)):.6f}")
                     
-                    # Analyze gradients every frame
                     self.renderer.analyze_gradients()
                     
-                    # Track loss every 10 frames
                     if frame_count % 10 == 0:
                         loss = self.compute_current_loss()
                         self.renderer.loss_history.append(loss)
                         if len(self.renderer.loss_history) > 200:
                             self.renderer.loss_history.pop(0)
-                    
                 
                 if self.renderer.debug_needs_update and self.renderer.debug_mode > 0:
                     self.renderer.update_debug_visualization(self.vol_min_world, self.vol_max_world)
@@ -1122,8 +1070,10 @@ class App:
             imgui.separator()
             _, self.train_config.learning_rate_pos = imgui.slider_float(
                 "Position", self.train_config.learning_rate_pos, 0.0001, 0.1, format="%.4f")
-            _, self.train_config.learning_rate_sigma = imgui.slider_float(
-                "Sigma", self.train_config.learning_rate_sigma, 0.00001, 0.01, format="%.5f")
+            _, self.train_config.learning_rate_scale = imgui.slider_float(
+                "Scale", self.train_config.learning_rate_scale, 0.0001, 0.1, format="%.4f")
+            _, self.train_config.learning_rate_rotation = imgui.slider_float(
+                "Rotation", self.train_config.learning_rate_rotation, 0.0001, 0.01, format="%.5f")
             _, self.train_config.learning_rate_weight = imgui.slider_float(
                 "Weight", self.train_config.learning_rate_weight, 0.001, 0.1, format="%.4f")
             
@@ -1155,12 +1105,12 @@ class App:
                 self.gaussians = convert_grid_to_gaussians(self.grid, self.train_config)
                 self.renderer.gaussian_count = len(self.gaussians)
                 self.renderer.gaussian_buffer = self.device.create_buffer(
-                        element_count=self.renderer.gaussian_count,
-                        struct_size=20,
-                        usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
-                        memory_type=spy.MemoryType.device_local,
-                        data=self.gaussians 
-                    )
+                    element_count=self.renderer.gaussian_count,
+                    struct_size=44,
+                    usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+                    memory_type=spy.MemoryType.device_local,
+                    data=self.gaussians 
+                )
                 self.renderer.init_training()
                 self.renderer._needs_rebinning = True
                 self.renderer.rasterize_gaussians(self.vol_min_world, self.vol_max_world)
@@ -1174,243 +1124,6 @@ class App:
                 optimizer_name = "ADAM" if self.train_config.use_adam else "SGD"
                 imgui.text_colored((0, 1, 0, 1), f"TRAINING ACTIVE ({optimizer_name})")
             
-
-            # Debug
-            imgui.dummy((0, 10))
-        imgui.text("Debug Visualization")
-        imgui.separator()
-        
-        debug_modes = [
-            "None (Normal Render)",
-            "Loss Heatmap",
-            "Gradient Magnitude",
-            "Tile Gaussian Count",
-            "Gaussian Overlap",
-            "Prediction Error"
-        ]
-        
-        old_mode = self.renderer.debug_mode
-        clicked, self.renderer.debug_mode = imgui.combo(
-            "Debug Mode", 
-            self.renderer.debug_mode, 
-            debug_modes
-        )
-        
-        # Refresh debug when mode changes
-        if self.renderer.debug_mode != old_mode:
-            self.renderer.debug_needs_update = True
-        
-        if self.renderer.debug_mode > 0:
-            old_scale = self.renderer.debug_scale
-            _, self.renderer.debug_scale = imgui.slider_float(
-                "Visualization Scale", 
-                self.renderer.debug_scale, 
-                0.1, 5.0
-            )
-            
-            # Refresh debug when scale changes
-            if abs(self.renderer.debug_scale - old_scale) > 0.01:
-                self.renderer.debug_needs_update = True
-            
-            # Mode-specific information
-            imgui.dummy((0, 5))
-            
-            if self.renderer.debug_mode == 1:  # Loss
-                imgui.text_colored((0.7, 0.7, 0.7, 1), "Loss Heatmap")
-                imgui.text_wrapped(
-                    "Green: Low loss (< 0.05) - well fitted\n"
-                    "Yellow: Medium loss (0.05-0.1) - needs improvement\n"
-                    "Red: High loss (> 0.1) - poor fit, add Gaussians"
-                )
-                imgui.separator()
-                imgui.text(f"Typical range: 0.0 - 0.05")
-                imgui.text(f"Scale multiplier: {self.renderer.debug_scale:.2f}x")
-                
-            elif self.renderer.debug_mode == 2:  # Gradients
-                imgui.text_colored((0.7, 0.7, 0.7, 1), "Gradient Magnitude")
-                imgui.text_wrapped(
-                    "Shows where optimizer is making changes.\n"
-                    "Green: Small gradients (< 0.04) - converged\n"
-                    "Yellow: Medium gradients (0.04-0.1)\n"
-                    "Red: Large gradients (> 0.1) - active learning"
-                )
-                imgui.separator()
-                
-                # Show actual gradient stats
-                if hasattr(self.renderer, 'grad_buffer') and self.renderer.grad_buffer:
-                    grad_bytes = self.renderer.grad_buffer.to_numpy()
-                    grad_debug = grad_bytes.view(dtype=np.float32)
-                    grad_nonzero = grad_debug[grad_debug != 0]
-                    if len(grad_nonzero) > 0:
-                        imgui.text(f"Current gradients:")
-                        imgui.text(f"  Max: {np.max(np.abs(grad_nonzero)):.6f}")
-                        imgui.text(f"  Mean: {np.mean(np.abs(grad_nonzero)):.6f}")
-                        imgui.text(f"  Active: {len(grad_nonzero)}/{len(grad_debug)}")
-                
-            elif self.renderer.debug_mode == 3:  # Tile density
-                imgui.text_colored((0.7, 0.7, 0.7, 1), "Tile Gaussian Count")
-                imgui.text_wrapped(
-                    "Shows Gaussian distribution efficiency.\n"
-                    "Green: Sparse (< 16 Gaussians/tile)\n"
-                    "Yellow: Medium (16-32)\n"
-                    "Red: Dense (> 32) - may need larger tiles"
-                )
-                imgui.separator()
-                
-                # Show tile stats
-                if hasattr(self.renderer, 'tile_counts') and self.renderer.tile_counts:
-                    tile_debug = self.renderer.tile_counts.to_numpy().view(dtype=np.uint32)
-                    total_refs = np.sum(tile_debug)
-                    occupied = np.sum(tile_debug > 0)
-                    if occupied > 0:
-                        imgui.text(f"Tile statistics:")
-                        imgui.text(f"  Total refs: {total_refs:,}")
-                        imgui.text(f"  Avg/tile: {total_refs/occupied:.1f}")
-                        imgui.text(f"  Max/tile: {np.max(tile_debug)}")
-                
-            elif self.renderer.debug_mode == 4:  # Overlap
-                imgui.text_colored((0.7, 0.7, 0.7, 1), "Gaussian Overlap")
-                imgui.text_wrapped(
-                    "Shows combined Gaussian density.\n"
-                    "Green: Low density (< 0.25)\n"
-                    "Yellow: Medium density (0.25-0.5)\n"
-                    "Red: High density (> 0.5)"
-                )
-                imgui.separator()
-                imgui.text(f"Typical range: 0.0 - 1.0")
-                
-            elif self.renderer.debug_mode == 5:  # Error
-                imgui.text_colored((0.7, 0.7, 0.7, 1), "Prediction Error")
-                imgui.text_wrapped(
-                    "Compares prediction vs. ground truth.\n"
-                    "Blue: Underpredicting (add Gaussians)\n"
-                    "White: Accurate (< ±0.02 error)\n"
-                    "Red: Overpredicting (reduce weights)"
-                )
-                imgui.separator()
-                imgui.text(f"Error range: -0.1 to +0.1")
-            
-            imgui.dummy((0, 5))
-            if imgui.button("Refresh Debug View"):
-                self.renderer.debug_needs_update = True
-            
-        imgui.end()
-
-        if imgui.begin("Training Health Monitor"):
-            health = self.renderer.gradient_health
-            
-            # Status indicator with color
-            imgui.text("Gradient Status:")
-            imgui.same_line()
-            
-            status_colors = {
-                'healthy': (0.0, 1.0, 0.0, 1.0),      # Green
-                'converged': (0.0, 0.8, 1.0, 1.0),    # Cyan
-                'exploding': (1.0, 0.0, 0.0, 1.0),    # Red
-                'vanishing': (1.0, 0.5, 0.0, 1.0),    # Orange
-                'dead': (0.5, 0.0, 0.0, 1.0),         # Dark red
-                'sparse': (1.0, 1.0, 0.0, 1.0),       # Yellow
-                'unknown': (0.5, 0.5, 0.5, 1.0)       # Gray
-            }
-            
-            color = status_colors.get(health['status'], (1, 1, 1, 1))
-            imgui.text_colored(color, health['status'].upper())
-            
-            # Gradient statistics
-            imgui.separator()
-            imgui.text("Gradient Statistics:")
-            imgui.text(f"  Mean: {health['mean']:.6f}")
-            imgui.text(f"  Max:  {health['max']:.6f}")
-            imgui.text(f"  Min:  {health['min']:.6f}")
-            imgui.text(f"  Active: {health['active_ratio']*100:.1f}%")
-            
-            # Recommendation box
-            imgui.dummy((0, 5))
-            imgui.separator()
-            
-            if health['status'] in ['exploding', 'vanishing', 'dead', 'sparse']:
-                # Warning box
-                imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(1, 1, 0, 1))
-                imgui.text_wrapped(f"⚠️  {health['recommendation']}")
-                imgui.pop_style_color()
-                
-                # Quick fix buttons
-                imgui.dummy((0, 5))
-                
-                if health['status'] == 'exploding':
-                    if imgui.button("Fix: Reduce LRs by 5×"):
-                        self.train_config.learning_rate_pos /= 5.0
-                        self.train_config.learning_rate_sigma /= 5.0
-                        self.train_config.learning_rate_weight /= 5.0
-                        print(f"Reduced learning rates by 5×")
-                    
-                    imgui.same_line()
-                    if imgui.button("Reset Adam State"):
-                        self.renderer._init_adam_state()
-                        print("Adam state reset")
-                
-                elif health['status'] == 'vanishing':
-                    if imgui.button("Fix: Increase LRs by 5×"):
-                        self.train_config.learning_rate_pos *= 5.0
-                        self.train_config.learning_rate_sigma *= 5.0
-                        self.train_config.learning_rate_weight *= 5.0
-                        print(f"Increased learning rates by 5×")
-                
-                elif health['status'] == 'sparse':
-                    if imgui.button("Fix: Increase Sigma Scale"):
-                        self.train_config.sigma_scale *= 1.5
-                        imgui.text_colored((1, 1, 0, 1), "Note: Regenerate Gaussians to apply!")
-            
-            else:
-                # All good
-                imgui.text_colored((0, 1, 0, 1), f"✓ {health['recommendation']}")
-            
-            # Loss trend
-            imgui.dummy((0, 10))
-            imgui.separator()
-            imgui.text("Loss Trend:")
-            
-            if len(self.renderer.loss_history) > 2:
-                loss_array = np.array(self.renderer.loss_history[-100:], dtype=np.float32)
-                imgui.plot_lines(
-                    "##loss_trend",
-                    loss_array,
-                    scale_min=0.0,
-                    scale_max=np.max(loss_array) * 1.1 if len(loss_array) > 0 else 1.0,
-                    graph_size=(300, 80)
-                )
-                
-                current_loss = self.renderer.loss_history[-1]
-                imgui.text(f"Current: {current_loss:.6f}")
-                
-                # Loss trend analysis
-                if len(loss_array) > 10:
-                    recent = loss_array[-10:]
-                    prev = loss_array[-20:-10] if len(loss_array) >= 20 else loss_array[:-10]
-                    
-                    improvement = np.mean(prev) - np.mean(recent) if len(prev) > 0 else 0
-                    
-                    if improvement > 0.001:
-                        imgui.text_colored((0, 1, 0, 1), f"↓ Improving ({improvement:.6f}/10 iter)")
-                    elif improvement < -0.001:
-                        imgui.text_colored((1, 0, 0, 1), f"↑ Worsening ({-improvement:.6f}/10 iter)")
-                    else:
-                        imgui.text_colored((1, 1, 0, 1), "→ Plateaued")
-            
-            # Gradient magnitude trend
-            imgui.dummy((0, 10))
-            imgui.text("Gradient Magnitude Trend:")
-            
-            if len(self.renderer.grad_mean_history) > 2:
-                grad_array = np.array(self.renderer.grad_mean_history[-100:], dtype=np.float32)
-                imgui.plot_lines(
-                    "##grad_trend",
-                    grad_array,
-                    scale_min=0.0,
-                    scale_max=np.max(grad_array) * 1.1 if len(grad_array) > 0 else 1.0,
-                    graph_size=(300, 80)
-                )
-        
         imgui.end()
 
     def cleanup(self):
@@ -1420,12 +1133,9 @@ class App:
         glfw.terminate()
     
     def compute_current_loss(self):
-        """Compute MSE loss between Gaussian volume and reference"""
-        # Only rasterize if we're using Gaussian volume
         if self.renderer.use_gaussian_volume:
             vol = self.renderer.gaussian_volume_tex.to_numpy()
         else:
-            # Need to rasterize temporarily
             self.renderer.rasterize_gaussians(self.vol_min_world, self.vol_max_world)
             vol = self.renderer.gaussian_volume_tex.to_numpy()
         
@@ -1433,10 +1143,6 @@ class App:
         diff = vol - ref
         return np.mean(diff * diff)
 
-
-# ==========================================
-# ENTRY POINT
-# ==========================================
 
 if __name__ == "__main__":
     app = App()

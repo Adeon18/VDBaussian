@@ -1,33 +1,34 @@
-// training.slang
-
-// Training workgroup dimensions (must match kernel dispatch)
 static const uint TRAIN_WG_X = 4;
 static const uint TRAIN_WG_Y = 4;
 static const uint TRAIN_WG_Z = 4;
 static const uint TRAIN_WG_SIZE = TRAIN_WG_X * TRAIN_WG_Y * TRAIN_WG_Z;
 
-// DEFINITIONS
 static const uint MAX_GAUSSIANS_PER_TILE = 64;
 
-// PARAMETER LAYOUT CONFIGURATION
 static const uint PARAM_POS_X = 0;
 static const uint PARAM_POS_Y = 1;
 static const uint PARAM_POS_Z = 2;
-static const uint PARAM_SIGMA = 3;
-static const uint PARAM_WEIGHT = 4;
-static const uint PARAMS_PER_GAUSSIAN = 5;
+static const uint PARAM_SCALE_X = 3;
+static const uint PARAM_SCALE_Y = 4;
+static const uint PARAM_SCALE_Z = 5;
+static const uint PARAM_QUAT_W = 6;
+static const uint PARAM_QUAT_X = 7;
+static const uint PARAM_QUAT_Y = 8;
+static const uint PARAM_QUAT_Z = 9;
+static const uint PARAM_WEIGHT = 10;
+static const uint PARAMS_PER_GAUSSIAN = 11;
 
-// Learning rate groups (indices to learningRates arr)
 static const uint LR_GROUP_POSITION = 0;
-static const uint LR_GROUP_SIGMA = 1;
-static const uint LR_GROUP_WEIGHT = 2;
-static const uint NUM_LR_GROUPS = 3;
+static const uint LR_GROUP_SCALE = 1;
+static const uint LR_GROUP_ROTATION = 2;
+static const uint LR_GROUP_WEIGHT = 3;
+static const uint NUM_LR_GROUPS = 4;
 
-// GAUSSIAN STRUCTURE
 struct Gaussian 
 {
     float3 pos;
-    float sigma;
+    float3 scale;
+    float4 rotation;
     float weight;
     
     static float getParam(uint gaussianID, uint paramID)
@@ -40,14 +41,19 @@ struct Gaussian
         gGaussianParamsRaw[gaussianID * PARAMS_PER_GAUSSIAN + paramID] = asuint(value);
     }
     
-    // Convenience loaders
     static Gaussian load(uint gaussianID)
     {
         Gaussian g;
         g.pos.x = getParam(gaussianID, PARAM_POS_X);
         g.pos.y = getParam(gaussianID, PARAM_POS_Y);
         g.pos.z = getParam(gaussianID, PARAM_POS_Z);
-        g.sigma = getParam(gaussianID, PARAM_SIGMA);
+        g.scale.x = getParam(gaussianID, PARAM_SCALE_X);
+        g.scale.y = getParam(gaussianID, PARAM_SCALE_Y);
+        g.scale.z = getParam(gaussianID, PARAM_SCALE_Z);
+        g.rotation.w = getParam(gaussianID, PARAM_QUAT_W);
+        g.rotation.x = getParam(gaussianID, PARAM_QUAT_X);
+        g.rotation.y = getParam(gaussianID, PARAM_QUAT_Y);
+        g.rotation.z = getParam(gaussianID, PARAM_QUAT_Z);
         g.weight = getParam(gaussianID, PARAM_WEIGHT);
         return g;
     }
@@ -57,14 +63,19 @@ struct Gaussian
         setParam(gaussianID, PARAM_POS_X, g.pos.x);
         setParam(gaussianID, PARAM_POS_Y, g.pos.y);
         setParam(gaussianID, PARAM_POS_Z, g.pos.z);
-        setParam(gaussianID, PARAM_SIGMA, g.sigma);
+        setParam(gaussianID, PARAM_SCALE_X, g.scale.x);
+        setParam(gaussianID, PARAM_SCALE_Y, g.scale.y);
+        setParam(gaussianID, PARAM_SCALE_Z, g.scale.z);
+        setParam(gaussianID, PARAM_QUAT_W, g.rotation.w);
+        setParam(gaussianID, PARAM_QUAT_X, g.rotation.x);
+        setParam(gaussianID, PARAM_QUAT_Y, g.rotation.y);
+        setParam(gaussianID, PARAM_QUAT_Z, g.rotation.z);
         setParam(gaussianID, PARAM_WEIGHT, g.weight);
     }
 };
 
-// BINDINGS
 [[vk::binding(0)]] Texture3D<float> ReferenceVol;
-[[vk::binding(1)]] RWStructuredBuffer<uint> gGaussianParamsRaw;  // Raw floab buffer
+[[vk::binding(1)]] RWStructuredBuffer<uint> gGaussianParamsRaw;
 [[vk::binding(2)]] RWStructuredBuffer<uint> gGradientsRaw;
 [[vk::binding(3)]] RWStructuredBuffer<uint> gTileContent; 
 [[vk::binding(4)]] RWStructuredBuffer<uint> gTileCounts; 
@@ -74,14 +85,12 @@ struct Gaussian
 
 groupshared float reductionBuffer[TRAIN_WG_SIZE];
 
-
 cbuffer TrainParams {
     uint3 volumeResolution;
     uint  gaussianCount;
     float3 minWorld;
     float3 maxWorld;
     
-    // Generic learning rates (indexed by LR_GROUP_*)
     float learningRates[NUM_LR_GROUPS];
     
     uint3 tileResolution;
@@ -93,12 +102,10 @@ cbuffer TrainParams {
     float adamEpsilon;
     uint adamIteration;
 
-    // Debug
     uint debugMode;
     float debugScale;
 };
 
-// Debug
 static const uint DEBUG_NONE = 0;
 static const uint DEBUG_LOSS = 1;
 static const uint DEBUG_GRADIENT_MAG = 2;
@@ -106,27 +113,21 @@ static const uint DEBUG_TILE_DENSITY = 3;
 static const uint DEBUG_OVERLAP = 4;
 static const uint DEBUG_PRED_VS_TARGET = 5;
 
-// Scale factors for different debug modes
-static const float DEBUG_LOSS_SCALE = 20.0;           // Loss values typically 0.0-0.05
-static const float DEBUG_GRADIENT_SCALE = 5.0;        // Gradients typically 0.0-0.2
-static const float DEBUG_TILE_SCALE = 1.0 / 32.0;    // Tile counts 0-64
-static const float DEBUG_OVERLAP_SCALE = 2.0;         // Density typically 0.0-0.5
-static const float DEBUG_ERROR_SCALE = 10.0;          // Prediction error typically -0.1 to +0.1
+static const float DEBUG_LOSS_SCALE = 20.0;
+static const float DEBUG_GRADIENT_SCALE = 5.0;
+static const float DEBUG_TILE_SCALE = 1.0 / 32.0;
+static const float DEBUG_OVERLAP_SCALE = 2.0;
+static const float DEBUG_ERROR_SCALE = 10.0;
 
-// Opacity scaling (how quickly debug vis becomes opaque)
 static const float DEBUG_ALPHA_MULT_LOSS = 100.0;
 static const float DEBUG_ALPHA_MULT_GRADIENT = 50.0;
 static const float DEBUG_ALPHA_MULT_TILE = 2.0;
 static const float DEBUG_ALPHA_MULT_OVERLAP = 5.0;
 static const float DEBUG_ALPHA_MULT_ERROR = 20.0;
 
-// Heatmap thresholds for color mapping
-static const float HEATMAP_LOW_THRESHOLD = 0.2;    // Below this = mostly green
-static const float HEATMAP_HIGH_THRESHOLD = 0.8;   // Above this = mostly red
+static const float HEATMAP_LOW_THRESHOLD = 0.2;
+static const float HEATMAP_HIGH_THRESHOLD = 0.8;
 
-
-
-// Maps each parameter to its learning rate group and constraints
 struct ParamMetadata
 {
     uint lrGroup;
@@ -135,14 +136,19 @@ struct ParamMetadata
 };
 
 static const ParamMetadata PARAM_META[PARAMS_PER_GAUSSIAN] = {
-    { LR_GROUP_POSITION, -1e6, 1e6 },   // pos.x
-    { LR_GROUP_POSITION, -1e6, 1e6 },   // pos.y
-    { LR_GROUP_POSITION, -1e6, 1e6 },   // pos.z
-    { LR_GROUP_SIGMA,    0.01, 1e6 },   // sigma
-    { LR_GROUP_WEIGHT,   0.0,  1.0 },   // weight
+    { LR_GROUP_POSITION, -1e6, 1e6 },
+    { LR_GROUP_POSITION, -1e6, 1e6 },
+    { LR_GROUP_POSITION, -1e6, 1e6 },
+    { LR_GROUP_SCALE, 0.01, 1e6 },
+    { LR_GROUP_SCALE, 0.01, 1e6 },
+    { LR_GROUP_SCALE, 0.01, 1e6 },
+    { LR_GROUP_ROTATION, -1.0, 1.0 },
+    { LR_GROUP_ROTATION, -1.0, 1.0 },
+    { LR_GROUP_ROTATION, -1.0, 1.0 },
+    { LR_GROUP_ROTATION, -1.0, 1.0 },
+    { LR_GROUP_WEIGHT, 0.0, 1.0 },
 };
 
-// HELPERS
 int3 WorldToVoxel(float3 pos) {
     float3 uvw = (pos - minWorld) / (maxWorld - minWorld);
     return int3(floor(uvw * float3(volumeResolution)));
@@ -154,49 +160,58 @@ uint GetTileIndex(uint3 voxelID) {
     return tileID.z * (tileResolution.x * tileResolution.y) + tileID.y * tileResolution.x + tileID.x;
 }
 
-// Compute local thread index within workgroup
 uint GetLocalThreadIndex(uint3 tid) {
     uint3 local = tid % uint3(TRAIN_WG_X, TRAIN_WG_Y, TRAIN_WG_Z);
     return local.x + local.y * TRAIN_WG_X + local.z * TRAIN_WG_X * TRAIN_WG_Y;
 }
 
 float3 heatmapColor(float t) {
-    // Improved heatmap with better distribution
     t = clamp(t, 0.0, 1.0);
-    
-    // Apply power curve for better visual distribution
-    t = pow(t, 0.7);  // Makes mid-range more visible
+    t = pow(t, 0.7);
     
     if (t < 0.33) {
-        // Green to Yellow-Green
         return lerp(float3(0.0, 0.8, 0.0), float3(0.5, 1.0, 0.0), t * 3.0);
     } else if (t < 0.67) {
-        // Yellow-Green to Orange
         return lerp(float3(0.5, 1.0, 0.0), float3(1.0, 0.6, 0.0), (t - 0.33) * 3.0);
     } else {
-        // Orange to Red
         return lerp(float3(1.0, 0.6, 0.0), float3(1.0, 0.0, 0.0), (t - 0.67) * 3.0);
     }
 }
 
 float3 divergingColor(float t) {
-    // Improved diverging colormap
-    // Blue (under) → White (zero) → Red (over)
     t = clamp(t, -1.0, 1.0);
     
     if (t < -0.1) {
-        // Strong blue for significant underprediction
         float blend = clamp((-t - 0.1) / 0.9, 0.0, 1.0);
         return lerp(float3(0.7, 0.9, 1.0), float3(0.0, 0.0, 1.0), blend);
     } else if (t < 0.1) {
-        // White zone for small errors
-        float blend = t / 0.1 * 0.5 + 0.5;  // 0.0 to 1.0
+        float blend = t / 0.1 * 0.5 + 0.5;
         return lerp(float3(0.7, 0.9, 1.0), float3(1.0, 0.9, 0.7), blend);
     } else {
-        // Strong red for significant overprediction
         float blend = clamp((t - 0.1) / 0.9, 0.0, 1.0);
         return lerp(float3(1.0, 0.9, 0.7), float3(1.0, 0.0, 0.0), blend);
     }
+}
+
+float3x3 quat_to_matrix(float4 q) {
+    q = normalize(q);
+    
+    float xx = q.x * q.x;
+    float yy = q.y * q.y;
+    float zz = q.z * q.z;
+    float xy = q.x * q.y;
+    float xz = q.x * q.z;
+    float yz = q.y * q.z;
+    float wx = q.w * q.x;
+    float wy = q.w * q.y;
+    float wz = q.w * q.z;
+    
+    float3x3 R;
+    R[0] = float3(1.0 - 2.0*(yy + zz), 2.0*(xy - wz), 2.0*(xz + wy));
+    R[1] = float3(2.0*(xy + wz), 1.0 - 2.0*(xx + zz), 2.0*(yz - wx));
+    R[2] = float3(2.0*(xz - wy), 2.0*(yz + wx), 1.0 - 2.0*(xx + yy));
+    
+    return R;
 }
 
 [shader("compute")]
@@ -214,7 +229,6 @@ void compute_debug(uint3 tid : SV_DispatchThreadID) {
     float debugAlpha = 0.0;
     
     if (debugMode == DEBUG_LOSS) {
-        // Compute loss at this voxel
         float predicted = compute_density_tiled(tid, worldPos);
         float target = ReferenceVol[tid];
         float diff = predicted - target;
@@ -226,7 +240,6 @@ void compute_debug(uint3 tid : SV_DispatchThreadID) {
         debugAlpha = min(loss * DEBUG_ALPHA_MULT_LOSS * debugScale, 1.0);
     }
     else if (debugMode == DEBUG_GRADIENT_MAG) {
-        // Sum gradient magnitudes for all Gaussians affecting this voxel
         uint tileIdx = GetTileIndex(tid);
         uint count = gTileCounts[tileIdx];
         count = min(count, MAX_GAUSSIANS_PER_TILE);
@@ -238,9 +251,9 @@ void compute_debug(uint3 tid : SV_DispatchThreadID) {
             float gradMag = 0.0;
             for (uint p = 0; p < PARAMS_PER_GAUSSIAN; ++p) {
                 float g = asfloat(gGradientsRaw[gid * PARAMS_PER_GAUSSIAN + p]);
-                gradMag += g * g;  // L2 norm squared
+                gradMag += g * g;
             }
-            totalGradMag += sqrt(gradMag);  // L2 norm
+            totalGradMag += sqrt(gradMag);
         }
         
         rawValue = totalGradMag;
@@ -249,7 +262,6 @@ void compute_debug(uint3 tid : SV_DispatchThreadID) {
         debugAlpha = min(totalGradMag * DEBUG_ALPHA_MULT_GRADIENT * debugScale, 1.0);
     }
     else if (debugMode == DEBUG_TILE_DENSITY) {
-        // Visualize Gaussian count per tile
         uint tileIdx = GetTileIndex(tid);
         uint count = gTileCounts[tileIdx];
         
@@ -259,7 +271,6 @@ void compute_debug(uint3 tid : SV_DispatchThreadID) {
         debugAlpha = normalizedValue;
     }
     else if (debugMode == DEBUG_OVERLAP) {
-        // Visualize Gaussian density
         float density = compute_density_tiled(tid, worldPos);
         
         rawValue = density;
@@ -268,7 +279,6 @@ void compute_debug(uint3 tid : SV_DispatchThreadID) {
         debugAlpha = min(density * DEBUG_ALPHA_MULT_OVERLAP * debugScale, 1.0);
     }
     else if (debugMode == DEBUG_PRED_VS_TARGET) {
-        // Visualize prediction error
         float predicted = compute_density_tiled(tid, worldPos);
         float target = ReferenceVol[tid];
         float error = predicted - target;
@@ -279,11 +289,9 @@ void compute_debug(uint3 tid : SV_DispatchThreadID) {
         debugAlpha = min(abs(error) * DEBUG_ALPHA_MULT_ERROR * debugScale, 1.0);
     }
     
-    // Store: RGB = color, A = alpha (for compositing)
     gDebugVolume[tid] = float4(debugColor, debugAlpha);
 }
 
-// CLEAR TILES
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void clear_tiles(uint3 tid : SV_DispatchThreadID)
@@ -292,7 +300,6 @@ void clear_tiles(uint3 tid : SV_DispatchThreadID)
     gTileCounts[tid.x] = 0;
 }
 
-// BIN GAUSSIANS
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void bin_gaussians(uint3 tid : SV_DispatchThreadID) {
@@ -301,7 +308,8 @@ void bin_gaussians(uint3 tid : SV_DispatchThreadID) {
 
     Gaussian g = Gaussian::load(gid);
     
-    float radius = g.sigma * 3.0;
+    float max_scale = max(max(g.scale.x, g.scale.y), g.scale.z);
+    float radius = max_scale * 3.0;
     int3 min_vox = WorldToVoxel(g.pos - radius);
     int3 max_vox = WorldToVoxel(g.pos + radius);
     
@@ -323,7 +331,6 @@ void bin_gaussians(uint3 tid : SV_DispatchThreadID) {
     }
 }
 
-// ATOMIC GRADIENT ACCUMULATION
 void atomicAccumulate(uint idx, float val) {
     if (val == 0.0) return;
     for (;;) {
@@ -337,7 +344,6 @@ void atomicAccumulate(uint idx, float val) {
     }
 }
 
-// DIFFERENTIABLE PARAMETER LOADERS
 [BackwardDerivative(loadParam_bwd)]
 float loadParam(uint gaussianID, uint paramID, uint localThreadIdx) {
     return asfloat(gGaussianParamsRaw[gaussianID * PARAMS_PER_GAUSSIAN + paramID]);
@@ -362,10 +368,17 @@ void loadParam_bwd(uint gaussianID, uint paramID, uint localThreadIdx, float dOu
 }
 
 [Differentiable]
-float gaussian_math(float3 p, float3 mu, float sigma) {
+float gaussian_math_aniso(float3 p, float3 mu, float3 scale, float4 quat) {
     float3 d = p - mu;
-    float r2 = dot(d, d);
-    return exp(-0.5 * r2 / (sigma * sigma));
+    
+    float3x3 R = no_diff quat_to_matrix(quat);
+    float3x3 R_T = transpose(R);
+    float3 d_local = mul(R_T, d);
+    
+    float3 d_scaled = d_local / scale;
+    float dist2 = dot(d_scaled, d_scaled);
+    
+    return exp(-0.5 * dist2);
 }
 
 [Differentiable]
@@ -384,19 +397,29 @@ float compute_density_tiled(no_diff uint3 tid, no_diff float3 worldPos) {
 
         uint gid = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + i];
         
-        // Load via generic accessor
         float3 g_pos = float3(
             loadParam(gid, PARAM_POS_X, localThreadIdx),
             loadParam(gid, PARAM_POS_Y, localThreadIdx),
             loadParam(gid, PARAM_POS_Z, localThreadIdx)
         );
-        float g_sigma = loadParam(gid, PARAM_SIGMA, localThreadIdx);
+        float3 g_scale = float3(
+            loadParam(gid, PARAM_SCALE_X, localThreadIdx),
+            loadParam(gid, PARAM_SCALE_Y, localThreadIdx),
+            loadParam(gid, PARAM_SCALE_Z, localThreadIdx)
+        );
+        float4 g_quat = float4(
+            loadParam(gid, PARAM_QUAT_W, localThreadIdx),
+            loadParam(gid, PARAM_QUAT_X, localThreadIdx),
+            loadParam(gid, PARAM_QUAT_Y, localThreadIdx),
+            loadParam(gid, PARAM_QUAT_Z, localThreadIdx)
+        );
         float g_weight = loadParam(gid, PARAM_WEIGHT, localThreadIdx);
         
+        float max_scale = max(max(g_scale.x, g_scale.y), g_scale.z);
         float3 d = worldPos - g_pos;
-        if (no_diff(dot(d,d) > (g_sigma * 3.0)*(g_sigma * 3.0))) continue;
-
-        density += g_weight * gaussian_math(worldPos, g_pos, g_sigma);
+        if (no_diff(dot(d,d) > (max_scale * 3.0)*(max_scale * 3.0))) continue;
+        
+        density += g_weight * gaussian_math_aniso(worldPos, g_pos, g_scale, g_quat);
     }
     return density;
 }
@@ -418,7 +441,6 @@ float compute_loss(
     return diff * diff;
 }
 
-// TRAINING
 [shader("compute")]
 [numthreads(TRAIN_WG_X, TRAIN_WG_Y, TRAIN_WG_Z)]
 void train_main(uint3 tid : SV_DispatchThreadID) {
@@ -427,7 +449,6 @@ void train_main(uint3 tid : SV_DispatchThreadID) {
     bwd_diff(compute_loss)(tid, minWorld, maxWorld, volumeResolution, 1.0);
 }
 
-// CLEAR GRADIENTS
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void clear_gradients(uint3 tid : SV_DispatchThreadID) {
@@ -436,83 +457,66 @@ void clear_gradients(uint3 tid : SV_DispatchThreadID) {
     }
 }
 
-// SGD OPTIMIZER (GENERIC)
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void optimizer_sgd(uint3 tid : SV_DispatchThreadID) {
     uint gid = tid.x;
     if (gid >= gaussianCount) return;
     
-    // Process all parameters generically
     for (uint paramID = 0; paramID < PARAMS_PER_GAUSSIAN; ++paramID) {
         uint idx = gid * PARAMS_PER_GAUSSIAN + paramID;
         float gradient = asfloat(gGradientsRaw[idx]);
         float currentVal = asfloat(gGaussianParamsRaw[idx]);
         
-        // Get metadata
         ParamMetadata meta = PARAM_META[paramID];
         float lr = learningRates[meta.lrGroup];
         
-        // Update
         float newVal = currentVal - gradient * lr;
-        
-        // Clamp
         newVal = clamp(newVal, meta.minVal, meta.maxVal);
         
         gGaussianParamsRaw[idx] = asuint(newVal);
     }
 }
 
-// ADAM OPTIMIZER
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void optimizer_adam(uint3 tid : SV_DispatchThreadID) {
     uint gid = tid.x;
     if (gid >= gaussianCount) return;
     
-    // Bias correction terms (computed once per Gaussian)
     float beta1_pow = pow(adamBeta1, float(adamIteration));
     float beta2_pow = pow(adamBeta2, float(adamIteration));
     
-    // Process all parameters generically
     for (uint paramID = 0; paramID < PARAMS_PER_GAUSSIAN; ++paramID) {
         uint idx = gid * PARAMS_PER_GAUSSIAN + paramID;
         
         float g_t = asfloat(gGradientsRaw[idx]);
         float currentVal = asfloat(gGaussianParamsRaw[idx]);
         
-        // Load previous moments
         float m_t_prev = gAdamFirstMoment[idx];
         float v_t_prev = gAdamSecondMoment[idx];
         
-        // Update moments
         float m_t = adamBeta1 * m_t_prev + (1.0 - adamBeta1) * g_t;
         float v_t = adamBeta2 * v_t_prev + (1.0 - adamBeta2) * (g_t * g_t);
         
-        // Store moments
         gAdamFirstMoment[idx] = m_t;
         gAdamSecondMoment[idx] = v_t;
         
-        // Bias correction
         float m_t_hat = m_t / (1.0 - beta1_pow);
         float v_t_hat = v_t / (1.0 - beta2_pow);
         
-        // Get metadata
         ParamMetadata meta = PARAM_META[paramID];
         float lr = learningRates[meta.lrGroup];
         
-        // Compute update
         float update = (lr / (sqrt(v_t_hat) + adamEpsilon)) * m_t_hat;
         float newVal = currentVal - update;
         
-        // Clamp
         newVal = clamp(newVal, meta.minVal, meta.maxVal);
         
         gGaussianParamsRaw[idx] = asuint(newVal);
     }
 }
 
-// INITIALIZE ADAM STATE
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void init_adam_state(uint3 tid : SV_DispatchThreadID) {
