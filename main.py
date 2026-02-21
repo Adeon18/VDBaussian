@@ -42,6 +42,8 @@ CAMERA_START_POS = [0.0, 0.0, 2.5]
 CAMERA_SPEED = 2.0
 CAMERA_SENSITIVITY = 0.1
 
+PARAMS_PER_GAUSSIAN = 11  # pos(3) + scale(3) + quat(4) + weight(1)
+
 class DebugMode:
     NONE = 0
     LOSS = 1
@@ -275,8 +277,10 @@ def convert_grid_to_gaussians(grid, config):
                 weight = value
 
                 gaussians.append((
-                    position[0], position[1], position[2],
-                    sigma, weight
+                    position[0], position[1], position[2],   # pos
+                    sigma, sigma, sigma,                     # scale (isotropic start)
+                    0.0, 0.0, 0.0, 1.0,                      # quaternion (identity)
+                    weight                                   # weight
                 ))
 
     print(f"Generated {len(gaussians)} gaussians.")
@@ -287,7 +291,8 @@ class TrainingConfig:
     def __init__(self):
         # SGD Learning Rates
         self.learning_rate_pos = 0.1
-        self.learning_rate_sigma = 0.01
+        self.learning_rate_scale = 0.01
+        self.learning_rate_rotation = 0.001
         self.learning_rate_weight = 0.1
         
         # Adam Hyperparameters
@@ -408,7 +413,7 @@ class Renderer:
         total_tiles = self.tile_res[0] * self.tile_res[1] * self.tile_res[2]
         
         self.grad_buffer = self.device.create_buffer(
-            element_count=self.gaussian_count * 5,
+            element_count=self.gaussian_count * PARAMS_PER_GAUSSIAN,
             struct_size=4,
             usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
             memory_type=spy.MemoryType.device_local
@@ -429,14 +434,14 @@ class Renderer:
         )
 
         self.adam_first_moment = self.device.create_buffer(
-            element_count=self.gaussian_count * 5,
+            element_count=self.gaussian_count * PARAMS_PER_GAUSSIAN,
             struct_size=4,
             usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
             memory_type=spy.MemoryType.device_local
         )
         
         self.adam_second_moment = self.device.create_buffer(
-            element_count=self.gaussian_count * 5,
+            element_count=self.gaussian_count * PARAMS_PER_GAUSSIAN,
             struct_size=4,
             usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
             memory_type=spy.MemoryType.device_local
@@ -486,7 +491,7 @@ class Renderer:
             cursor["gAdamSecondMoment"] = self.adam_second_moment
             cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
             
-            threads = self.gaussian_count * 5
+            threads = self.gaussian_count * PARAMS_PER_GAUSSIAN
             cp.dispatch(thread_count=(threads, 1, 1))
         
         self.device.submit_command_buffer(cmd.finish())
@@ -635,7 +640,7 @@ class Renderer:
             cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
             cursor["TrainParams"]["tileSize"] = TILE_SIZE
             
-            threads = self.gaussian_count * 5  # Still 5 params per Gaussian
+            threads = self.gaussian_count * PARAMS_PER_GAUSSIAN
             cp.dispatch(thread_count=(threads, 1, 1))
         
         if self._needs_rebinning:
@@ -699,7 +704,8 @@ class Renderer:
             # Pack learning rates as array
             cursor["TrainParams"]["learningRates"] = [
                 train_config.learning_rate_pos,
-                train_config.learning_rate_sigma,
+                train_config.learning_rate_scale,
+                train_config.learning_rate_rotation,
                 train_config.learning_rate_weight
             ]
             
@@ -949,7 +955,7 @@ class App:
         self.renderer.gaussian_count = len(self.gaussians)
         self.renderer.gaussian_buffer = self.device.create_buffer(
                 element_count=self.renderer.gaussian_count,
-                struct_size=20,
+                struct_size=PARAMS_PER_GAUSSIAN*4,
                 usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
                 memory_type=spy.MemoryType.device_local,
                 data=self.gaussians 
@@ -1122,8 +1128,10 @@ class App:
             imgui.separator()
             _, self.train_config.learning_rate_pos = imgui.slider_float(
                 "Position", self.train_config.learning_rate_pos, 0.0001, 0.1, format="%.4f")
-            _, self.train_config.learning_rate_sigma = imgui.slider_float(
-                "Sigma", self.train_config.learning_rate_sigma, 0.00001, 0.01, format="%.5f")
+            _, self.train_config.learning_rate_scale = imgui.slider_float(
+                "Scale", self.train_config.learning_rate_scale, 0.00001, 0.01, format="%.5f")
+            _, self.train_config.learning_rate_rotation = imgui.slider_float(
+                "Rotation", self.train_config.learning_rate_rotation, 0.00001, 0.005, format="%.5f")
             _, self.train_config.learning_rate_weight = imgui.slider_float(
                 "Weight", self.train_config.learning_rate_weight, 0.001, 0.1, format="%.4f")
             
@@ -1156,7 +1164,7 @@ class App:
                 self.renderer.gaussian_count = len(self.gaussians)
                 self.renderer.gaussian_buffer = self.device.create_buffer(
                         element_count=self.renderer.gaussian_count,
-                        struct_size=20,
+                        struct_size=PARAMS_PER_GAUSSIAN * 4,
                         usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
                         memory_type=spy.MemoryType.device_local,
                         data=self.gaussians 
@@ -1339,8 +1347,8 @@ class App:
                 
                 if health['status'] == 'exploding':
                     if imgui.button("Fix: Reduce LRs by 5×"):
-                        self.train_config.learning_rate_pos /= 5.0
-                        self.train_config.learning_rate_sigma /= 5.0
+                        self.train_config.learning_rate_scale /= 5.0
+                        self.train_config.learning_rate_rotation /= 5.0
                         self.train_config.learning_rate_weight /= 5.0
                         print(f"Reduced learning rates by 5×")
                     
@@ -1352,7 +1360,8 @@ class App:
                 elif health['status'] == 'vanishing':
                     if imgui.button("Fix: Increase LRs by 5×"):
                         self.train_config.learning_rate_pos *= 5.0
-                        self.train_config.learning_rate_sigma *= 5.0
+                        self.train_config.learning_rate_scale *= 5.0
+                        self.train_config.learning_rate_rotation *= 5.0
                         self.train_config.learning_rate_weight *= 5.0
                         print(f"Increased learning rates by 5×")
                 

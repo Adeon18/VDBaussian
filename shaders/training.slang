@@ -10,25 +10,32 @@ static const uint TRAIN_WG_SIZE = TRAIN_WG_X * TRAIN_WG_Y * TRAIN_WG_Z;
 static const uint MAX_GAUSSIANS_PER_TILE = 64;
 
 // PARAMETER LAYOUT CONFIGURATION
-static const uint PARAM_POS_X = 0;
-static const uint PARAM_POS_Y = 1;
-static const uint PARAM_POS_Z = 2;
-static const uint PARAM_SIGMA = 3;
-static const uint PARAM_WEIGHT = 4;
-static const uint PARAMS_PER_GAUSSIAN = 5;
+static const uint PARAM_POS_X  = 0;
+static const uint PARAM_POS_Y  = 1;
+static const uint PARAM_POS_Z  = 2;
+static const uint PARAM_SCALE_X = 3;
+static const uint PARAM_SCALE_Y = 4;
+static const uint PARAM_SCALE_Z = 5;
+static const uint PARAM_QUAT_X = 6;
+static const uint PARAM_QUAT_Y = 7;
+static const uint PARAM_QUAT_Z = 8;
+static const uint PARAM_QUAT_W = 9;
+static const uint PARAM_WEIGHT = 10;
+static const uint PARAMS_PER_GAUSSIAN = 11;
 
-// Learning rate groups (indices to learningRates arr)
 static const uint LR_GROUP_POSITION = 0;
-static const uint LR_GROUP_SIGMA = 1;
-static const uint LR_GROUP_WEIGHT = 2;
-static const uint NUM_LR_GROUPS = 3;
+static const uint LR_GROUP_SCALE    = 1;
+static const uint LR_GROUP_ROTATION = 2;
+static const uint LR_GROUP_WEIGHT   = 3;
+static const uint NUM_LR_GROUPS     = 4;
 
 // GAUSSIAN STRUCTURE
 struct Gaussian 
 {
     float3 pos;
-    float sigma;
-    float weight;
+    float3 scale;   // per-axis standard deviations
+    float4 quat;    // rotation quaternion (x,y,z,w), unit length
+    float  weight;
     
     static float getParam(uint gaussianID, uint paramID)
     {
@@ -40,26 +47,23 @@ struct Gaussian
         gGaussianParamsRaw[gaussianID * PARAMS_PER_GAUSSIAN + paramID] = asuint(value);
     }
     
-    // Convenience loaders
-    static Gaussian load(uint gaussianID)
+    static Gaussian load(uint gid)
     {
         Gaussian g;
-        g.pos.x = getParam(gaussianID, PARAM_POS_X);
-        g.pos.y = getParam(gaussianID, PARAM_POS_Y);
-        g.pos.z = getParam(gaussianID, PARAM_POS_Z);
-        g.sigma = getParam(gaussianID, PARAM_SIGMA);
-        g.weight = getParam(gaussianID, PARAM_WEIGHT);
+        g.pos.x   = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_POS_X]);
+        g.pos.y   = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_POS_Y]);
+        g.pos.z   = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_POS_Z]);
+        g.scale.x = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_X]);
+        g.scale.y = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_Y]);
+        g.scale.z = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_Z]);
+        g.quat.x  = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_QUAT_X]);
+        g.quat.y  = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_QUAT_Y]);
+        g.quat.z  = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_QUAT_Z]);
+        g.quat.w  = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_QUAT_W]);
+        g.weight  = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_WEIGHT]);
         return g;
     }
-    
-    static void store(uint gaussianID, Gaussian g)
-    {
-        setParam(gaussianID, PARAM_POS_X, g.pos.x);
-        setParam(gaussianID, PARAM_POS_Y, g.pos.y);
-        setParam(gaussianID, PARAM_POS_Z, g.pos.z);
-        setParam(gaussianID, PARAM_SIGMA, g.sigma);
-        setParam(gaussianID, PARAM_WEIGHT, g.weight);
-    }
+
 };
 
 // BINDINGS
@@ -135,12 +139,60 @@ struct ParamMetadata
 };
 
 static const ParamMetadata PARAM_META[PARAMS_PER_GAUSSIAN] = {
-    { LR_GROUP_POSITION, -1e6, 1e6 },   // pos.x
-    { LR_GROUP_POSITION, -1e6, 1e6 },   // pos.y
-    { LR_GROUP_POSITION, -1e6, 1e6 },   // pos.z
-    { LR_GROUP_SIGMA,    0.01, 1e6 },   // sigma
-    { LR_GROUP_WEIGHT,   0.0,  1.0 },   // weight
+    { LR_GROUP_POSITION, -1e6, 1e6  },  // pos.x
+    { LR_GROUP_POSITION, -1e6, 1e6  },  // pos.y
+    { LR_GROUP_POSITION, -1e6, 1e6  },  // pos.z
+    { LR_GROUP_SCALE,    1e-4, 1e6  },  // scale.x (must stay positive)
+    { LR_GROUP_SCALE,    1e-4, 1e6  },  // scale.y
+    { LR_GROUP_SCALE,    1e-4, 1e6  },  // scale.z
+    { LR_GROUP_ROTATION, -1.0, 1.0  },  // quat.x
+    { LR_GROUP_ROTATION, -1.0, 1.0  },  // quat.y
+    { LR_GROUP_ROTATION, -1.0, 1.0  },  // quat.z
+    { LR_GROUP_ROTATION, -1.0, 1.0  },  // quat.w
+    { LR_GROUP_WEIGHT,   0.0,  1.0  },  // weight
 };
+
+// MATH
+// Build 3x3 rotation matrix from unit quaternion (x,y,z,w)
+[Differentiable]
+float3x3 quatToMatrix(float4 q)
+{
+    float x=q.x, y=q.y, z=q.z, w=q.w;
+    return float3x3(
+        1-2*(y*y+z*z),   2*(x*y-w*z),   2*(x*z+w*y),
+          2*(x*y+w*z), 1-2*(x*x+z*z),   2*(y*z-w*x),
+          2*(x*z-w*y),   2*(y*z+w*x), 1-2*(x*x+y*y)
+    );
+}
+
+// Build precision matrix Sigma^{-1} = R * diag(1/s^2) * R^T
+// This is what we use in the exponent: d^T * Sigma^{-1} * d
+[Differentiable]
+float3x3 buildPrecisionMatrix(float3 scale, float4 quat)
+{
+    float3x3 R = quatToMatrix(quat);
+    float3 invS2 = 1.0 / (scale * scale);
+    
+    // P_ij = sum_k R[i][k] * invS2[k] * R[j][k]
+    float3x3 P;
+    P[0][0] = R[0][0]*R[0][0]*invS2.x + R[0][1]*R[0][1]*invS2.y + R[0][2]*R[0][2]*invS2.z;
+    P[0][1] = R[0][0]*R[1][0]*invS2.x + R[0][1]*R[1][1]*invS2.y + R[0][2]*R[1][2]*invS2.z;
+    P[0][2] = R[0][0]*R[2][0]*invS2.x + R[0][1]*R[2][1]*invS2.y + R[0][2]*R[2][2]*invS2.z;
+    P[1][0] = P[0][1]; // symmetric
+    P[1][1] = R[1][0]*R[1][0]*invS2.x + R[1][1]*R[1][1]*invS2.y + R[1][2]*R[1][2]*invS2.z;
+    P[1][2] = R[1][0]*R[2][0]*invS2.x + R[1][1]*R[2][1]*invS2.y + R[1][2]*R[2][2]*invS2.z;
+    P[2][0] = P[0][2]; // symmetric
+    P[2][1] = P[1][2]; // symmetric
+    P[2][2] = R[2][0]*R[2][0]*invS2.x + R[2][1]*R[2][1]*invS2.y + R[2][2]*R[2][2]*invS2.z;
+    return P;
+}
+
+// Mahalanobis squared distance: d^T * P * d
+[Differentiable]
+float mahalanobis2(float3 d, float3x3 P)
+{
+    return dot(d, mul(P, d));
+}
 
 // HELPERS
 int3 WorldToVoxel(float3 pos) {
@@ -301,7 +353,7 @@ void bin_gaussians(uint3 tid : SV_DispatchThreadID) {
 
     Gaussian g = Gaussian::load(gid);
     
-    float radius = g.sigma * 3.0;
+    float radius = max(g.scale.x, max(g.scale.y, g.scale.z)) * 3.0;
     int3 min_vox = WorldToVoxel(g.pos - radius);
     int3 max_vox = WorldToVoxel(g.pos + radius);
     
@@ -362,10 +414,10 @@ void loadParam_bwd(uint gaussianID, uint paramID, uint localThreadIdx, float dOu
 }
 
 [Differentiable]
-float gaussian_math(float3 p, float3 mu, float sigma) {
+float gaussian_math(float3 p, float3 mu, float3x3 precision)
+{
     float3 d = p - mu;
-    float r2 = dot(d, d);
-    return exp(-0.5 * r2 / (sigma * sigma));
+    return exp(-0.5 * mahalanobis2(d, precision));
 }
 
 [Differentiable]
@@ -383,20 +435,33 @@ float compute_density_tiled(no_diff uint3 tid, no_diff float3 worldPos) {
         if (i >= count) break;
 
         uint gid = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + i];
-        
-        // Load via generic accessor
         float3 g_pos = float3(
             loadParam(gid, PARAM_POS_X, localThreadIdx),
             loadParam(gid, PARAM_POS_Y, localThreadIdx),
             loadParam(gid, PARAM_POS_Z, localThreadIdx)
         );
-        float g_sigma = loadParam(gid, PARAM_SIGMA, localThreadIdx);
-        float g_weight = loadParam(gid, PARAM_WEIGHT, localThreadIdx);
         
-        float3 d = worldPos - g_pos;
-        if (no_diff(dot(d,d) > (g_sigma * 3.0)*(g_sigma * 3.0))) continue;
+        // Load via generic accessor
+        float3 g_scale = float3(
+            loadParam(gid, PARAM_SCALE_X, localThreadIdx),
+            loadParam(gid, PARAM_SCALE_Y, localThreadIdx),
+            loadParam(gid, PARAM_SCALE_Z, localThreadIdx)
+        );
+        float4 g_quat = float4(
+            loadParam(gid, PARAM_QUAT_X, localThreadIdx),
+            loadParam(gid, PARAM_QUAT_Y, localThreadIdx),
+            loadParam(gid, PARAM_QUAT_Z, localThreadIdx),
+            loadParam(gid, PARAM_QUAT_W, localThreadIdx)
+        );
+        float g_weight = loadParam(gid, PARAM_WEIGHT, localThreadIdx);
 
-        density += g_weight * gaussian_math(worldPos, g_pos, g_sigma);
+        float3 d = worldPos - g_pos;
+        // Cheap AABB cull using max scale radius
+        float maxScale = max(g_scale.x, max(g_scale.y, g_scale.z));
+        if (no_diff(dot(d,d) > (maxScale * 3.0) * (maxScale * 3.0))) continue;
+
+        float3x3 precision = buildPrecisionMatrix(g_scale, g_quat);
+        density += g_weight * gaussian_math(worldPos, g_pos, precision);
     }
     return density;
 }
@@ -461,6 +526,22 @@ void optimizer_sgd(uint3 tid : SV_DispatchThreadID) {
         
         gGaussianParamsRaw[idx] = asuint(newVal);
     }
+
+    // quat renormalization
+    uint qBase = gid * PARAMS_PER_GAUSSIAN + PARAM_QUAT_X;
+    float4 q = float4(
+        asfloat(gGaussianParamsRaw[qBase + 0]),
+        asfloat(gGaussianParamsRaw[qBase + 1]),
+        asfloat(gGaussianParamsRaw[qBase + 2]),
+        asfloat(gGaussianParamsRaw[qBase + 3])
+    );
+    float qLen = length(q);
+    if (qLen > 1e-6) q /= qLen;
+    else q = float4(0, 0, 0, 1);  // fallback to identity
+    gGaussianParamsRaw[qBase + 0] = asuint(q.x);
+    gGaussianParamsRaw[qBase + 1] = asuint(q.y);
+    gGaussianParamsRaw[qBase + 2] = asuint(q.z);
+    gGaussianParamsRaw[qBase + 3] = asuint(q.w);
 }
 
 // ADAM OPTIMIZER
@@ -510,6 +591,21 @@ void optimizer_adam(uint3 tid : SV_DispatchThreadID) {
         
         gGaussianParamsRaw[idx] = asuint(newVal);
     }
+    // quat renormalization
+    uint qBase = gid * PARAMS_PER_GAUSSIAN + PARAM_QUAT_X;
+    float4 q = float4(
+        asfloat(gGaussianParamsRaw[qBase + 0]),
+        asfloat(gGaussianParamsRaw[qBase + 1]),
+        asfloat(gGaussianParamsRaw[qBase + 2]),
+        asfloat(gGaussianParamsRaw[qBase + 3])
+    );
+    float qLen = length(q);
+    if (qLen > 1e-6) q /= qLen;
+    else q = float4(0, 0, 0, 1);  // fallback to identity
+    gGaussianParamsRaw[qBase + 0] = asuint(q.x);
+    gGaussianParamsRaw[qBase + 1] = asuint(q.y);
+    gGaussianParamsRaw[qBase + 2] = asuint(q.z);
+    gGaussianParamsRaw[qBase + 3] = asuint(q.w);
 }
 
 // INITIALIZE ADAM STATE

@@ -1,8 +1,9 @@
 struct Gaussian
 {
     float3 pos;
-    float  sigma;
-    float  weight;
+    float3 scale;
+    float4 quat;
+    float weight;
 };
 
 [[vk::binding(0)]] StructuredBuffer<Gaussian> gGaussians;
@@ -27,6 +28,43 @@ uint GetTileIndex(uint3 voxelID) {
     tileID = min(tileID, tileResolution - 1);
     return tileID.z * (tileResolution.x * tileResolution.y) + 
            tileID.y * tileResolution.x + tileID.x;
+}
+
+float3x3 quatToMatrix(float4 q)
+{
+    float x=q.x, y=q.y, z=q.z, w=q.w;
+    return float3x3(
+        1-2*(y*y+z*z),   2*(x*y-w*z),   2*(x*z+w*y),
+          2*(x*y+w*z), 1-2*(x*x+z*z),   2*(y*z-w*x),
+          2*(x*z-w*y),   2*(y*z+w*x), 1-2*(x*x+y*y)
+    );
+}
+
+// Build precision matrix Sigma^{-1} = R * diag(1/s^2) * R^T
+// This is what we use in the exponent: d^T * Sigma^{-1} * d
+float3x3 buildPrecisionMatrix(float3 scale, float4 quat)
+{
+    float3x3 R = quatToMatrix(quat);
+    float3 invS2 = 1.0 / (scale * scale);
+    
+    // P_ij = sum_k R[i][k] * invS2[k] * R[j][k]
+    float3x3 P;
+    P[0][0] = R[0][0]*R[0][0]*invS2.x + R[0][1]*R[0][1]*invS2.y + R[0][2]*R[0][2]*invS2.z;
+    P[0][1] = R[0][0]*R[1][0]*invS2.x + R[0][1]*R[1][1]*invS2.y + R[0][2]*R[1][2]*invS2.z;
+    P[0][2] = R[0][0]*R[2][0]*invS2.x + R[0][1]*R[2][1]*invS2.y + R[0][2]*R[2][2]*invS2.z;
+    P[1][0] = P[0][1]; // symmetric
+    P[1][1] = R[1][0]*R[1][0]*invS2.x + R[1][1]*R[1][1]*invS2.y + R[1][2]*R[1][2]*invS2.z;
+    P[1][2] = R[1][0]*R[2][0]*invS2.x + R[1][1]*R[2][1]*invS2.y + R[1][2]*R[2][2]*invS2.z;
+    P[2][0] = P[0][2]; // symmetric
+    P[2][1] = P[1][2]; // symmetric
+    P[2][2] = R[2][0]*R[2][0]*invS2.x + R[2][1]*R[2][1]*invS2.y + R[2][2]*R[2][2]*invS2.z;
+    return P;
+}
+
+// Mahalanobis squared distance: d^T * P * d
+float mahalanobis2(float3 d, float3x3 P)
+{
+    return dot(d, mul(P, d));
 }
 
 [shader("compute")]
@@ -54,16 +92,13 @@ void rasterize_tiled(uint3 tid : SV_DispatchThreadID)
         Gaussian g = gGaussians[gid];
 
         float3 d = worldPos - g.pos;
-        float maxDist = g.sigma * CUTOFF_RADIUS;
-
-        // Distance check
+        float maxScale = max(g.scale.x, max(g.scale.y, g.scale.z));
         float r2 = dot(d, d);
-        if (r2 > maxDist * maxDist)
-            continue;
+        if (r2 > (maxScale * CUTOFF_RADIUS) * (maxScale * CUTOFF_RADIUS)) continue;
 
-        // Gaussian contribution
-        float invSigma2 = 1.0 / (g.sigma * g.sigma);
-        float contribution = exp(-0.5 * r2 * invSigma2);
+        float3x3 precision = buildPrecisionMatrix(g.scale, g.quat);
+        float maha2 = dot(d, mul(precision, d));
+        float contribution = exp(-0.5 * maha2);
         density += g.weight * contribution;
     }
 
