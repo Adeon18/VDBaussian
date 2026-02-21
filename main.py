@@ -28,7 +28,7 @@ PRINT_GRADIENT_STATS = True # Print gradient statistics
 
 VDB_FILE = "cloud_01_variant_0000.vdb" 
 VOL_SIZE = 128
-SHADER_FILE = "hybrid.slang"
+SHADER_FILE = "shaders/hybrid.slang"
 TILE_SIZE = 4
 MAX_GAUSSIANS_PER_TILE = 64
 
@@ -354,7 +354,7 @@ class Renderer:
 
         self._needs_rebinning = True
         self._needs_rasterization = True
-        prog_raster_tiled = self.device.load_program("3drasterizer.slang", ["rasterize_tiled"])
+        prog_raster_tiled = self.device.load_program("shaders/3drasterizer.slang", ["rasterize_tiled"])
         self.pipe_raster_tiled = self.device.create_compute_pipeline(program=prog_raster_tiled)
 
         self.use_gaussian_volume = False
@@ -384,7 +384,7 @@ class Renderer:
         self.debug_scale = 1.0
         
         # Load debug raymarcher
-        prog_debug = device.load_program("debug_raymarch.slang", ["vertex_main", "fragment_main"])
+        prog_debug = device.load_program("shaders/debug_raymarch.slang", ["vertex_main", "fragment_main"])
         self.debug_pipeline = device.create_render_pipeline(
             program=prog_debug,
             input_layout=device.create_input_layout(input_elements=[], vertex_streams=[]),
@@ -445,28 +445,28 @@ class Renderer:
         if not self._training_initialized:
             print("Compiling Kernels...")
             
-            prog_clear_grads = self.device.load_program("training.slang", ["clear_gradients"])
+            prog_clear_grads = self.device.load_program("shaders/training.slang", ["clear_gradients"])
             self.pipe_clear_grads = self.device.create_compute_pipeline(program=prog_clear_grads)
             
-            prog_clear_tiles = self.device.load_program("training.slang", ["clear_tiles"])
+            prog_clear_tiles = self.device.load_program("shaders/training.slang", ["clear_tiles"])
             self.pipe_clear_tiles = self.device.create_compute_pipeline(program=prog_clear_tiles)
 
-            prog_bin = self.device.load_program("training.slang", ["bin_gaussians"])
+            prog_bin = self.device.load_program("shaders/training.slang", ["bin_gaussians"])
             self.pipe_bin = self.device.create_compute_pipeline(program=prog_bin)
 
-            prog_train = self.device.load_program("training.slang", ["train_main"])
+            prog_train = self.device.load_program("shaders/training.slang", ["train_main"])
             self.pipe_train = self.device.create_compute_pipeline(program=prog_train)
 
-            prog_optim_sgd = self.device.load_program("training.slang", ["optimizer_sgd"])
+            prog_optim_sgd = self.device.load_program("shaders/training.slang", ["optimizer_sgd"])
             self.pipe_optim_sgd = self.device.create_compute_pipeline(program=prog_optim_sgd)
             
-            prog_optim_adam = self.device.load_program("training.slang", ["optimizer_adam"])
+            prog_optim_adam = self.device.load_program("shaders/training.slang", ["optimizer_adam"])
             self.pipe_optim_adam = self.device.create_compute_pipeline(program=prog_optim_adam)
             
-            prog_init_adam = self.device.load_program("training.slang", ["init_adam_state"])
+            prog_init_adam = self.device.load_program("shaders/training.slang", ["init_adam_state"])
             self.pipe_init_adam = self.device.create_compute_pipeline(program=prog_init_adam)
 
-            prog_debug = self.device.load_program("training.slang", ["compute_debug"])
+            prog_debug = self.device.load_program("shaders/training.slang", ["compute_debug"])
             self.pipe_debug_only = self.device.create_compute_pipeline(program=prog_debug)
 
             self._training_initialized = True
