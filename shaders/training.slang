@@ -7,7 +7,7 @@ static const uint TRAIN_WG_Z = 4;
 static const uint TRAIN_WG_SIZE = TRAIN_WG_X * TRAIN_WG_Y * TRAIN_WG_Z;
 
 // DEFINITIONS
-static const uint MAX_GAUSSIANS_PER_TILE = 64;
+static const uint MAX_GAUSSIANS_PER_TILE = 128;
 
 // PARAMETER LAYOUT CONFIGURATION
 static const uint PARAM_POS_X  = 0;
@@ -430,9 +430,8 @@ float compute_density_tiled(no_diff uint3 tid, no_diff float3 worldPos) {
 
     uint localThreadIdx = GetLocalThreadIndex(tid);
     
-    [ForceUnroll] 
-    for(uint i=0; i<MAX_GAUSSIANS_PER_TILE; ++i) {
-        if (i >= count) break;
+    [MaxIters(MAX_GAUSSIANS_PER_TILE)]
+    for(uint i=0; i<count; ++i) {
 
         uint gid = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + i];
         float3 g_pos = float3(
@@ -562,7 +561,12 @@ void optimizer_adam(uint3 tid : SV_DispatchThreadID) {
         float g_t = asfloat(gGradientsRaw[idx]);
         float currentVal = asfloat(gGaussianParamsRaw[idx]);
         if (paramID >= PARAM_SCALE_X && paramID <= PARAM_SCALE_Z) {
-            g_t += currentVal * 0.001;  // L2 penalty — tune this value
+            float sx = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_X]);
+            float sy = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_Y]);
+            float sz = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_Z]);
+            float volume = sx * sy * sz;
+            // Volume penalty: gradient grows with volume, not just individual scale
+            g_t += currentVal * volume * 0.0001;
         }
         
         // Load previous moments

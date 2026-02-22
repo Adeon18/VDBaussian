@@ -30,7 +30,7 @@ VDB_FILE = "cloud_01_variant_0000.vdb"
 VOL_SIZE = 128
 SHADER_FILE = "shaders/hybrid.slang"
 TILE_SIZE = 4
-MAX_GAUSSIANS_PER_TILE = 64
+MAX_GAUSSIANS_PER_TILE = 128
 
 # Window Settings
 WINDOW_WIDTH = 1024

@@ -20,7 +20,7 @@ cbuffer RasterParams
     float3 volumeMaxWorld;
 };
 
-static const uint MAX_GAUSSIANS_PER_TILE = 64;
+static const uint MAX_GAUSSIANS_PER_TILE = 128;
 static const float CUTOFF_RADIUS = 3.0;
 
 uint GetTileIndex(uint3 voxelID) {
