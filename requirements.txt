@@ -1,0 +1,4 @@
+glfw==2.10.0
+imgui-bundle==1.92.5
+PyOpenGL==3.1.10
+slangpy==0.40.1

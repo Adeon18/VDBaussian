@@ -561,6 +561,9 @@ void optimizer_adam(uint3 tid : SV_DispatchThreadID) {
         
         float g_t = asfloat(gGradientsRaw[idx]);
         float currentVal = asfloat(gGaussianParamsRaw[idx]);
+        if (paramID >= PARAM_SCALE_X && paramID <= PARAM_SCALE_Z) {
+            g_t += currentVal * 0.001;  // L2 penalty — tune this value
+        }
         
         // Load previous moments
         float m_t_prev = gAdamFirstMoment[idx];

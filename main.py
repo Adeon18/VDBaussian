@@ -722,6 +722,7 @@ class Renderer:
             cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
 
         self.device.submit_command_buffer(cmd.finish())
+        self.device.wait_for_idle()
         self._needs_rebinning = True
         self.debug_needs_update = True
         self._needs_rasterization = True
@@ -912,7 +913,7 @@ class Renderer:
 
         self.device.submit_command_buffer(cmd.finish())
         self._needs_rasterization = False
-        print(f"Rasterized {self.gaussian_count} gaussians")
+        # print(f"Rasterized {self.gaussian_count} gaussians")
 
 
 # ==========================================
@@ -1006,6 +1007,7 @@ class App:
                         print(f"[ALERT] Tiler works ({total_refs} refs) but Gradients are ZERO.")
                     else:
                         print(f"[OK] Training Running. Refs: {total_refs}, GradMax: {np.max(np.abs(grad_debug)):.6f}")
+                    
                     
                     # Analyze gradients every frame
                     self.renderer.analyze_gradients()
