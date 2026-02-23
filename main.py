@@ -591,15 +591,13 @@ class Renderer:
             'recommendation': recommendation
         }
 
-    def update_debug_visualization(self, vol_min, vol_max):
+    def update_debug_visualization(self, cmd, vol_min, vol_max):
         """
         Update debug visualization WITHOUT running training.
         Call this when debug mode changes or user wants to refresh.
         """
         if self.debug_mode == 0:
             return
-        
-        cmd = self.device.create_command_encoder()
         
         # Just run the debug computation kernel (no training)
         with cmd.begin_compute_pass() as cp:
@@ -624,7 +622,6 @@ class Renderer:
             
             cp.dispatch(thread_count=(VOL_SIZE, VOL_SIZE, VOL_SIZE))
         
-        self.device.submit_command_buffer(cmd.finish())
         self.debug_needs_update = False
 
     def run_training_step(self, vol_min, vol_max, train_config):
@@ -721,12 +718,18 @@ class Renderer:
             
             cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
 
+        if self.use_gaussian_volume:
+            self.rasterize_gaussians(cmd, vol_min, vol_max)
+
+        # Pass 7: Debug visualization
+        if self.debug_needs_update and self.debug_mode > 0:
+            self.update_debug_visualization(cmd, vol_min, vol_max)
+
         self.device.submit_command_buffer(cmd.finish())
-        self.device.wait_for_idle()
         self._needs_rebinning = True
-        self.debug_needs_update = True
         self._needs_rasterization = True
-        
+        self.debug_needs_update = True
+
         if train_config.use_adam:
             self.adam_iteration += 1
 
@@ -860,9 +863,8 @@ class Renderer:
         glBlitFramebuffer(0, 0, self.width, self.height, 0, 0, self.width, self.height, GL_COLOR_BUFFER_BIT, GL_NEAREST)
         glDeleteFramebuffers(1, [fb])
     
-    def rasterize_gaussians(self, vol_min, vol_max):
+    def rasterize_gaussians(self, cmd, vol_min, vol_max):
 
-        cmd = self.device.create_command_encoder()
         cmd.clear_texture_float(self.gaussian_volume_tex)
         cmd.set_texture_state(self.gaussian_volume_tex, spy.ResourceState.unordered_access)
 
@@ -911,9 +913,7 @@ class Renderer:
             
             cp.dispatch(thread_count=(VOL_SIZE, VOL_SIZE, VOL_SIZE))
 
-        self.device.submit_command_buffer(cmd.finish())
         self._needs_rasterization = False
-        # print(f"Rasterized {self.gaussian_count} gaussians")
 
 
 # ==========================================
@@ -945,7 +945,7 @@ class App:
         self.train_config = TrainingConfig()
         
         example_dir = Path(__file__).parent
-        self.device = spy.Device(enable_debug_layers=True, compiler_options={"include_paths": [example_dir]})
+        self.device = spy.Device(enable_debug_layers=True, compiler_options={"include_paths": [example_dir]}, type=spy.DeviceType.vulkan)
         
         self.grid = load_vdb_grid(VDB_FILE)
         self.vol_min_world, self.vol_max_world, vol_data = convert_grid_to_dense_volume(self.grid, VOL_SIZE)
@@ -962,7 +962,10 @@ class App:
                 data=self.gaussians 
             )
         self.renderer.init_training()
-        self.renderer.rasterize_gaussians(self.vol_min_world, self.vol_max_world)
+        
+        cmd = self.device.create_command_encoder()
+        self.renderer.rasterize_gaussians(cmd, self.vol_min_world, self.vol_max_world)
+        self.device.submit_command_buffer(cmd.finish())
 
 
     def run(self):
@@ -995,18 +998,19 @@ class App:
                 if self.is_training:
                     self.renderer.run_training_step(self.vol_min_world, self.vol_max_world, self.train_config)
 
-                    tile_debug = self.renderer.tile_counts.to_numpy().view(dtype=np.uint32)
-                    total_refs = np.sum(tile_debug)
-                    
-                    grad_bytes = self.renderer.grad_buffer.to_numpy()
-                    grad_debug = grad_bytes.view(dtype=np.float32)[:25]
-                    
-                    if total_refs == 0:
-                        print(f"[CRITICAL] Tiler is empty! (Total Refs: {total_refs})")
-                    elif np.all(grad_debug == 0):
-                        print(f"[ALERT] Tiler works ({total_refs} refs) but Gradients are ZERO.")
-                    else:
-                        print(f"[OK] Training Running. Refs: {total_refs}, GradMax: {np.max(np.abs(grad_debug)):.6f}")
+                    if frame_count % 20 == 0:
+                        tile_debug = self.renderer.tile_counts.to_numpy().view(dtype=np.uint32)
+                        total_refs = np.sum(tile_debug)
+                        
+                        grad_bytes = self.renderer.grad_buffer.to_numpy()
+                        grad_debug = grad_bytes.view(dtype=np.float32)[:25]
+                        
+                        if total_refs == 0:
+                            print(f"[CRITICAL] Tiler is empty! (Total Refs: {total_refs})")
+                        elif np.all(grad_debug == 0):
+                            print(f"[ALERT] Tiler works ({total_refs} refs) but Gradients are ZERO.")
+                        else:
+                            print(f"[OK] Training Running. Refs: {total_refs}, GradMax: {np.max(np.abs(grad_debug)):.6f}")
                     
                     
                     # Analyze gradients every frame
@@ -1020,11 +1024,18 @@ class App:
                             self.renderer.loss_history.pop(0)
                     
                 
-                if self.renderer.debug_needs_update and self.renderer.debug_mode > 0:
-                    self.renderer.update_debug_visualization(self.vol_min_world, self.vol_max_world)
-                
-                if self.renderer._needs_rasterization and self.renderer.use_gaussian_volume:
-                    self.renderer.rasterize_gaussians(self.vol_min_world, self.vol_max_world)
+                if not self.is_training:
+                    needs_compute = (
+                        (self.renderer.debug_needs_update and self.renderer.debug_mode > 0) or
+                        (self.renderer._needs_rasterization and self.renderer.use_gaussian_volume)
+                    )
+                    if needs_compute:
+                        cmd = self.device.create_command_encoder()
+                        if self.renderer._needs_rasterization and self.renderer.use_gaussian_volume:
+                            self.renderer.rasterize_gaussians(cmd, self.vol_min_world, self.vol_max_world)
+                        if self.renderer.debug_needs_update and self.renderer.debug_mode > 0:
+                            self.renderer.update_debug_visualization(cmd, self.vol_min_world, self.vol_max_world)
+                        self.device.submit_command_buffer(cmd.finish())
                     
                 self.renderer.render(self.camera, self.settings)
                 self.renderer.update_display()

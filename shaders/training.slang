@@ -69,7 +69,7 @@ struct Gaussian
 // BINDINGS
 [[vk::binding(0)]] Texture3D<float> ReferenceVol;
 [[vk::binding(1)]] RWStructuredBuffer<uint> gGaussianParamsRaw;  // Raw floab buffer
-[[vk::binding(2)]] RWStructuredBuffer<uint> gGradientsRaw;
+[[vk::binding(2)]] RWStructuredBuffer<float> gGradientsRaw;
 [[vk::binding(3)]] RWStructuredBuffer<uint> gTileContent; 
 [[vk::binding(4)]] RWStructuredBuffer<uint> gTileCounts; 
 [[vk::binding(5)]] RWStructuredBuffer<float> gAdamFirstMoment;
@@ -289,7 +289,7 @@ void compute_debug(uint3 tid : SV_DispatchThreadID) {
             
             float gradMag = 0.0;
             for (uint p = 0; p < PARAMS_PER_GAUSSIAN; ++p) {
-                float g = asfloat(gGradientsRaw[gid * PARAMS_PER_GAUSSIAN + p]);
+                float g = gGradientsRaw[gid * PARAMS_PER_GAUSSIAN + p];
                 gradMag += g * g;  // L2 norm squared
             }
             totalGradMag += sqrt(gradMag);  // L2 norm
@@ -378,15 +378,7 @@ void bin_gaussians(uint3 tid : SV_DispatchThreadID) {
 // ATOMIC GRADIENT ACCUMULATION
 void atomicAccumulate(uint idx, float val) {
     if (val == 0.0) return;
-    for (;;) {
-        uint oldInt = gGradientsRaw[idx];
-        float oldFloat = asfloat(oldInt);
-        float newFloat = oldFloat + val;
-        uint newInt = asuint(newFloat);
-        uint original = 0;
-        InterlockedCompareExchange(gGradientsRaw[idx], oldInt, newInt, original);
-        if (original == oldInt) break;
-    }
+    InterlockedAdd(gGradientsRaw[idx], val);
 }
 
 // DIFFERENTIABLE PARAMETER LOADERS
@@ -496,7 +488,7 @@ void train_main(uint3 tid : SV_DispatchThreadID) {
 [numthreads(256, 1, 1)]
 void clear_gradients(uint3 tid : SV_DispatchThreadID) {
     if (tid.x < gaussianCount * PARAMS_PER_GAUSSIAN) {
-        gGradientsRaw[tid.x] = 0;
+        gGradientsRaw[tid.x] = 0.0;
     }
 }
 
@@ -510,7 +502,7 @@ void optimizer_sgd(uint3 tid : SV_DispatchThreadID) {
     // Process all parameters generically
     for (uint paramID = 0; paramID < PARAMS_PER_GAUSSIAN; ++paramID) {
         uint idx = gid * PARAMS_PER_GAUSSIAN + paramID;
-        float gradient = asfloat(gGradientsRaw[idx]);
+        float gradient = gGradientsRaw[idx];
         float currentVal = asfloat(gGaussianParamsRaw[idx]);
         
         // Get metadata
@@ -558,7 +550,7 @@ void optimizer_adam(uint3 tid : SV_DispatchThreadID) {
     for (uint paramID = 0; paramID < PARAMS_PER_GAUSSIAN; ++paramID) {
         uint idx = gid * PARAMS_PER_GAUSSIAN + paramID;
         
-        float g_t = asfloat(gGradientsRaw[idx]);
+        float g_t = gGradientsRaw[idx];
         float currentVal = asfloat(gGaussianParamsRaw[idx]);
         if (paramID >= PARAM_SCALE_X && paramID <= PARAM_SCALE_Z) {
             float sx = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_X]);
