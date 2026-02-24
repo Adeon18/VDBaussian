@@ -77,6 +77,9 @@ struct Gaussian
 [[vk::binding(7)]] RWTexture3D<float4> gDebugVolume;
 
 groupshared float reductionBuffer[TRAIN_WG_SIZE];
+groupshared float gs_params[MAX_GAUSSIANS_PER_TILE * PARAMS_PER_GAUSSIAN];
+groupshared uint gs_gaussianIDs[MAX_GAUSSIANS_PER_TILE];
+groupshared uint gs_count;
 
 
 cbuffer TrainParams {
@@ -383,11 +386,11 @@ void atomicAccumulate(uint idx, float val) {
 
 // DIFFERENTIABLE PARAMETER LOADERS
 [BackwardDerivative(loadParam_bwd)]
-float loadParam(uint gaussianID, uint paramID, uint localThreadIdx) {
-    return asfloat(gGaussianParamsRaw[gaussianID * PARAMS_PER_GAUSSIAN + paramID]);
+float loadParam(uint localGaussianIdx, uint paramID, uint localThreadIdx) {
+    return gs_params[localGaussianIdx * PARAMS_PER_GAUSSIAN + paramID];
 }
 
-void loadParam_bwd(uint gaussianID, uint paramID, uint localThreadIdx, float dOut) {
+void loadParam_bwd(uint localGaussianIdx, uint paramID, uint localThreadIdx, float dOut) {
     if (localThreadIdx >= TRAIN_WG_SIZE) return;
     
     reductionBuffer[localThreadIdx] = dOut;
@@ -401,7 +404,9 @@ void loadParam_bwd(uint gaussianID, uint paramID, uint localThreadIdx, float dOu
     }
     
     if (localThreadIdx == 0) {
-        atomicAccumulate(gaussianID * PARAMS_PER_GAUSSIAN + paramID, reductionBuffer[0]);
+        // Map local index back to global Gaussian ID for gradient write
+        uint gid = gs_gaussianIDs[localGaussianIdx];
+        atomicAccumulate(gid * PARAMS_PER_GAUSSIAN + paramID, reductionBuffer[0]);
     }
 }
 
@@ -415,39 +420,32 @@ float gaussian_math(float3 p, float3 mu, float3x3 precision)
 [Differentiable]
 float compute_density_tiled(no_diff uint3 tid, no_diff float3 worldPos) {
     float density = 0.0;
-    
-    uint tileIdx = GetTileIndex(tid);
-    uint count = gTileCounts[tileIdx];
-    count = min(count, MAX_GAUSSIANS_PER_TILE);
 
     uint localThreadIdx = GetLocalThreadIndex(tid);
-    
-    [MaxIters(MAX_GAUSSIANS_PER_TILE)]
-    for(uint i=0; i<count; ++i) {
+    uint count = gs_count;  // Already loaded into groupshared by train_main
 
-        uint gid = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + i];
+    [MaxIters(MAX_GAUSSIANS_PER_TILE)]
+    for(uint i = 0; i < count; ++i) {
+        // All reads now hit groupshared cache, not global memory
         float3 g_pos = float3(
-            loadParam(gid, PARAM_POS_X, localThreadIdx),
-            loadParam(gid, PARAM_POS_Y, localThreadIdx),
-            loadParam(gid, PARAM_POS_Z, localThreadIdx)
+            loadParam(i, PARAM_POS_X, localThreadIdx),
+            loadParam(i, PARAM_POS_Y, localThreadIdx),
+            loadParam(i, PARAM_POS_Z, localThreadIdx)
         );
-        
-        // Load via generic accessor
         float3 g_scale = float3(
-            loadParam(gid, PARAM_SCALE_X, localThreadIdx),
-            loadParam(gid, PARAM_SCALE_Y, localThreadIdx),
-            loadParam(gid, PARAM_SCALE_Z, localThreadIdx)
+            loadParam(i, PARAM_SCALE_X, localThreadIdx),
+            loadParam(i, PARAM_SCALE_Y, localThreadIdx),
+            loadParam(i, PARAM_SCALE_Z, localThreadIdx)
         );
         float4 g_quat = float4(
-            loadParam(gid, PARAM_QUAT_X, localThreadIdx),
-            loadParam(gid, PARAM_QUAT_Y, localThreadIdx),
-            loadParam(gid, PARAM_QUAT_Z, localThreadIdx),
-            loadParam(gid, PARAM_QUAT_W, localThreadIdx)
+            loadParam(i, PARAM_QUAT_X, localThreadIdx),
+            loadParam(i, PARAM_QUAT_Y, localThreadIdx),
+            loadParam(i, PARAM_QUAT_Z, localThreadIdx),
+            loadParam(i, PARAM_QUAT_W, localThreadIdx)
         );
-        float g_weight = loadParam(gid, PARAM_WEIGHT, localThreadIdx);
+        float g_weight = loadParam(i, PARAM_WEIGHT, localThreadIdx);
 
         float3 d = worldPos - g_pos;
-        // Cheap AABB cull using max scale radius
         float maxScale = max(g_scale.x, max(g_scale.y, g_scale.z));
         if (no_diff(dot(d,d) > (maxScale * 3.0) * (maxScale * 3.0))) continue;
 
@@ -478,8 +476,37 @@ float compute_loss(
 [shader("compute")]
 [numthreads(TRAIN_WG_X, TRAIN_WG_Y, TRAIN_WG_Z)]
 void train_main(uint3 tid : SV_DispatchThreadID) {
+    uint localThreadIdx = GetLocalThreadIndex(tid);
+
+    // ── Cooperative cache fill ───────────────────────────────────────────
+    // One workgroup = one tile, so we fill the cache once for all 256 threads
+
+    if (localThreadIdx == 0) {
+        uint tileIdx = GetTileIndex(tid);
+        gs_count = min(gTileCounts[tileIdx], MAX_GAUSSIANS_PER_TILE);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Load Gaussian IDs cooperatively
+    uint tileIdx = GetTileIndex(tid);
+    for (uint i = localThreadIdx; i < gs_count; i += TRAIN_WG_SIZE) {
+        gs_gaussianIDs[i] = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + i];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Load all params cooperatively — each thread loads a few floats
+    uint totalFloats = gs_count * PARAMS_PER_GAUSSIAN;
+    for (uint i = localThreadIdx; i < totalFloats; i += TRAIN_WG_SIZE) {
+        uint localGaussianIdx = i / PARAMS_PER_GAUSSIAN;
+        uint paramID          = i % PARAMS_PER_GAUSSIAN;
+        uint gid              = gs_gaussianIDs[localGaussianIdx];
+        gs_params[i] = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + paramID]);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    // ── Cache is now warm, proceed with training ─────────────────────────
+
     if (any(tid >= volumeResolution)) return;
-    
+
     bwd_diff(compute_loss)(tid, minWorld, maxWorld, volumeResolution, 1.0);
 }
 
