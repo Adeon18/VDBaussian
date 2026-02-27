@@ -11,7 +11,8 @@ import random
 import openvdb as vdb
 import itertools
 import time
-
+import threading
+import traceback
 
 
 # ==========================================
@@ -43,6 +44,19 @@ CAMERA_SPEED = 2.0
 CAMERA_SENSITIVITY = 0.1
 
 PARAMS_PER_GAUSSIAN = 11  # pos(3) + scale(3) + quat(4) + weight(1)
+
+# ==========================================
+# ADC CONFIGURATION
+# ==========================================
+ADC_START_FRAME      = 300    # Don't densify until Adam has settled
+ADC_EVERY            = 200    # Full ADC (prune + split + clone) interval
+PRUNE_ONLY_EVERY     = 100    # Prune-only pass between full ADC cycles
+ADC_MAX_GAUSSIANS    = 50000  # Hard cap — never exceed this
+ADC_PRUNE_WEIGHT_MIN = 0.005  # Gaussians below this weight get pruned
+ADC_PRUNE_SCALE_MAX  = 0.3    # Fraction of vol_extent — blobs larger than this get pruned
+ADC_N_CLONE          = 40     # New Gaussians spawned per clone pass
+ADC_N_SPLIT          = 20     # Gaussians split per split pass
+ADC_SUBSTANCE_THRESH = 0.02   # Min reference density to be a valid spawn site
 
 class DebugMode:
     NONE = 0
@@ -285,6 +299,573 @@ def convert_grid_to_gaussians(grid, config):
 
     print(f"Generated {len(gaussians)} gaussians.")
     return np.array(gaussians, dtype=np.float32)
+
+class ADCMode:
+    DISABLED = 0
+    CPU      = 1
+    GPU      = 2  # stub, not yet implemented
+
+
+class ADCConfig:
+    def __init__(self):
+        self.mode = ADCMode.CPU
+
+        # Scheduling
+        self.start_frame      = 300
+        self.full_adc_every   = 400
+        self.prune_only_every = 200
+        self.max_gaussians    = 50000
+
+        # Prune
+        self.prune_weight_min = 0.006
+        self.prune_scale_max  = 0.3    # fraction of vol_extent
+
+        # Clone
+        self.n_clone          = 350
+        self.substance_thresh = 0.05
+
+        # Split
+        self.n_split               = 20
+        self.split_scale_thresh    = 0.04  # fraction of vol_extent
+        self.split_grad_percentile = 85
+
+
+# ==========================================
+# BACKEND INTERFACE
+# ==========================================
+
+class ADCBackend:
+    @property
+    def runs_async(self) -> bool:
+        return False
+
+    def run(self, params, grads, pred, ref, config, vol_min, vol_max, do_full) -> np.ndarray:
+        raise NotImplementedError
+
+
+# ==========================================
+# CPU BACKEND
+# ==========================================
+
+class CPUADCBackend(ADCBackend):
+    """
+    Pure numpy. Safe to run on a background thread because numpy
+    releases the GIL during its C-level operations.
+    """
+
+    @property
+    def runs_async(self):
+        return True
+
+    def _prune(self, params, grads, config, vol_min, vol_max):
+        if len(params) == 0:
+            return params, grads, np.arange(0, dtype=np.int64)
+
+        weights    = params[:, 10]
+        max_scale  = np.max(params[:, 3:6], axis=1)
+        vol_extent = float(np.max(np.array(vol_max, dtype=np.float32)
+                                - np.array(vol_min, dtype=np.float32)))
+
+        keep = (
+            (weights   > config.prune_weight_min) &
+            (max_scale < vol_extent * config.prune_scale_max)
+        )
+
+        n_pruned = int(np.sum(~keep))
+        if n_pruned > 0:
+            print(f"[ADC:CPU] Pruned {n_pruned} / {len(params)} Gaussians")
+
+        surviving_indices = np.where(keep)[0]
+        result_params     = params[keep]
+        result_grads      = grads[keep]
+
+        if len(result_params) == 0:
+            print("[ADC:CPU] Warning: pruning removed everything, keeping top-10 by weight")
+            top               = np.argsort(weights)[-10:]
+            result_params     = params[top]
+            result_grads      = grads[top]
+            surviving_indices = top
+
+        return result_params, result_grads, surviving_indices
+
+
+    def run(self, params, grads, pred, ref, config, vol_min, vol_max, do_full):
+        params, grads, surviving_indices = self._prune(params, grads, config, vol_min, vol_max)
+        if do_full:
+            params = self._split(params, grads, config, vol_min, vol_max)
+            params = self._clone(params, pred, ref, config, vol_min, vol_max)
+        return params, surviving_indices
+
+    # ------------------------------------------------------------------
+    def _split(self, params, grads, config, vol_min, vol_max):
+        if len(params) == 0:
+            return params
+
+        weights    = params[:, 10]
+        max_scale  = np.max(params[:, 3:6], axis=1)
+        vol_extent = float(np.max(np.array(vol_max, dtype=np.float32)
+                                - np.array(vol_min, dtype=np.float32)))
+
+        pos_grad   = np.linalg.norm(grads[:, 0:3], axis=1)
+
+        alive      = weights   > 0.01
+        is_large   = max_scale > vol_extent * config.split_scale_thresh
+
+        nonzero_pg = pos_grad[pos_grad > 0]
+        if len(nonzero_pg) == 0:
+            return params
+
+        grad_thresh = float(np.percentile(nonzero_pg, config.split_grad_percentile))
+        has_grad    = pos_grad > grad_thresh
+        candidates  = np.where(is_large & has_grad & alive)[0]
+
+        if len(candidates) == 0:
+            return params
+
+        sorted_cands = candidates[np.argsort(pos_grad[candidates])[::-1]]
+        to_split     = sorted_cands[:config.n_split]
+
+        keep_mask = np.ones(len(params), dtype=bool)
+        new_rows  = []
+
+        for idx in to_split:
+            g          = params[idx]
+            keep_mask[idx] = False
+
+            split_axis         = int(np.argmax(g[3:6]))
+            offset             = np.zeros(3, dtype=np.float32)
+            offset[split_axis] = g[3 + split_axis] * 0.5
+
+            g1 = g.copy(); g2 = g.copy()
+            g1[0:3] = g[0:3] + offset
+            g2[0:3] = g[0:3] - offset
+            g1[3:6] = g[3:6] * 0.7071   # scale / sqrt(2)
+            g2[3:6] = g[3:6] * 0.7071
+            g1[10]  = g[10]  * 0.6      # shared weight with overlap factor
+            g2[10]  = g[10]  * 0.6
+            new_rows.extend([g1, g2])
+
+        survivors = params[keep_mask]
+        print(f"[ADC:CPU] Split {len(to_split)} Gaussians → +{len(to_split)} children")
+
+        if new_rows:
+            return np.vstack([survivors, np.array(new_rows, dtype=np.float32)])
+        return survivors
+
+    # ------------------------------------------------------------------
+    def _clone(self, params, pred, ref, config, vol_min, vol_max):
+        if len(params) >= config.max_gaussians:
+            print(f"[ADC:CPU] At Gaussian cap ({config.max_gaussians}), skipping clone")
+            return params
+
+        # Positive where we are UNDER-predicting
+        under_error = np.clip(
+            ref.astype(np.float32) - pred.astype(np.float32), 0.0, None)
+
+        # Only spawn where the reference has actual substance
+        under_error *= (ref > config.substance_thresh).astype(np.float32)
+
+        if np.any(under_error > 0):
+            # Only spawn into top 40% worst voxels
+            # As training matures, raise this to 60-70% to be more selective
+            thresh = float(np.percentile(under_error[under_error > 0], 60))
+            under_error[under_error < thresh] = 0.0
+
+        total_error = float(under_error.sum())
+        if total_error < 1e-8:
+            print("[ADC:CPU] No significant under-prediction, skipping clone")
+            return params
+
+        n_spawn = min(config.n_clone, config.max_gaussians - len(params))
+        if n_spawn <= 0:
+            return params
+
+        flat      = under_error.flatten()
+        probs     = flat / flat.sum()
+        n_nonzero = int(np.count_nonzero(flat))
+        replace   = n_nonzero < n_spawn
+        chosen    = np.random.choice(len(flat), size=n_spawn,
+                                     replace=replace, p=probs)
+
+        Z, Y, X = ref.shape
+        zs = chosen // (Y * X)
+        ys = (chosen % (Y * X)) // X
+        xs = chosen % X
+
+        vol_min_a  = np.array(vol_min, dtype=np.float32)
+        vol_max_a  = np.array(vol_max, dtype=np.float32)
+        vol_extent = vol_max_a - vol_min_a
+        voxel_size = vol_extent / np.array([X, Y, Z], dtype=np.float32)
+
+        new_rows = []
+        for i in range(n_spawn):
+            uvw       = np.array([xs[i]+0.5, ys[i]+0.5, zs[i]+0.5], dtype=np.float32)
+            uvw      /= np.array([X, Y, Z], dtype=np.float32)
+            world_pos = vol_min_a + uvw * vol_extent
+            jitter    = (np.random.rand(3).astype(np.float32) - 0.5) * voxel_size * 0.5
+            world_pos = world_pos + jitter
+
+            sigma       = float(vol_extent.max() / X) * 1.5
+            local_ref   = float(ref[zs[i], ys[i], xs[i]])
+            init_weight = float(np.clip(local_ref * 0.5, 0.05, 0.3))
+
+            new_rows.append([
+                world_pos[0], world_pos[1], world_pos[2],
+                sigma, sigma, sigma,
+                0.0, 0.0, 0.0, 1.0,
+                init_weight
+            ])
+
+        new_arr = np.array(new_rows, dtype=np.float32)
+        print(f"[ADC:CPU] Cloned {n_spawn} Gaussians "
+              f"(total → {len(params) + n_spawn})")
+        return np.vstack([params, new_arr])
+
+
+# ==========================================
+# GPU BACKEND (stub)
+# ==========================================
+
+class GPUADCBackend(ADCBackend):
+    """
+    Future GPU-native ADC via Slang kernels.
+    Planned:
+      1. prune_kernel   - compact survivors with InterlockedAdd
+      2. compact_kernel - write tight param buffer from survivor list
+      3. spawn_kernel   - reservoir-sample loss texture, append Gaussians
+      4. indirect dispatch - wire new count into DispatchIndirectCommand
+    """
+    @property
+    def runs_async(self):
+        # GPU backend runs inline on main thread (slangpy requires the
+        # Vulkan context owner thread). GPU itself is the async engine.
+        return False
+
+    def run(self, params, grads, pred, ref, config, vol_min, vol_max, do_full):
+        raise NotImplementedError("GPU ADC not yet implemented")
+
+
+# ==========================================
+# ADC CONTROLLER
+# ==========================================
+
+class ADCController:
+    """
+    Owns all ADC scheduling, threading, and UI.
+
+    App calls:
+        controller.tick(frame, is_training)   — every frame, handles scheduling
+        controller.apply_pending()            — every frame, zero-cost if nothing ready
+        controller.draw_ui()                  — self-contained imgui panel
+    """
+
+    def __init__(self, app_ref, config: ADCConfig):
+        self.app    = app_ref
+        self.config = config
+
+        self._backends = {
+            ADCMode.CPU: CPUADCBackend(),
+            ADCMode.GPU: GPUADCBackend(),
+        }
+
+        # Threading state (CPU path only)
+        self._lock           = threading.Lock()
+        self._thread         = None
+        self._running        = False
+        self._pending_params = None
+
+        # Stats for UI
+        self.gaussian_count_history = []
+        self.last_adc_frame         = 0
+        self.last_adc_type          = "none"
+
+        # Cached reference volume — never changes after load
+        self._ref_cache = None
+
+    # ------------------------------------------------------------------
+    # PUBLIC API
+    # ------------------------------------------------------------------
+
+    def tick(self, frame: int, is_training: bool):
+        """Call every frame from App.run()."""
+        if not is_training:
+            return
+        if self.config.mode == ADCMode.DISABLED:
+            return
+        if frame < self.config.start_frame:
+            return
+
+        do_full    = (frame % self.config.full_adc_every   == 0)
+        prune_only = (frame % self.config.prune_only_every == 0)
+
+        if do_full:
+            self._trigger(do_full=True)
+        elif prune_only:
+            self._trigger(do_full=False)
+
+    def apply_pending(self):
+        """
+        Call every frame from App.run() — before render.
+        Zero cost when nothing is ready.
+        """
+        if self.config.mode == ADCMode.DISABLED:
+            return
+
+        with self._lock:
+            if self._pending_params is None:
+                return
+            params, surviving_indices = self._pending_params
+            self._pending_params = None
+
+        self.app.apply_densification(params, surviving_indices)
+
+        self.gaussian_count_history.append(len(params))
+        if len(self.gaussian_count_history) > 200:
+            self.gaussian_count_history.pop(0)
+
+    # ------------------------------------------------------------------
+    # INTERNAL SCHEDULING
+    # ------------------------------------------------------------------
+
+    def _trigger(self, do_full: bool):
+        backend = self._backends.get(self.config.mode)
+
+        if backend is None or self.config.mode == ADCMode.DISABLED:
+            return
+
+        if self.config.mode == ADCMode.GPU:
+            print("[ADC] GPU backend not yet implemented, falling back to CPU")
+            backend = self._backends[ADCMode.CPU]
+
+        # CPU path: async via thread
+        if self._running:
+            print("[ADC] Previous pass still running, skipping this cycle")
+            return
+
+        snapshots = self._take_snapshots()
+        if snapshots is None:
+            return
+
+        params_snap, grads_snap, pred_snap, ref_snap = snapshots
+
+        self._running      = True
+        self.last_adc_type = "Full" if do_full else "Prune-only"
+
+        self._thread = threading.Thread(
+            target=self._worker,
+            args=(params_snap, grads_snap, pred_snap, ref_snap, do_full),
+            daemon=True
+        )
+        self._thread.start()
+        print(f"[ADC] {self.last_adc_type} pass started "
+              f"({len(params_snap)} Gaussians in)")
+
+    def _take_snapshots(self):
+        """
+        GPU readbacks — must run on the main thread.
+        Returns (params, grads, pred, ref) numpy snapshots or None on error.
+        """
+        try:
+            r = self.app.renderer
+
+            params_snap = (r.gaussian_buffer
+                           .to_numpy()
+                           .view(np.float32)
+                           .reshape(-1, PARAMS_PER_GAUSSIAN)
+                           .copy())
+
+            grads_snap = (r.grad_buffer
+                          .to_numpy()
+                          .view(np.float32)
+                          .reshape(-1, PARAMS_PER_GAUSSIAN)
+                          .copy())
+
+            # Fresh rasterize so prediction matches current Gaussian state
+            cmd = self.app.device.create_command_encoder()
+            r.rasterize_gaussians(cmd, self.app.vol_min_world, self.app.vol_max_world)
+            self.app.device.submit_command_buffer(cmd.finish())
+            pred_snap = r.gaussian_volume_tex.to_numpy().copy()
+
+            # Reference never changes — cache it after first read
+            if self._ref_cache is None:
+                self._ref_cache = r.volume_tex.to_numpy().copy()
+                print("[ADC] Reference volume cached")
+
+            return params_snap, grads_snap, pred_snap, self._ref_cache
+
+        except Exception as e:
+            print(f"[ADC] Snapshot failed: {e}")
+            traceback.print_exc()
+            self._running = False
+            return None
+
+    def _worker(self, params, grads, pred, ref, do_full):
+        try:
+            backend = self._backends[self.config.mode]
+            if self.config.mode == ADCMode.GPU:
+                backend = self._backends[ADCMode.CPU]
+
+            result_params, surviving_indices = backend.run(
+                params, grads, pred, ref,
+                self.config,
+                self.app.vol_min_world,
+                self.app.vol_max_world,
+                do_full
+            )
+
+            self.gaussian_count_history.append(len(result_params))
+            if len(self.gaussian_count_history) > 200:
+                self.gaussian_count_history.pop(0)
+
+            with self._lock:
+                self._pending_params = (result_params, surviving_indices)
+
+        except Exception as e:
+            print(f"[ADC] Worker error: {e}")
+            traceback.print_exc()
+        finally:
+            self._running = False
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+
+    def draw_ui(self):
+        """
+        Self-contained imgui panel.
+        Call from App.draw_ui() as: self.adc.draw_ui()
+        Requires imgui_bundle to be imported in the calling module.
+        """
+        from imgui_bundle import imgui
+
+        if not imgui.begin("ADC - Adaptive Density Control"):
+            imgui.end()
+            return
+
+        # ---- Mode selector ----
+        modes = ["Disabled", "CPU (Async)", "GPU (Stub)"]
+        changed, self.config.mode = imgui.combo("Backend", self.config.mode, modes)
+        if self.config.mode == ADCMode.GPU:
+            imgui.text_colored(imgui.ImVec4(1, 0.5, 0, 1),
+                               "GPU ADC not yet implemented — falls back to CPU")
+
+        imgui.separator()
+
+        # ---- Status ----
+        if self._running:
+            imgui.text_colored(imgui.ImVec4(1, 1, 0, 1),
+                               f"Running: {self.last_adc_type}...")
+        elif self.config.mode == ADCMode.DISABLED:
+            imgui.text_colored(imgui.ImVec4(0.5, 0.5, 0.5, 1), "Disabled")
+        else:
+            imgui.text_colored(imgui.ImVec4(0.4, 1, 0.4, 1), "Idle")
+
+        n_current = self.app.renderer.gaussian_count
+        imgui.text(f"Gaussians: {n_current:,} / {self.config.max_gaussians:,}")
+
+        # Progress bar toward cap
+        fill = float(n_current) / float(self.config.max_gaussians)
+        imgui.progress_bar(fill, imgui.ImVec2(-1, 0),
+                           f"{n_current:,} / {self.config.max_gaussians:,}")
+
+        # History plot
+        if len(self.gaussian_count_history) > 1:
+            arr = np.array(self.gaussian_count_history, dtype=np.float32)
+            imgui.plot_lines(
+                "##gauss_history", arr,
+                scale_min=0.0,
+                scale_max=float(self.config.max_gaussians),
+                graph_size=imgui.ImVec2(300, 50)
+            )
+
+        imgui.separator()
+
+        # ---- Scheduling ----
+        imgui.text("Scheduling")
+        _, self.config.start_frame = imgui.slider_int(
+            "Start Frame", self.config.start_frame, 0, 2000)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Don't run ADC until Adam has settled this many frames")
+
+        _, self.config.full_adc_every = imgui.slider_int(
+            "Full ADC Every N Frames", self.config.full_adc_every, 50, 1000)
+        _, self.config.prune_only_every = imgui.slider_int(
+            "Prune Only Every N Frames", self.config.prune_only_every, 20, 500)
+        _, self.config.max_gaussians = imgui.slider_int(
+            "Max Gaussians", self.config.max_gaussians, 1000, 200000)
+
+        imgui.separator()
+
+        # ---- Prune ----
+        imgui.text("Pruning")
+        _, self.config.prune_weight_min = imgui.slider_float(
+            "Min Weight Threshold", self.config.prune_weight_min,
+            0.0001, 0.05, format="%.4f")
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Gaussians with weight below this are removed")
+
+        _, self.config.prune_scale_max = imgui.slider_float(
+            "Max Scale (fraction of extent)", self.config.prune_scale_max,
+            0.05, 1.0, format="%.2f")
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Gaussians larger than this fraction of the volume extent are removed")
+
+        imgui.separator()
+
+        # ---- Split ----
+        imgui.text("Split")
+        _, self.config.n_split = imgui.slider_int(
+            "Split Count", self.config.n_split, 0, 200)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Max Gaussians to split per ADC pass")
+
+        _, self.config.split_scale_thresh = imgui.slider_float(
+            "Split Size Threshold", self.config.split_scale_thresh,
+            0.01, 0.2, format="%.3f")
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Min scale (fraction of extent) to be a split candidate")
+
+        _, self.config.split_grad_percentile = imgui.slider_int(
+            "Grad Percentile Threshold", self.config.split_grad_percentile,
+            50, 99)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Only split Gaussians whose gradient magnitude exceeds this percentile")
+
+        imgui.separator()
+
+        # ---- Clone ----
+        imgui.text("Clone / Spawn")
+        _, self.config.n_clone = imgui.slider_int(
+            "Clone Count", self.config.n_clone, 0, 500)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Max new Gaussians to spawn per full ADC pass")
+
+        _, self.config.substance_thresh = imgui.slider_float(
+            "Substance Threshold", self.config.substance_thresh,
+            0.001, 0.2, format="%.3f")
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Min reference density at a voxel to be a valid spawn site.\n"
+                "Prevents spawning in empty boundary regions.")
+
+        imgui.separator()
+
+        # ---- Manual triggers ----
+        disabled = self._running or self.config.mode == ADCMode.DISABLED
+        if disabled:
+            imgui.begin_disabled()
+
+        if imgui.button("Run Full ADC Now"):
+            self._trigger(do_full=True)
+        imgui.same_line()
+        if imgui.button("Prune Only"):
+            self._trigger(do_full=False)
+
+        if disabled:
+            imgui.end_disabled()
+
+        imgui.end()
     
 class TrainingConfig:
     """Configurable training hyperparameters"""
@@ -495,7 +1076,6 @@ class Renderer:
             cp.dispatch(thread_count=(threads, 1, 1))
         
         self.device.submit_command_buffer(cmd.finish())
-        self.adam_iteration = 1
 
 
     def analyze_gradients(self):
@@ -972,6 +1552,52 @@ class App:
         self.renderer.rasterize_gaussians(cmd, self.vol_min_world, self.vol_max_world)
         self.device.submit_command_buffer(cmd.finish())
 
+        self.adc = ADCController(self, ADCConfig())
+
+    
+    def apply_densification(self, new_params, surviving_indices=None):
+        # surviving_indices: which rows of the OLD buffer survived pruning
+        # passed back from _adc_worker alongside new_params
+        
+        saved_iteration = self.renderer.adam_iteration
+        
+        if surviving_indices is not None:
+            # Read old momentum buffers before init_training zeros them
+            old_m1 = (self.renderer.adam_first_moment
+                    .to_numpy().view(np.float32)
+                    .reshape(-1, PARAMS_PER_GAUSSIAN).copy())
+            old_m2 = (self.renderer.adam_second_moment
+                    .to_numpy().view(np.float32)
+                    .reshape(-1, PARAMS_PER_GAUSSIAN).copy())
+        
+        # Rebuild buffer
+        self.renderer.gaussian_count  = len(new_params)
+        self.renderer.gaussian_buffer = self.device.create_buffer(
+            element_count=len(new_params),
+            struct_size=PARAMS_PER_GAUSSIAN * 4,
+            usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+            memory_type=spy.MemoryType.device_local,
+            data=new_params
+        )
+        self.renderer.init_training()   # zeros all momentum
+        self.renderer.adam_iteration = saved_iteration
+        
+        if surviving_indices is not None:
+            n_new    = len(new_params)
+            n_survive = len(surviving_indices)
+            
+            # Reconstruct momentum: survivors keep theirs, new Gaussians stay zero
+            new_m1 = np.zeros((n_new, PARAMS_PER_GAUSSIAN), dtype=np.float32)
+            new_m2 = np.zeros((n_new, PARAMS_PER_GAUSSIAN), dtype=np.float32)
+            new_m1[:n_survive] = old_m1[surviving_indices]
+            new_m2[:n_survive] = old_m2[surviving_indices]
+            
+            # Upload preserved momentum
+            self.renderer.adam_first_moment.copy_from_numpy(
+                new_m1.flatten())
+            self.renderer.adam_second_moment.copy_from_numpy(
+                new_m2.flatten())
+
 
     def run(self):
         last_time = glfw.get_time()
@@ -1002,28 +1628,38 @@ class App:
             if self.is_training:
                 self.renderer.run_training_step(self.vol_min_world, self.vol_max_world, self.train_config)
 
-                if frame_count % 20 == 0:
+                if frame_count % 100 == 0:
                     tile_debug = self.renderer.tile_counts.to_numpy().view(dtype=np.uint32)
                     total_refs = np.sum(tile_debug)
                     
                     grad_bytes = self.renderer.grad_buffer.to_numpy()
-                    grad_debug = grad_bytes.view(dtype=np.float32)[:25]
+                    grad_all   = grad_bytes.view(dtype=np.float32).reshape(-1, PARAMS_PER_GAUSSIAN)
+                    
+                    # Check weight gradients across ALL Gaussians (param index 10)
+                    weight_grads = grad_all[:, 10]
+                    grad_max     = np.max(np.abs(grad_all))
+                    nonzero      = np.count_nonzero(weight_grads)
                     
                     if total_refs == 0:
                         print(f"[CRITICAL] Tiler is empty! (Total Refs: {total_refs})")
-                    elif np.all(grad_debug == 0):
-                        print(f"[ALERT] Tiler works ({total_refs} refs) but Gradients are ZERO.")
+                    elif grad_max == 0:
+                        print(f"[ALERT] Tiler works ({total_refs} refs) but ALL gradients are ZERO.")
                     else:
-                        print(f"[OK] Training Running. Refs: {total_refs}, GradMax: {np.max(np.abs(grad_debug)):.6f}")
+                        print(f"[OK] Training Running. Refs: {total_refs}, "
+                            f"GradMax: {grad_max:.6f}, "
+                            f"ActiveWeightGrads: {nonzero}/{len(weight_grads)}")
                 
                                 
                 # Track loss every 10 frames
-                if frame_count % 10 == 0:
+                if frame_count % 50 == 0:
                     self.renderer.analyze_gradients()
                     loss = self.compute_current_loss()
                     self.renderer.loss_history.append(loss)
                     if len(self.renderer.loss_history) > 200:
                         self.renderer.loss_history.pop(0)
+            
+            self.adc.tick(frame_count, self.is_training)
+            self.adc.apply_pending()
                 
             
             if not self.is_training:
@@ -1174,6 +1810,7 @@ class App:
             if imgui.button("Regenerate Gaussians"):
                 self.gaussians = convert_grid_to_gaussians(self.grid, self.train_config)
                 self.renderer.gaussian_count = len(self.gaussians)
+                self.apply_densification(self.gaussians)
                 self.renderer.gaussian_buffer = self.device.create_buffer(
                         element_count=self.renderer.gaussian_count,
                         struct_size=PARAMS_PER_GAUSSIAN * 4,
@@ -1186,6 +1823,7 @@ class App:
                 cmd = self.device.create_command_encoder()
                 self.renderer.rasterize_gaussians(cmd, self.vol_min_world, self.vol_max_world)
                 self.device.submit_command_buffer(cmd.finish())
+                self.adam_iteration = 1
                 print("Gaussians regenerated!")
 
             imgui.dummy((0, 10))
@@ -1199,122 +1837,125 @@ class App:
 
             # Debug
             imgui.dummy((0, 10))
-        imgui.text("Debug Visualization")
-        imgui.separator()
-        
-        debug_modes = [
-            "None (Normal Render)",
-            "Loss Heatmap",
-            "Gradient Magnitude",
-            "Tile Gaussian Count",
-            "Gaussian Overlap",
-            "Prediction Error"
-        ]
-        
-        old_mode = self.renderer.debug_mode
-        clicked, self.renderer.debug_mode = imgui.combo(
-            "Debug Mode", 
-            self.renderer.debug_mode, 
-            debug_modes
-        )
-        
-        # Refresh debug when mode changes
-        if self.renderer.debug_mode != old_mode:
-            self.renderer.debug_needs_update = True
-        
-        if self.renderer.debug_mode > 0:
-            old_scale = self.renderer.debug_scale
-            _, self.renderer.debug_scale = imgui.slider_float(
-                "Visualization Scale", 
-                self.renderer.debug_scale, 
-                0.1, 5.0
+        imgui.end()
+
+        if imgui.begin("Debug"):
+            imgui.text("Debug Visualization")
+            imgui.separator()
+            
+            debug_modes = [
+                "None (Normal Render)",
+                "Loss Heatmap",
+                "Gradient Magnitude",
+                "Tile Gaussian Count",
+                "Gaussian Overlap",
+                "Prediction Error"
+            ]
+            
+            old_mode = self.renderer.debug_mode
+            clicked, self.renderer.debug_mode = imgui.combo(
+                "Debug Mode", 
+                self.renderer.debug_mode, 
+                debug_modes
             )
             
-            # Refresh debug when scale changes
-            if abs(self.renderer.debug_scale - old_scale) > 0.01:
+            # Refresh debug when mode changes
+            if self.renderer.debug_mode != old_mode:
                 self.renderer.debug_needs_update = True
             
-            # Mode-specific information
-            imgui.dummy((0, 5))
-            
-            if self.renderer.debug_mode == 1:  # Loss
-                imgui.text_colored((0.7, 0.7, 0.7, 1), "Loss Heatmap")
-                imgui.text_wrapped(
-                    "Green: Low loss (< 0.05) - well fitted\n"
-                    "Yellow: Medium loss (0.05-0.1) - needs improvement\n"
-                    "Red: High loss (> 0.1) - poor fit, add Gaussians"
+            if self.renderer.debug_mode > 0:
+                old_scale = self.renderer.debug_scale
+                _, self.renderer.debug_scale = imgui.slider_float(
+                    "Visualization Scale", 
+                    self.renderer.debug_scale, 
+                    0.1, 5.0
                 )
-                imgui.separator()
-                imgui.text(f"Typical range: 0.0 - 0.05")
-                imgui.text(f"Scale multiplier: {self.renderer.debug_scale:.2f}x")
                 
-            elif self.renderer.debug_mode == 2:  # Gradients
-                imgui.text_colored((0.7, 0.7, 0.7, 1), "Gradient Magnitude")
-                imgui.text_wrapped(
-                    "Shows where optimizer is making changes.\n"
-                    "Green: Small gradients (< 0.04) - converged\n"
-                    "Yellow: Medium gradients (0.04-0.1)\n"
-                    "Red: Large gradients (> 0.1) - active learning"
-                )
-                imgui.separator()
+                # Refresh debug when scale changes
+                if abs(self.renderer.debug_scale - old_scale) > 0.01:
+                    self.renderer.debug_needs_update = True
                 
-                # Show actual gradient stats
-                if hasattr(self.renderer, 'grad_buffer') and self.renderer.grad_buffer:
-                    grad_bytes = self.renderer.grad_buffer.to_numpy()
-                    grad_debug = grad_bytes.view(dtype=np.float32)
-                    grad_nonzero = grad_debug[grad_debug != 0]
-                    if len(grad_nonzero) > 0:
-                        imgui.text(f"Current gradients:")
-                        imgui.text(f"  Max: {np.max(np.abs(grad_nonzero)):.6f}")
-                        imgui.text(f"  Mean: {np.mean(np.abs(grad_nonzero)):.6f}")
-                        imgui.text(f"  Active: {len(grad_nonzero)}/{len(grad_debug)}")
+                # Mode-specific information
+                imgui.dummy((0, 5))
                 
-            elif self.renderer.debug_mode == 3:  # Tile density
-                imgui.text_colored((0.7, 0.7, 0.7, 1), "Tile Gaussian Count")
-                imgui.text_wrapped(
-                    "Shows Gaussian distribution efficiency.\n"
-                    "Green: Sparse (< 16 Gaussians/tile)\n"
-                    "Yellow: Medium (16-32)\n"
-                    "Red: Dense (> 32) - may need larger tiles"
-                )
-                imgui.separator()
+                if self.renderer.debug_mode == 1:  # Loss
+                    imgui.text_colored((0.7, 0.7, 0.7, 1), "Loss Heatmap")
+                    imgui.text_wrapped(
+                        "Green: Low loss (< 0.05) - well fitted\n"
+                        "Yellow: Medium loss (0.05-0.1) - needs improvement\n"
+                        "Red: High loss (> 0.1) - poor fit, add Gaussians"
+                    )
+                    imgui.separator()
+                    imgui.text(f"Typical range: 0.0 - 0.05")
+                    imgui.text(f"Scale multiplier: {self.renderer.debug_scale:.2f}x")
+                    
+                elif self.renderer.debug_mode == 2:  # Gradients
+                    imgui.text_colored((0.7, 0.7, 0.7, 1), "Gradient Magnitude")
+                    imgui.text_wrapped(
+                        "Shows where optimizer is making changes.\n"
+                        "Green: Small gradients (< 0.04) - converged\n"
+                        "Yellow: Medium gradients (0.04-0.1)\n"
+                        "Red: Large gradients (> 0.1) - active learning"
+                    )
+                    imgui.separator()
+                    
+                    # Show actual gradient stats
+                    if hasattr(self.renderer, 'grad_buffer') and self.renderer.grad_buffer:
+                        grad_bytes = self.renderer.grad_buffer.to_numpy()
+                        grad_debug = grad_bytes.view(dtype=np.float32)
+                        grad_nonzero = grad_debug[grad_debug != 0]
+                        if len(grad_nonzero) > 0:
+                            imgui.text(f"Current gradients:")
+                            imgui.text(f"  Max: {np.max(np.abs(grad_nonzero)):.6f}")
+                            imgui.text(f"  Mean: {np.mean(np.abs(grad_nonzero)):.6f}")
+                            imgui.text(f"  Active: {len(grad_nonzero)}/{len(grad_debug)}")
+                    
+                elif self.renderer.debug_mode == 3:  # Tile density
+                    imgui.text_colored((0.7, 0.7, 0.7, 1), "Tile Gaussian Count")
+                    imgui.text_wrapped(
+                        "Shows Gaussian distribution efficiency.\n"
+                        "Green: Sparse (< 16 Gaussians/tile)\n"
+                        "Yellow: Medium (16-32)\n"
+                        "Red: Dense (> 32) - may need larger tiles"
+                    )
+                    imgui.separator()
+                    
+                    # Show tile stats
+                    if hasattr(self.renderer, 'tile_counts') and self.renderer.tile_counts:
+                        tile_debug = self.renderer.tile_counts.to_numpy().view(dtype=np.uint32)
+                        total_refs = np.sum(tile_debug)
+                        occupied = np.sum(tile_debug > 0)
+                        if occupied > 0:
+                            imgui.text(f"Tile statistics:")
+                            imgui.text(f"  Total refs: {total_refs:,}")
+                            imgui.text(f"  Avg/tile: {total_refs/occupied:.1f}")
+                            imgui.text(f"  Max/tile: {np.max(tile_debug)}")
+                    
+                elif self.renderer.debug_mode == 4:  # Overlap
+                    imgui.text_colored((0.7, 0.7, 0.7, 1), "Gaussian Overlap")
+                    imgui.text_wrapped(
+                        "Shows combined Gaussian density.\n"
+                        "Green: Low density (< 0.25)\n"
+                        "Yellow: Medium density (0.25-0.5)\n"
+                        "Red: High density (> 0.5)"
+                    )
+                    imgui.separator()
+                    imgui.text(f"Typical range: 0.0 - 1.0")
+                    
+                elif self.renderer.debug_mode == 5:  # Error
+                    imgui.text_colored((0.7, 0.7, 0.7, 1), "Prediction Error")
+                    imgui.text_wrapped(
+                        "Compares prediction vs. ground truth.\n"
+                        "Blue: Underpredicting (add Gaussians)\n"
+                        "White: Accurate (< ±0.02 error)\n"
+                        "Red: Overpredicting (reduce weights)"
+                    )
+                    imgui.separator()
+                    imgui.text(f"Error range: -0.1 to +0.1")
                 
-                # Show tile stats
-                if hasattr(self.renderer, 'tile_counts') and self.renderer.tile_counts:
-                    tile_debug = self.renderer.tile_counts.to_numpy().view(dtype=np.uint32)
-                    total_refs = np.sum(tile_debug)
-                    occupied = np.sum(tile_debug > 0)
-                    if occupied > 0:
-                        imgui.text(f"Tile statistics:")
-                        imgui.text(f"  Total refs: {total_refs:,}")
-                        imgui.text(f"  Avg/tile: {total_refs/occupied:.1f}")
-                        imgui.text(f"  Max/tile: {np.max(tile_debug)}")
-                
-            elif self.renderer.debug_mode == 4:  # Overlap
-                imgui.text_colored((0.7, 0.7, 0.7, 1), "Gaussian Overlap")
-                imgui.text_wrapped(
-                    "Shows combined Gaussian density.\n"
-                    "Green: Low density (< 0.25)\n"
-                    "Yellow: Medium density (0.25-0.5)\n"
-                    "Red: High density (> 0.5)"
-                )
-                imgui.separator()
-                imgui.text(f"Typical range: 0.0 - 1.0")
-                
-            elif self.renderer.debug_mode == 5:  # Error
-                imgui.text_colored((0.7, 0.7, 0.7, 1), "Prediction Error")
-                imgui.text_wrapped(
-                    "Compares prediction vs. ground truth.\n"
-                    "Blue: Underpredicting (add Gaussians)\n"
-                    "White: Accurate (< ±0.02 error)\n"
-                    "Red: Overpredicting (reduce weights)"
-                )
-                imgui.separator()
-                imgui.text(f"Error range: -0.1 to +0.1")
-            
-            imgui.dummy((0, 5))
-            if imgui.button("Refresh Debug View"):
-                self.renderer.debug_needs_update = True
+                imgui.dummy((0, 5))
+                if imgui.button("Refresh Debug View"):
+                    self.renderer.debug_needs_update = True
             
         imgui.end()
 
@@ -1435,6 +2076,8 @@ class App:
                 )
         
         imgui.end()
+
+        self.adc.draw_ui()
 
     def cleanup(self):
         imgui.backends.opengl3_shutdown()
