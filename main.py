@@ -739,7 +739,8 @@ class Renderer:
         self.width, self.height = w, h
         
         self.screen_tex = self.device.create_texture(
-            format=spy.Format.rgba32_float, width=w, height=h,
+            format=spy.Format.rgba8_unorm,  # was rgba32_float
+            width=w, height=h,
             usage=spy.TextureUsage.render_target, label="Screen"
         )
         
@@ -760,7 +761,7 @@ class Renderer:
                 new_pipe = self.device.create_render_pipeline(
                     program=prog,
                     input_layout=self.device.create_input_layout(input_elements=[], vertex_streams=[]),
-                    targets=[{"format": spy.Format.rgba32_float}]
+                    targets=[{"format": spy.Format.rgba8_unorm}]
                 )
                 
                 self.pipeline = new_pipe
@@ -852,15 +853,19 @@ class Renderer:
         self.device.submit_command_buffer(cmd.finish())
 
     def update_display(self):
-        pixels = (np.clip(self.screen_tex.to_numpy(), 0, 1) * 255).astype(np.uint8)
+        pixels = self.screen_tex.to_numpy()  # already RGBA8, no clip/cast needed
         glBindTexture(GL_TEXTURE_2D, self.display_gl_tex)
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, self.width, self.height, GL_RGBA, GL_UNSIGNED_BYTE, pixels)
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, self.width, self.height, 
+                        GL_RGBA, GL_UNSIGNED_BYTE, pixels)
         
         fb = glGenFramebuffers(1)
         glBindFramebuffer(GL_READ_FRAMEBUFFER, fb)
-        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, self.display_gl_tex, 0)
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 
+                            GL_TEXTURE_2D, self.display_gl_tex, 0)
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0)
-        glBlitFramebuffer(0, 0, self.width, self.height, 0, 0, self.width, self.height, GL_COLOR_BUFFER_BIT, GL_NEAREST)
+        glBlitFramebuffer(0, 0, self.width, self.height, 
+                        0, 0, self.width, self.height, 
+                        GL_COLOR_BUFFER_BIT, GL_NEAREST)
         glDeleteFramebuffers(1, [fb])
     
     def rasterize_gaussians(self, cmd, vol_min, vol_max):
@@ -994,56 +999,50 @@ class App:
             self.draw_ui(dt)
             self.handle_input(dt)
 
-            try:
-                if self.is_training:
-                    self.renderer.run_training_step(self.vol_min_world, self.vol_max_world, self.train_config)
+            if self.is_training:
+                self.renderer.run_training_step(self.vol_min_world, self.vol_max_world, self.train_config)
 
-                    if frame_count % 20 == 0:
-                        tile_debug = self.renderer.tile_counts.to_numpy().view(dtype=np.uint32)
-                        total_refs = np.sum(tile_debug)
-                        
-                        grad_bytes = self.renderer.grad_buffer.to_numpy()
-                        grad_debug = grad_bytes.view(dtype=np.float32)[:25]
-                        
-                        if total_refs == 0:
-                            print(f"[CRITICAL] Tiler is empty! (Total Refs: {total_refs})")
-                        elif np.all(grad_debug == 0):
-                            print(f"[ALERT] Tiler works ({total_refs} refs) but Gradients are ZERO.")
-                        else:
-                            print(f"[OK] Training Running. Refs: {total_refs}, GradMax: {np.max(np.abs(grad_debug)):.6f}")
+                if frame_count % 20 == 0:
+                    tile_debug = self.renderer.tile_counts.to_numpy().view(dtype=np.uint32)
+                    total_refs = np.sum(tile_debug)
                     
+                    grad_bytes = self.renderer.grad_buffer.to_numpy()
+                    grad_debug = grad_bytes.view(dtype=np.float32)[:25]
                     
-                    # Analyze gradients every frame
-                    self.renderer.analyze_gradients()
-                    
-                    # Track loss every 10 frames
-                    if frame_count % 10 == 0:
-                        loss = self.compute_current_loss()
-                        self.renderer.loss_history.append(loss)
-                        if len(self.renderer.loss_history) > 200:
-                            self.renderer.loss_history.pop(0)
-                    
+                    if total_refs == 0:
+                        print(f"[CRITICAL] Tiler is empty! (Total Refs: {total_refs})")
+                    elif np.all(grad_debug == 0):
+                        print(f"[ALERT] Tiler works ({total_refs} refs) but Gradients are ZERO.")
+                    else:
+                        print(f"[OK] Training Running. Refs: {total_refs}, GradMax: {np.max(np.abs(grad_debug)):.6f}")
                 
-                if not self.is_training:
-                    needs_compute = (
-                        (self.renderer.debug_needs_update and self.renderer.debug_mode > 0) or
-                        (self.renderer._needs_rasterization and self.renderer.use_gaussian_volume)
-                    )
-                    if needs_compute:
-                        cmd = self.device.create_command_encoder()
-                        if self.renderer._needs_rasterization and self.renderer.use_gaussian_volume:
-                            self.renderer.rasterize_gaussians(cmd, self.vol_min_world, self.vol_max_world)
-                        if self.renderer.debug_needs_update and self.renderer.debug_mode > 0:
-                            self.renderer.update_debug_visualization(cmd, self.vol_min_world, self.vol_max_world)
-                        self.device.submit_command_buffer(cmd.finish())
-                    
-                self.renderer.render(self.camera, self.settings)
-                self.renderer.update_display()
+                                
+                # Track loss every 10 frames
+                if frame_count % 10 == 0:
+                    self.renderer.analyze_gradients()
+                    loss = self.compute_current_loss()
+                    self.renderer.loss_history.append(loss)
+                    if len(self.renderer.loss_history) > 200:
+                        self.renderer.loss_history.pop(0)
+                
+            
+            if not self.is_training:
+                needs_compute = (
+                    (self.renderer.debug_needs_update and self.renderer.debug_mode > 0) or
+                    (self.renderer._needs_rasterization and self.renderer.use_gaussian_volume)
+                )
+                if needs_compute:
+                    cmd = self.device.create_command_encoder()
+                    if self.renderer._needs_rasterization and self.renderer.use_gaussian_volume:
+                        self.renderer.rasterize_gaussians(cmd, self.vol_min_world, self.vol_max_world)
+                    if self.renderer.debug_needs_update and self.renderer.debug_mode > 0:
+                        self.renderer.update_debug_visualization(cmd, self.vol_min_world, self.vol_max_world)
+                    self.device.submit_command_buffer(cmd.finish())
+                
+            self.renderer.render(self.camera, self.settings)
+            self.renderer.update_display()
 
-                frame_count += 1
-
-            except Exception as e:
-                print(f"Runtime Render Error: {e}")
+            frame_count += 1
 
             imgui.render()
             imgui.backends.opengl3_render_draw_data(imgui.get_draw_data())
@@ -1184,7 +1183,9 @@ class App:
                     )
                 self.renderer.init_training()
                 self.renderer._needs_rebinning = True
-                self.renderer.rasterize_gaussians(self.vol_min_world, self.vol_max_world)
+                cmd = self.device.create_command_encoder()
+                self.renderer.rasterize_gaussians(cmd, self.vol_min_world, self.vol_max_world)
+                self.device.submit_command_buffer(cmd.finish())
                 print("Gaussians regenerated!")
 
             imgui.dummy((0, 10))
@@ -1448,7 +1449,9 @@ class App:
             vol = self.renderer.gaussian_volume_tex.to_numpy()
         else:
             # Need to rasterize temporarily
-            self.renderer.rasterize_gaussians(self.vol_min_world, self.vol_max_world)
+            cmd = self.device.create_command_encoder()
+            self.renderer.rasterize_gaussians(cmd, self.vol_min_world, self.vol_max_world)
+            self.device.submit_command_buffer(cmd.finish())
             vol = self.renderer.gaussian_volume_tex.to_numpy()
         
         ref = self.renderer.volume_tex.to_numpy()

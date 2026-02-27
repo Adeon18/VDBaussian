@@ -1,6 +1,6 @@
 // training.slang
 
-// Training workgroup dimensions (must match kernel dispatch)
+// Training workgroup dimensions
 static const uint TRAIN_WG_X = 4;
 static const uint TRAIN_WG_Y = 4;
 static const uint TRAIN_WG_Z = 4;
@@ -76,10 +76,19 @@ struct Gaussian
 [[vk::binding(6)]] RWStructuredBuffer<float> gAdamSecondMoment;
 [[vk::binding(7)]] RWTexture3D<float4> gDebugVolume;
 
-groupshared float reductionBuffer[TRAIN_WG_SIZE];
-groupshared float gs_params[MAX_GAUSSIANS_PER_TILE * PARAMS_PER_GAUSSIAN];
-groupshared uint gs_gaussianIDs[MAX_GAUSSIANS_PER_TILE];
-groupshared uint gs_count;
+// Batch size for cooperative Gaussian processing <= TRAIN_WG_SIZE
+static const uint GAUSS_BATCH = 32;
+
+// Per-batch forward cache
+groupshared float4 gsBatchPos[GAUSS_BATCH];        // xyz + padding
+groupshared float4 gsBatchScale[GAUSS_BATCH];      // xyz + padding
+groupshared float4 gsBatchQuat[GAUSS_BATCH];
+groupshared float  gsBatchWeight[GAUSS_BATCH];
+groupshared uint   gsBatchGaussianIDs[GAUSS_BATCH];
+
+// Per-batch gradient accumulator
+// Native float atomic needed here
+groupshared float  gsBatchGradAccum[GAUSS_BATCH * PARAMS_PER_GAUSSIAN];
 
 
 cbuffer TrainParams {
@@ -254,87 +263,82 @@ float3 divergingColor(float t) {
     }
 }
 
+// Non-tiled density for debug passes, reads directly from global params,
+// no groupshared cache required - JUST FOR DEBUG
+float gsDebug_computeDensityDirect(float3 worldPos)
+{
+    float density = 0.0;
+    for (uint gid = 0; gid < gaussianCount; ++gid)
+    {
+        Gaussian g = Gaussian::load(gid);
+        float3 d = worldPos - g.pos;
+        float maxScale = max(g.scale.x, max(g.scale.y, g.scale.z));
+        if (dot(d, d) > (maxScale * 3.0) * (maxScale * 3.0)) continue;
+        float3x3 precision = buildPrecisionMatrix(g.scale, g.quat);
+        density += g.weight * gaussian_math(worldPos, g.pos, precision);
+    }
+    return density;
+}
+
 [shader("compute")]
 [numthreads(TRAIN_WG_X, TRAIN_WG_Y, TRAIN_WG_Z)]
-void compute_debug(uint3 tid : SV_DispatchThreadID) {
+void compute_debug(uint3 tid : SV_DispatchThreadID)
+{
     if (any(tid >= volumeResolution)) return;
     if (debugMode == DEBUG_NONE) return;
-    
+
     float3 uvw = (float3(tid) + 0.5) / float3(volumeResolution);
     float3 worldPos = minWorld + uvw * (maxWorld - minWorld);
-    
-    float rawValue = 0.0;
-    float normalizedValue = 0.0;
+
     float3 debugColor = float3(0.0);
-    float debugAlpha = 0.0;
-    
-    if (debugMode == DEBUG_LOSS) {
-        // Compute loss at this voxel
-        float predicted = compute_density_tiled(tid, worldPos);
-        float target = ReferenceVol[tid];
-        float diff = predicted - target;
-        float loss = diff * diff;
-        
-        rawValue = loss;
-        normalizedValue = loss * DEBUG_LOSS_SCALE * debugScale;
-        debugColor = heatmapColor(normalizedValue);
+    float  debugAlpha = 0.0;
+
+    if (debugMode == DEBUG_LOSS)
+    {
+        float predicted = gsDebug_computeDensityDirect(worldPos);
+        float loss = (predicted - ReferenceVol[tid]) * (predicted - ReferenceVol[tid]);
+        debugColor = heatmapColor(loss * DEBUG_LOSS_SCALE * debugScale);
         debugAlpha = min(loss * DEBUG_ALPHA_MULT_LOSS * debugScale, 1.0);
     }
-    else if (debugMode == DEBUG_GRADIENT_MAG) {
-        // Sum gradient magnitudes for all Gaussians affecting this voxel
+    else if (debugMode == DEBUG_GRADIENT_MAG)
+    {
         uint tileIdx = GetTileIndex(tid);
-        uint count = gTileCounts[tileIdx];
-        count = min(count, MAX_GAUSSIANS_PER_TILE);
-        
+        uint count = min(gTileCounts[tileIdx], MAX_GAUSSIANS_PER_TILE);
         float totalGradMag = 0.0;
-        for (uint i = 0; i < count; ++i) {
+        for (uint i = 0; i < count; ++i)
+        {
             uint gid = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + i];
-            
             float gradMag = 0.0;
             for (uint p = 0; p < PARAMS_PER_GAUSSIAN; ++p) {
                 float g = gGradientsRaw[gid * PARAMS_PER_GAUSSIAN + p];
-                gradMag += g * g;  // L2 norm squared
+                gradMag += g * g;
             }
-            totalGradMag += sqrt(gradMag);  // L2 norm
+            totalGradMag += sqrt(gradMag);
         }
-        
-        rawValue = totalGradMag;
-        normalizedValue = totalGradMag * DEBUG_GRADIENT_SCALE * debugScale;
-        debugColor = heatmapColor(normalizedValue);
+        debugColor = heatmapColor(totalGradMag * DEBUG_GRADIENT_SCALE * debugScale);
         debugAlpha = min(totalGradMag * DEBUG_ALPHA_MULT_GRADIENT * debugScale, 1.0);
     }
-    else if (debugMode == DEBUG_TILE_DENSITY) {
-        // Visualize Gaussian count per tile
-        uint tileIdx = GetTileIndex(tid);
-        uint count = gTileCounts[tileIdx];
-        
-        rawValue = float(count);
-        normalizedValue = float(count) * DEBUG_TILE_SCALE * debugScale;
-        debugColor = heatmapColor(normalizedValue);
-        debugAlpha = normalizedValue;
+    else if (debugMode == DEBUG_TILE_DENSITY)
+    {
+        uint count = gTileCounts[GetTileIndex(tid)];
+        float norm = float(count) * DEBUG_TILE_SCALE * debugScale;
+        debugColor = heatmapColor(norm);
+        debugAlpha = norm;
     }
-    else if (debugMode == DEBUG_OVERLAP) {
-        // Visualize Gaussian density
-        float density = compute_density_tiled(tid, worldPos);
-        
-        rawValue = density;
-        normalizedValue = density * DEBUG_OVERLAP_SCALE * debugScale;
-        debugColor = heatmapColor(normalizedValue);
+    else if (debugMode == DEBUG_OVERLAP)
+    {
+        float density = gsDebug_computeDensityDirect(worldPos);
+        float norm = density * DEBUG_OVERLAP_SCALE * debugScale;
+        debugColor = heatmapColor(norm);
         debugAlpha = min(density * DEBUG_ALPHA_MULT_OVERLAP * debugScale, 1.0);
     }
-    else if (debugMode == DEBUG_PRED_VS_TARGET) {
-        // Visualize prediction error
-        float predicted = compute_density_tiled(tid, worldPos);
-        float target = ReferenceVol[tid];
-        float error = predicted - target;
-        
-        rawValue = error;
-        normalizedValue = error * DEBUG_ERROR_SCALE * debugScale;
-        debugColor = divergingColor(normalizedValue);
+    else if (debugMode == DEBUG_PRED_VS_TARGET)
+    {
+        float error = gsDebug_computeDensityDirect(worldPos) - ReferenceVol[tid];
+        debugColor = divergingColor(error * DEBUG_ERROR_SCALE * debugScale);
         debugAlpha = min(abs(error) * DEBUG_ALPHA_MULT_ERROR * debugScale, 1.0);
     }
-    
-    // Store: RGB = color, A = alpha (for compositing)
+
     gDebugVolume[tid] = float4(debugColor, debugAlpha);
 }
 
@@ -384,30 +388,77 @@ void atomicAccumulate(uint idx, float val) {
     InterlockedAdd(gGradientsRaw[idx], val);
 }
 
-// DIFFERENTIABLE PARAMETER LOADERS
-[BackwardDerivative(loadParam_bwd)]
-float loadParam(uint localGaussianIdx, uint paramID, uint localThreadIdx) {
-    return gs_params[localGaussianIdx * PARAMS_PER_GAUSSIAN + paramID];
+// BATCH HELPERS
+
+// Each lane loads one Gaussian from global into batch cache.
+void gsBatch_prefetch(uint batchStart, uint tileIdx, uint batchCount, uint lane)
+{
+    if (lane >= batchCount) return;
+    uint gid = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + batchStart + lane];
+    gsBatchGaussianIDs[lane] = gid;
+    gsBatchPos[lane]    = float4(asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_POS_X]),
+                                 asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_POS_Y]),
+                                 asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_POS_Z]), 0.0);
+    gsBatchScale[lane]  = float4(asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_X]),
+                                 asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_Y]),
+                                 asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_Z]), 0.0);
+    gsBatchQuat[lane]   = float4(asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_QUAT_X]),
+                                 asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_QUAT_Y]),
+                                 asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_QUAT_Z]),
+                                 asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_QUAT_W]));
+    gsBatchWeight[lane] = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_WEIGHT]);
 }
 
-void loadParam_bwd(uint localGaussianIdx, uint paramID, uint localThreadIdx, float dOut) {
-    if (localThreadIdx >= TRAIN_WG_SIZE) return;
-    
-    reductionBuffer[localThreadIdx] = dOut;
-    GroupMemoryBarrierWithGroupSync();
-    
-    for (uint stride = TRAIN_WG_SIZE / 2; stride > 0; stride >>= 1) {
-        if (localThreadIdx < stride) {
-            reductionBuffer[localThreadIdx] += reductionBuffer[localThreadIdx + stride];
-        }
-        GroupMemoryBarrierWithGroupSync();
+// Each lane clears its gradient slots.
+void gsBatch_clearGradAccum(uint batchCount, uint lane)
+{
+    if (lane >= batchCount) return;
+    uint base = lane * PARAMS_PER_GAUSSIAN;
+    [unroll] for (uint p = 0; p < PARAMS_PER_GAUSSIAN; p++)
+        gsBatchGradAccum[base + p] = 0.0;
+}
+
+// Each lane reads its accumulated gradients for the respective gaussian and atomically
+// adds them into the global gradient buffer.
+void gsBatch_flushGradAccum(uint batchCount, uint lane)
+{
+    if (lane >= batchCount) return;
+    uint gid  = gsBatchGaussianIDs[lane];
+    uint base = lane * PARAMS_PER_GAUSSIAN;
+    [unroll] for (uint p = 0; p < PARAMS_PER_GAUSSIAN; p++)
+    {
+        float grad = gsBatchGradAccum[base + p];
+        if (grad != 0.0)
+            atomicAccumulate(gid * PARAMS_PER_GAUSSIAN + p, grad);
     }
-    
-    if (localThreadIdx == 0) {
-        // Map local index back to global Gaussian ID for gradient write
-        uint gid = gs_gaussianIDs[localGaussianIdx];
-        atomicAccumulate(gid * PARAMS_PER_GAUSSIAN + paramID, reductionBuffer[0]);
+}
+
+// Differentiable read from the batch forward cache.
+// Backward writes into the batch gradient accumulator, so no barrier needed.
+[BackwardDerivative(gsBatchParam_bwd)]
+float gsBatchParam_load(uint localIdx, uint paramID)
+{
+    // Reconstruct float from the typed batch arrays to keep autodiff happy - but I personally don't like dis
+    switch (paramID)
+    {
+        case PARAM_POS_X:   return gsBatchPos[localIdx].x;
+        case PARAM_POS_Y:   return gsBatchPos[localIdx].y;
+        case PARAM_POS_Z:   return gsBatchPos[localIdx].z;
+        case PARAM_SCALE_X: return gsBatchScale[localIdx].x;
+        case PARAM_SCALE_Y: return gsBatchScale[localIdx].y;
+        case PARAM_SCALE_Z: return gsBatchScale[localIdx].z;
+        case PARAM_QUAT_X:  return gsBatchQuat[localIdx].x;
+        case PARAM_QUAT_Y:  return gsBatchQuat[localIdx].y;
+        case PARAM_QUAT_Z:  return gsBatchQuat[localIdx].z;
+        case PARAM_QUAT_W:  return gsBatchQuat[localIdx].w;
+        default:            return gsBatchWeight[localIdx];
     }
+}
+
+void gsBatchParam_bwd(uint localIdx, uint paramID, float dOut)
+{
+    if (dOut == 0.0) return;
+    InterlockedAdd(gsBatchGradAccum[localIdx * PARAMS_PER_GAUSSIAN + paramID], dOut);
 }
 
 [Differentiable]
@@ -417,37 +468,36 @@ float gaussian_math(float3 p, float3 mu, float3x3 precision)
     return exp(-0.5 * mahalanobis2(d, precision));
 }
 
+// Density eval over one prefetched batch
+// batchCount is the number of valid Gaussians in the current batch.
 [Differentiable]
-float compute_density_tiled(no_diff uint3 tid, no_diff float3 worldPos) {
+float gsBatch_computeDensity(no_diff float3 worldPos, no_diff uint batchCount)
+{
     float density = 0.0;
-
-    uint localThreadIdx = GetLocalThreadIndex(tid);
-    uint count = gs_count;  // Already loaded into groupshared by train_main
-
-    [MaxIters(MAX_GAUSSIANS_PER_TILE)]
-    for(uint i = 0; i < count; ++i) {
-        // All reads now hit groupshared cache, not global memory
+    [MaxIters(GAUSS_BATCH)]
+    for (uint i = 0; i < batchCount; ++i)
+    {
         float3 g_pos = float3(
-            loadParam(i, PARAM_POS_X, localThreadIdx),
-            loadParam(i, PARAM_POS_Y, localThreadIdx),
-            loadParam(i, PARAM_POS_Z, localThreadIdx)
+            gsBatchParam_load(i, PARAM_POS_X),
+            gsBatchParam_load(i, PARAM_POS_Y),
+            gsBatchParam_load(i, PARAM_POS_Z)
         );
         float3 g_scale = float3(
-            loadParam(i, PARAM_SCALE_X, localThreadIdx),
-            loadParam(i, PARAM_SCALE_Y, localThreadIdx),
-            loadParam(i, PARAM_SCALE_Z, localThreadIdx)
+            gsBatchParam_load(i, PARAM_SCALE_X),
+            gsBatchParam_load(i, PARAM_SCALE_Y),
+            gsBatchParam_load(i, PARAM_SCALE_Z)
         );
         float4 g_quat = float4(
-            loadParam(i, PARAM_QUAT_X, localThreadIdx),
-            loadParam(i, PARAM_QUAT_Y, localThreadIdx),
-            loadParam(i, PARAM_QUAT_Z, localThreadIdx),
-            loadParam(i, PARAM_QUAT_W, localThreadIdx)
+            gsBatchParam_load(i, PARAM_QUAT_X),
+            gsBatchParam_load(i, PARAM_QUAT_Y),
+            gsBatchParam_load(i, PARAM_QUAT_Z),
+            gsBatchParam_load(i, PARAM_QUAT_W)
         );
-        float g_weight = loadParam(i, PARAM_WEIGHT, localThreadIdx);
+        float g_weight = gsBatchParam_load(i, PARAM_WEIGHT);
 
         float3 d = worldPos - g_pos;
         float maxScale = max(g_scale.x, max(g_scale.y, g_scale.z));
-        if (no_diff(dot(d,d) > (maxScale * 3.0) * (maxScale * 3.0))) continue;
+        if (dot(d, d) > (maxScale * 3.0) * (maxScale * 3.0)) continue;
 
         float3x3 precision = buildPrecisionMatrix(g_scale, g_quat);
         density += g_weight * gaussian_math(worldPos, g_pos, precision);
@@ -455,19 +505,12 @@ float compute_density_tiled(no_diff uint3 tid, no_diff float3 worldPos) {
     return density;
 }
 
+//! L2 loss
 [Differentiable]
-float compute_loss(
-    no_diff uint3 tid, 
-    no_diff float3 minW, 
-    no_diff float3 maxW, 
-    no_diff uint3 res
+float gsBatch_computeLoss(
+    float predicted,
+    no_diff float  target
 ) {
-    float3 uvw = (float3(tid) + 0.5) / float3(res);
-    float3 worldPos = minW + uvw * (maxW - minW);
-
-    float predicted = compute_density_tiled(tid, worldPos);
-    float target = no_diff ReferenceVol[tid];
-
     float diff = predicted - target;
     return diff * diff;
 }
@@ -475,39 +518,55 @@ float compute_loss(
 // TRAINING
 [shader("compute")]
 [numthreads(TRAIN_WG_X, TRAIN_WG_Y, TRAIN_WG_Z)]
-void train_main(uint3 tid : SV_DispatchThreadID) {
-    uint localThreadIdx = GetLocalThreadIndex(tid);
-
-    // ── Cooperative cache fill ───────────────────────────────────────────
-    // One workgroup = one tile, so we fill the cache once for all 256 threads
-
-    if (localThreadIdx == 0) {
-        uint tileIdx = GetTileIndex(tid);
-        gs_count = min(gTileCounts[tileIdx], MAX_GAUSSIANS_PER_TILE);
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    // Load Gaussian IDs cooperatively
+void train_main(uint3 tid : SV_DispatchThreadID)
+{
+    uint lane    = GetLocalThreadIndex(tid);
     uint tileIdx = GetTileIndex(tid);
-    for (uint i = localThreadIdx; i < gs_count; i += TRAIN_WG_SIZE) {
-        gs_gaussianIDs[i] = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + i];
+    uint totalCount = min(gTileCounts[tileIdx], MAX_GAUSSIANS_PER_TILE);
+
+    bool voxelActive = !any(tid >= volumeResolution);
+    float3 worldPos = float3(0.0);
+    float  target   = 0.0;
+    if (voxelActive)
+    {
+        float3 uvw = (float3(tid) + 0.5) / float3(volumeResolution);
+        worldPos = minWorld + uvw * (maxWorld - minWorld);
+        target   = ReferenceVol[tid];
     }
-    GroupMemoryBarrierWithGroupSync();
 
-    // Load all params cooperatively — each thread loads a few floats
-    uint totalFloats = gs_count * PARAMS_PER_GAUSSIAN;
-    for (uint i = localThreadIdx; i < totalFloats; i += TRAIN_WG_SIZE) {
-        uint localGaussianIdx = i / PARAMS_PER_GAUSSIAN;
-        uint paramID          = i % PARAMS_PER_GAUSSIAN;
-        uint gid              = gs_gaussianIDs[localGaussianIdx];
-        gs_params[i] = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + paramID]);
+    //! PASS 1: Forward to accum density on ENTIRE TILE (needed for training)
+    float totalDensity = 0.0;
+    for (uint batchStart = 0; batchStart < totalCount; batchStart += GAUSS_BATCH)
+    {
+        uint batchCount = min(GAUSS_BATCH, totalCount - batchStart);
+        gsBatch_prefetch(batchStart, tileIdx, batchCount, lane);
+        GroupMemoryBarrierWithGroupSync();
+
+        if (voxelActive)
+            totalDensity += gsBatch_computeDensity(worldPos, batchCount);
+
+        GroupMemoryBarrierWithGroupSync();
     }
-    GroupMemoryBarrierWithGroupSync();
-    // ── Cache is now warm, proceed with training ─────────────────────────
 
-    if (any(tid >= volumeResolution)) return;
+    var dpDensity = diffPair(totalDensity);
+    bwd_diff(gsBatch_computeLoss)(dpDensity, target, 1.0);
+    float dLoss_dPredicted = dpDensity.getDifferential();
 
-    bwd_diff(compute_loss)(tid, minWorld, maxWorld, volumeResolution, 1.0);
+    // PASS 2: Backward on batches to speed up training
+    for (uint batchStart = 0; batchStart < totalCount; batchStart += GAUSS_BATCH)
+    {
+        uint batchCount = min(GAUSS_BATCH, totalCount - batchStart);
+        gsBatch_prefetch(batchStart, tileIdx, batchCount, lane);
+        gsBatch_clearGradAccum(batchCount, lane);
+        GroupMemoryBarrierWithGroupSync();
+
+        if (voxelActive)
+            bwd_diff(gsBatch_computeDensity)(worldPos, batchCount, dLoss_dPredicted);
+
+        GroupMemoryBarrierWithGroupSync();
+        gsBatch_flushGradAccum(batchCount, lane);
+        GroupMemoryBarrierWithGroupSync();
+    }
 }
 
 // CLEAR GRADIENTS
@@ -519,7 +578,7 @@ void clear_gradients(uint3 tid : SV_DispatchThreadID) {
     }
 }
 
-// SGD OPTIMIZER (GENERIC)
+// SGD OPTIMIZER
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void optimizer_sgd(uint3 tid : SV_DispatchThreadID) {
