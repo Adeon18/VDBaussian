@@ -7,7 +7,7 @@ static const uint TRAIN_WG_Z = 4;
 static const uint TRAIN_WG_SIZE = TRAIN_WG_X * TRAIN_WG_Y * TRAIN_WG_Z;
 
 // DEFINITIONS
-static const uint MAX_GAUSSIANS_PER_TILE = 128;
+static const uint MAX_GAUSSIANS_PER_TILE = 256;
 
 // PARAMETER LAYOUT CONFIGURATION
 static const uint PARAM_POS_X  = 0;
@@ -639,11 +639,15 @@ void optimizer_adam(uint3 tid : SV_DispatchThreadID) {
         float g_t = gGradientsRaw[idx];
         float currentVal = asfloat(gGaussianParamsRaw[idx]);
         if (paramID >= PARAM_SCALE_X && paramID <= PARAM_SCALE_Z) {
-            float sx = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_X]);
-            float sy = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_Y]);
-            float sz = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_Z]);
+            float sx = clamp(asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_X]), 1e-4, 15.0);
+            float sy = clamp(asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_Y]), 1e-4, 15.0);
+            float sz = clamp(asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_Z]), 1e-4, 15.0);
             float volume = sx * sy * sz;
-            g_t += currentVal * volume * 0.00005;
+            float penalty_strength = 0.00005 * (1.0 + float(adamIteration) / 1000.0);
+            g_t += currentVal * volume * penalty_strength;
+            g_t = clamp(g_t, -0.5, 0.5);  
+        } else {
+            g_t = clamp(g_t, -100.0, 100.0);  
         }
         
         // Load previous moments

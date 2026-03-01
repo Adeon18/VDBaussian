@@ -28,10 +28,10 @@ PRINT_TILE_STATS = True  # Print tiling statistics
 PRINT_GRADIENT_STATS = True # Print gradient statistics
 
 VDB_FILE = "cloud_01_variant_0000.vdb" 
-VOL_SIZE = 128
+VOL_SIZE = 196
 SHADER_FILE = "shaders/hybrid.slang"
 TILE_SIZE = 4
-MAX_GAUSSIANS_PER_TILE = 128
+MAX_GAUSSIANS_PER_TILE = 256
 
 # Window Settings
 WINDOW_WIDTH = 1024
@@ -494,9 +494,10 @@ class CPUADCBackend(ADCBackend):
             jitter    = (np.random.rand(3).astype(np.float32) - 0.5) * voxel_size * 0.5
             world_pos = world_pos + jitter
 
-            sigma       = float(vol_extent.max() / X) * 1.5
+            voxel_size_world = vol_extent / np.array([X, Y, Z], dtype=np.float32)
+            sigma = float(voxel_size_world.mean() * config.clone_sigma_scale)
             local_ref   = float(ref[zs[i], ys[i], xs[i]])
-            init_weight = float(np.clip(local_ref * 0.5, 0.05, 0.3))
+            init_weight = float(np.clip(local_ref * 0.3, 0.05, 0.3))
 
             new_rows.append([
                 world_pos[0], world_pos[1], world_pos[2],
@@ -562,11 +563,8 @@ class ADCController:
         # Cached reference volume
         self._ref_cache = None
 
-    # ------------------------------------------------------------------
-    # PUBLIC API
-    # ------------------------------------------------------------------
-
     def tick(self, frame: int, is_training: bool):
+        self.config.clone_sigma_scale = self.app.train_config.sigma_scale
         if not is_training:
             return
         if self.config.mode == ADCMode.DISABLED:
@@ -1539,6 +1537,7 @@ class App:
         self.device.submit_command_buffer(cmd.finish())
 
         self.adc = ADCController(self, ADCConfig())
+        self.adc.train_config = self.train_config
 
     
     def apply_densification(self, new_params, surviving_indices=None):
@@ -1647,7 +1646,7 @@ class App:
                         print(f"[OK] Training Running. Refs: {total_refs}, "
                             f"GradMax: {grad_max:.6f}, "
                             f"ActiveWeightGrads: {nonzero}/{len(weight_grads)}")
-                    maxed_tiles = np.sum(tile_debug >= 128)
+                    maxed_tiles = np.sum(tile_debug >= MAX_GAUSSIANS_PER_TILE)
                     if maxed_tiles > 0:
                         print(f"[WARN] {maxed_tiles} tiles at MAX_GAUSSIANS_PER_TILE cap!")
                 
