@@ -154,9 +154,9 @@ static const ParamMetadata PARAM_META[PARAMS_PER_GAUSSIAN] = {
     { LR_GROUP_POSITION, -1e6, 1e6  },  // pos.x
     { LR_GROUP_POSITION, -1e6, 1e6  },  // pos.y
     { LR_GROUP_POSITION, -1e6, 1e6  },  // pos.z
-    { LR_GROUP_SCALE,    1e-4, 1e6  },  // scale.x (must stay positive)
-    { LR_GROUP_SCALE,    1e-4, 1e6  },  // scale.y
-    { LR_GROUP_SCALE,    1e-4, 1e6  },  // scale.z
+    { LR_GROUP_SCALE,    1e-4, 15.0  },  // scale.x (must stay positive)
+    { LR_GROUP_SCALE,    1e-4, 15.0  },  // scale.y
+    { LR_GROUP_SCALE,    1e-4, 15.0  },  // scale.z
     { LR_GROUP_ROTATION, -1.0, 1.0  },  // quat.x
     { LR_GROUP_ROTATION, -1.0, 1.0  },  // quat.y
     { LR_GROUP_ROTATION, -1.0, 1.0  },  // quat.z
@@ -643,8 +643,7 @@ void optimizer_adam(uint3 tid : SV_DispatchThreadID) {
             float sy = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_Y]);
             float sz = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_Z]);
             float volume = sx * sy * sz;
-            // Volume penalty: gradient grows with volume, not just individual scale
-            g_t += currentVal * volume * 0.0001;
+            g_t += currentVal * volume * 0.00005;
         }
         
         // Load previous moments

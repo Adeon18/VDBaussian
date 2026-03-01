@@ -94,8 +94,8 @@ float4 fragment_main(VertexOut pin) : SV_Target
     float  shadow_step_mult  = settings[19];
 
     // Background
-    float3 top = float3(0.5, 0.6, 0.7);
-    float3 bot = float3(0.5, 0.6, 0.8);
+    float3 top = float3(0.0, 0.0, 0.0);
+    float3 bot = float3(0.1, 0.1, 0.1);
     float3 bg = lerp(bot, top, pin.uv.y);
     float4 color = float4(0.0);
 

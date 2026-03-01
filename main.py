@@ -329,11 +329,6 @@ class ADCConfig:
         self.split_scale_thresh    = 0.04  # fraction of vol_extent
         self.split_grad_percentile = 85
 
-
-# ==========================================
-# BACKEND INTERFACE
-# ==========================================
-
 class ADCBackend:
     @property
     def runs_async(self) -> bool:
@@ -341,11 +336,6 @@ class ADCBackend:
 
     def run(self, params, grads, pred, ref, config, vol_min, vol_max, do_full) -> np.ndarray:
         raise NotImplementedError
-
-
-# ==========================================
-# CPU BACKEND
-# ==========================================
 
 class CPUADCBackend(ADCBackend):
     """
@@ -361,13 +351,13 @@ class CPUADCBackend(ADCBackend):
         if len(params) == 0:
             return params, grads, np.arange(0, dtype=np.int64)
 
-        weights    = params[:, 10]
-        max_scale  = np.max(params[:, 3:6], axis=1)
+        weights = params[:, 10]
+        max_scale = np.max(params[:, 3:6], axis=1)
         vol_extent = float(np.max(np.array(vol_max, dtype=np.float32)
                                 - np.array(vol_min, dtype=np.float32)))
 
         keep = (
-            (weights   > config.prune_weight_min) &
+            (weights > config.prune_weight_min) &
             (max_scale < vol_extent * config.prune_scale_max)
         )
 
@@ -376,14 +366,15 @@ class CPUADCBackend(ADCBackend):
             print(f"[ADC:CPU] Pruned {n_pruned} / {len(params)} Gaussians")
 
         surviving_indices = np.where(keep)[0]
-        result_params     = params[keep]
-        result_grads      = grads[keep]
+        result_params = params[keep]
+        result_grads = grads[keep]
 
+        # fallback
         if len(result_params) == 0:
             print("[ADC:CPU] Warning: pruning removed everything, keeping top-10 by weight")
-            top               = np.argsort(weights)[-10:]
-            result_params     = params[top]
-            result_grads      = grads[top]
+            top = np.argsort(weights)[-10:]
+            result_params = params[top]
+            result_grads = grads[top]
             surviving_indices = top
 
         return result_params, result_grads, surviving_indices
@@ -396,7 +387,6 @@ class CPUADCBackend(ADCBackend):
             params = self._clone(params, pred, ref, config, vol_min, vol_max)
         return params, surviving_indices
 
-    # ------------------------------------------------------------------
     def _split(self, params, grads, config, vol_min, vol_max):
         if len(params) == 0:
             return params
@@ -416,7 +406,7 @@ class CPUADCBackend(ADCBackend):
             return params
 
         grad_thresh = float(np.percentile(nonzero_pg, config.split_grad_percentile))
-        has_grad    = pos_grad > grad_thresh
+        has_grad = pos_grad > grad_thresh
         candidates  = np.where(is_large & has_grad & alive)[0]
 
         if len(candidates) == 0:
@@ -452,7 +442,6 @@ class CPUADCBackend(ADCBackend):
             return np.vstack([survivors, np.array(new_rows, dtype=np.float32)])
         return survivors
 
-    # ------------------------------------------------------------------
     def _clone(self, params, pred, ref, config, vol_min, vol_max):
         if len(params) >= config.max_gaussians:
             print(f"[ADC:CPU] At Gaussian cap ({config.max_gaussians}), skipping clone")
@@ -467,7 +456,7 @@ class CPUADCBackend(ADCBackend):
 
         if np.any(under_error > 0):
             # Only spawn into top 40% worst voxels
-            # As training matures, raise this to 60-70% to be more selective
+            # As training matures, raise this to 60-70% but I did not do that yet
             thresh = float(np.percentile(under_error[under_error > 0], 60))
             under_error[under_error < thresh] = 0.0
 
@@ -522,10 +511,6 @@ class CPUADCBackend(ADCBackend):
         return np.vstack([params, new_arr])
 
 
-# ==========================================
-# GPU BACKEND (stub)
-# ==========================================
-
 class GPUADCBackend(ADCBackend):
     """
     Future GPU-native ADC via Slang kernels.
@@ -544,19 +529,14 @@ class GPUADCBackend(ADCBackend):
     def run(self, params, grads, pred, ref, config, vol_min, vol_max, do_full):
         raise NotImplementedError("GPU ADC not yet implemented")
 
-
-# ==========================================
-# ADC CONTROLLER
-# ==========================================
-
 class ADCController:
     """
     Owns all ADC scheduling, threading, and UI.
 
     App calls:
-        controller.tick(frame, is_training)   — every frame, handles scheduling
-        controller.apply_pending()            — every frame, zero-cost if nothing ready
-        controller.draw_ui()                  — self-contained imgui panel
+        controller.tick(frame, is_training): every frame, handles scheduling
+        controller.apply_pending(): every frame, zero-cost if nothing ready
+        controller.draw_ui(): self-contained imgui panel
     """
 
     def __init__(self, app_ref, config: ADCConfig):
@@ -579,7 +559,7 @@ class ADCController:
         self.last_adc_frame         = 0
         self.last_adc_type          = "none"
 
-        # Cached reference volume — never changes after load
+        # Cached reference volume
         self._ref_cache = None
 
     # ------------------------------------------------------------------
@@ -587,7 +567,6 @@ class ADCController:
     # ------------------------------------------------------------------
 
     def tick(self, frame: int, is_training: bool):
-        """Call every frame from App.run()."""
         if not is_training:
             return
         if self.config.mode == ADCMode.DISABLED:
@@ -595,8 +574,24 @@ class ADCController:
         if frame < self.config.start_frame:
             return
 
-        do_full    = (frame % self.config.full_adc_every   == 0)
-        prune_only = (frame % self.config.prune_only_every == 0)
+        # Update threshold BEFORE triggering so worker uses correct value
+        n = self.app.renderer.gaussian_count
+        if n < 10000:
+            self.config.prune_weight_min = 0.005
+        elif n < 12000:
+            self.config.prune_weight_min = 0.008
+        elif n < 15000:
+            self.config.prune_weight_min = 0.010
+        else:
+            self.config.prune_weight_min = 0.012
+
+        frames_since_full = frame % self.config.full_adc_every
+        do_full           = frames_since_full == 0
+        halfway           = self.config.full_adc_every // 2
+        prune_window_open = frames_since_full >= halfway
+        prune_only        = (prune_window_open and
+                            frames_since_full % self.config.prune_only_every == 0 and
+                            not do_full)
 
         if do_full:
             self._trigger(do_full=True)
@@ -605,7 +600,6 @@ class ADCController:
 
     def apply_pending(self):
         """
-        Call every frame from App.run() — before render.
         Zero cost when nothing is ready.
         """
         if self.config.mode == ADCMode.DISABLED:
@@ -622,10 +616,6 @@ class ADCController:
         self.gaussian_count_history.append(len(params))
         if len(self.gaussian_count_history) > 200:
             self.gaussian_count_history.pop(0)
-
-    # ------------------------------------------------------------------
-    # INTERNAL SCHEDULING
-    # ------------------------------------------------------------------
 
     def _trigger(self, do_full: bool):
         backend = self._backends.get(self.config.mode)
@@ -648,7 +638,7 @@ class ADCController:
 
         params_snap, grads_snap, pred_snap, ref_snap = snapshots
 
-        self._running      = True
+        self._running = True
         self.last_adc_type = "Full" if do_full else "Prune-only"
 
         self._thread = threading.Thread(
@@ -726,10 +716,6 @@ class ADCController:
         finally:
             self._running = False
 
-    # ------------------------------------------------------------------
-    # UI
-    # ------------------------------------------------------------------
-
     def draw_ui(self):
         """
         Self-contained imgui panel.
@@ -742,7 +728,7 @@ class ADCController:
             imgui.end()
             return
 
-        # ---- Mode selector ----
+        # Mode selector
         modes = ["Disabled", "CPU (Async)", "GPU (Stub)"]
         changed, self.config.mode = imgui.combo("Backend", self.config.mode, modes)
         if self.config.mode == ADCMode.GPU:
@@ -751,7 +737,7 @@ class ADCController:
 
         imgui.separator()
 
-        # ---- Status ----
+        # Status
         if self._running:
             imgui.text_colored(imgui.ImVec4(1, 1, 0, 1),
                                f"Running: {self.last_adc_type}...")
@@ -780,7 +766,7 @@ class ADCController:
 
         imgui.separator()
 
-        # ---- Scheduling ----
+        # Scheduling
         imgui.text("Scheduling")
         _, self.config.start_frame = imgui.slider_int(
             "Start Frame", self.config.start_frame, 0, 2000)
@@ -796,7 +782,7 @@ class ADCController:
 
         imgui.separator()
 
-        # ---- Prune ----
+        # Prune
         imgui.text("Pruning")
         _, self.config.prune_weight_min = imgui.slider_float(
             "Min Weight Threshold", self.config.prune_weight_min,
@@ -812,7 +798,7 @@ class ADCController:
 
         imgui.separator()
 
-        # ---- Split ----
+        # Split
         imgui.text("Split")
         _, self.config.n_split = imgui.slider_int(
             "Split Count", self.config.n_split, 0, 200)
@@ -834,7 +820,7 @@ class ADCController:
 
         imgui.separator()
 
-        # ---- Clone ----
+        # Clone
         imgui.text("Clone / Spawn")
         _, self.config.n_clone = imgui.slider_int(
             "Clone Count", self.config.n_clone, 0, 500)
@@ -851,7 +837,7 @@ class ADCController:
 
         imgui.separator()
 
-        # ---- Manual triggers ----
+        # Manual triggers
         disabled = self._running or self.config.mode == ADCMode.DISABLED
         if disabled:
             imgui.begin_disabled()
@@ -960,7 +946,7 @@ class Renderer:
         # Debug
         self.debug_tex = device.create_texture(
             type=spy.TextureType.texture_3d,
-            format=spy.Format.rgba32_float,
+            format=spy.Format.rgba8_unorm,
             width=VOL_SIZE, height=VOL_SIZE, depth=VOL_SIZE,
             usage=spy.TextureUsage.unordered_access | spy.TextureUsage.shader_resource,
             label="DebugVolume"
@@ -974,7 +960,7 @@ class Renderer:
         self.debug_pipeline = device.create_render_pipeline(
             program=prog_debug,
             input_layout=device.create_input_layout(input_elements=[], vertex_streams=[]),
-            targets=[{"format": spy.Format.rgba32_float}]
+            targets=[{"format": spy.Format.rgba8_unorm}]
         )
 
         self.gradient_health = {
@@ -1556,47 +1542,60 @@ class App:
 
     
     def apply_densification(self, new_params, surviving_indices=None):
-        # surviving_indices: which rows of the OLD buffer survived pruning
-        # passed back from _adc_worker alongside new_params
-        
+        new_params = np.ascontiguousarray(new_params, dtype=np.float32)
+        if new_params.ndim == 2:
+            new_params = new_params.reshape(-1, PARAMS_PER_GAUSSIAN)
+        flat_params = new_params.flatten()
+
+        if len(new_params) == 0:
+            print("[ADC] Warning: 0 Gaussians, skipping apply")
+            return
+
         saved_iteration = self.renderer.adam_iteration
-        
+
         if surviving_indices is not None:
-            # Read old momentum buffers before init_training zeros them
-            old_m1 = (self.renderer.adam_first_moment
-                    .to_numpy().view(np.float32)
-                    .reshape(-1, PARAMS_PER_GAUSSIAN).copy())
-            old_m2 = (self.renderer.adam_second_moment
-                    .to_numpy().view(np.float32)
-                    .reshape(-1, PARAMS_PER_GAUSSIAN).copy())
-        
-        # Rebuild buffer
+            try:
+                old_m1 = (self.renderer.adam_first_moment
+                        .to_numpy().view(np.float32)
+                        .reshape(-1, PARAMS_PER_GAUSSIAN).copy())
+                old_m2 = (self.renderer.adam_second_moment
+                        .to_numpy().view(np.float32)
+                        .reshape(-1, PARAMS_PER_GAUSSIAN).copy())
+            except Exception as e:
+                print(f"[ADC] Could not read momentum buffers: {e}")
+                old_m1 = old_m2 = None
+        else:
+            old_m1 = old_m2 = None
+
+        self.gaussians                = new_params
         self.renderer.gaussian_count  = len(new_params)
         self.renderer.gaussian_buffer = self.device.create_buffer(
             element_count=len(new_params),
             struct_size=PARAMS_PER_GAUSSIAN * 4,
             usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
             memory_type=spy.MemoryType.device_local,
-            data=new_params
+            data=flat_params
         )
-        self.renderer.init_training()   # zeros all momentum
-        self.renderer.adam_iteration = saved_iteration
-        
-        if surviving_indices is not None:
-            n_new    = len(new_params)
-            n_survive = len(surviving_indices)
-            
-            # Reconstruct momentum: survivors keep theirs, new Gaussians stay zero
-            new_m1 = np.zeros((n_new, PARAMS_PER_GAUSSIAN), dtype=np.float32)
-            new_m2 = np.zeros((n_new, PARAMS_PER_GAUSSIAN), dtype=np.float32)
-            new_m1[:n_survive] = old_m1[surviving_indices]
-            new_m2[:n_survive] = old_m2[surviving_indices]
-            
-            # Upload preserved momentum
-            self.renderer.adam_first_moment.copy_from_numpy(
-                new_m1.flatten())
-            self.renderer.adam_second_moment.copy_from_numpy(
-                new_m2.flatten())
+        self.renderer.init_training()
+        self.renderer.adam_iteration = saved_iteration  # restore — Regenerate button overrides this to 1
+
+        if surviving_indices is not None and old_m1 is not None:
+            try:
+                n_new  = len(new_params)
+                new_m1 = np.zeros((n_new, PARAMS_PER_GAUSSIAN), dtype=np.float32)
+                new_m2 = np.zeros((n_new, PARAMS_PER_GAUSSIAN), dtype=np.float32)
+                valid  = surviving_indices[surviving_indices < len(old_m1)]
+                new_m1[:len(valid)] = old_m1[valid]
+                new_m2[:len(valid)] = old_m2[valid]
+                self.renderer.adam_first_moment.copy_from_numpy(new_m1.flatten())
+                self.renderer.adam_second_moment.copy_from_numpy(new_m2.flatten())
+                print(f"[ADC] Momentum restored for {len(valid)} survivors")
+            except Exception as e:
+                print(f"[ADC] Momentum restore failed (non-fatal): {e}")
+
+        self.renderer._needs_rebinning     = True
+        self.renderer._needs_rasterization = True
+        print(f"[ADC] Buffer rebuilt: {len(new_params):,} Gaussians (Adam iter {saved_iteration})")
 
 
     def run(self):
@@ -1648,9 +1647,12 @@ class App:
                         print(f"[OK] Training Running. Refs: {total_refs}, "
                             f"GradMax: {grad_max:.6f}, "
                             f"ActiveWeightGrads: {nonzero}/{len(weight_grads)}")
+                    maxed_tiles = np.sum(tile_debug >= 128)
+                    if maxed_tiles > 0:
+                        print(f"[WARN] {maxed_tiles} tiles at MAX_GAUSSIANS_PER_TILE cap!")
                 
                                 
-                # Track loss every 10 frames
+                # Track loss every 50 frames
                 if frame_count % 50 == 0:
                     self.renderer.analyze_gradients()
                     loss = self.compute_current_loss()
@@ -1775,13 +1777,13 @@ class App:
             imgui.text("Learning Rates")
             imgui.separator()
             _, self.train_config.learning_rate_pos = imgui.slider_float(
-                "Position", self.train_config.learning_rate_pos, 0.0001, 0.1, format="%.4f")
+                "Position", self.train_config.learning_rate_pos, 0.0001, 0.5, format="%.4f")
             _, self.train_config.learning_rate_scale = imgui.slider_float(
-                "Scale", self.train_config.learning_rate_scale, 0.00001, 0.01, format="%.5f")
+                "Scale", self.train_config.learning_rate_scale, 0.00001, 0.1, format="%.5f")
             _, self.train_config.learning_rate_rotation = imgui.slider_float(
-                "Rotation", self.train_config.learning_rate_rotation, 0.00001, 0.005, format="%.5f")
+                "Rotation", self.train_config.learning_rate_rotation, 0.00001, 0.1, format="%.5f")
             _, self.train_config.learning_rate_weight = imgui.slider_float(
-                "Weight", self.train_config.learning_rate_weight, 0.001, 0.1, format="%.4f")
+                "Weight", self.train_config.learning_rate_weight, 0.001, 0.5, format="%.4f")
             
             if self.train_config.use_adam:
                 imgui.dummy((0, 10))
@@ -1809,21 +1811,12 @@ class App:
             imgui.separator()
             if imgui.button("Regenerate Gaussians"):
                 self.gaussians = convert_grid_to_gaussians(self.grid, self.train_config)
-                self.renderer.gaussian_count = len(self.gaussians)
                 self.apply_densification(self.gaussians)
-                self.renderer.gaussian_buffer = self.device.create_buffer(
-                        element_count=self.renderer.gaussian_count,
-                        struct_size=PARAMS_PER_GAUSSIAN * 4,
-                        usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
-                        memory_type=spy.MemoryType.device_local,
-                        data=self.gaussians 
-                    )
-                self.renderer.init_training()
-                self.renderer._needs_rebinning = True
+                self.renderer.adam_iteration = 1
+                self.adc._ref_cache = None
                 cmd = self.device.create_command_encoder()
                 self.renderer.rasterize_gaussians(cmd, self.vol_min_world, self.vol_max_world)
                 self.device.submit_command_buffer(cmd.finish())
-                self.adam_iteration = 1
                 print("Gaussians regenerated!")
 
             imgui.dummy((0, 10))
@@ -2045,7 +2038,7 @@ class App:
                 )
                 
                 current_loss = self.renderer.loss_history[-1]
-                imgui.text(f"Current: {current_loss:.6f}")
+                imgui.text(f"Current: {current_loss:.10f}")
                 
                 # Loss trend analysis
                 if len(loss_array) > 10:
