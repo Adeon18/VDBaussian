@@ -263,19 +263,22 @@ float3 divergingColor(float t) {
     }
 }
 
-// Non-tiled density for debug passes, reads directly from global params,
-// no groupshared cache required - JUST FOR DEBUG
-float gsDebug_computeDensityDirect(float3 worldPos)
+// Tile-accelerated density evaluation for debug passes.
+// Uses the same tile structure as training — O(tile_gaussians) not O(all_gaussians).
+float gsDebug_computeDensityTiled(float3 worldPos, uint3 tid)
 {
+    uint tileIdx = GetTileIndex(tid);
+    uint count   = min(gTileCounts[tileIdx], MAX_GAUSSIANS_PER_TILE);
     float density = 0.0;
-    for (uint gid = 0; gid < gaussianCount; ++gid)
+    for (uint i = 0; i < count; ++i)
     {
+        uint gid = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + i];
         Gaussian g = Gaussian::load(gid);
         float3 d = worldPos - g.pos;
         float maxScale = max(g.scale.x, max(g.scale.y, g.scale.z));
         if (dot(d, d) > (maxScale * 3.0) * (maxScale * 3.0)) continue;
         float3x3 precision = buildPrecisionMatrix(g.scale, g.quat);
-        density += g.weight * gaussian_math(worldPos, g.pos, precision);
+        density += g.weight * exp(-0.5 * mahalanobis2(d, precision));
     }
     return density;
 }
@@ -287,7 +290,7 @@ void compute_debug(uint3 tid : SV_DispatchThreadID)
     if (any(tid >= volumeResolution)) return;
     if (debugMode == DEBUG_NONE) return;
 
-    float3 uvw = (float3(tid) + 0.5) / float3(volumeResolution);
+    float3 uvw     = (float3(tid) + 0.5) / float3(volumeResolution);
     float3 worldPos = minWorld + uvw * (maxWorld - minWorld);
 
     float3 debugColor = float3(0.0);
@@ -295,15 +298,18 @@ void compute_debug(uint3 tid : SV_DispatchThreadID)
 
     if (debugMode == DEBUG_LOSS)
     {
-        float predicted = gsDebug_computeDensityDirect(worldPos);
-        float loss = (predicted - ReferenceVol[tid]) * (predicted - ReferenceVol[tid]);
+        // Tile-accelerated: only gaussians in this voxel's tile
+        float predicted = gsDebug_computeDensityTiled(worldPos, tid);
+        float diff = predicted - ReferenceVol[tid];
+        float loss = diff * diff;
         debugColor = heatmapColor(loss * DEBUG_LOSS_SCALE * debugScale);
         debugAlpha = min(loss * DEBUG_ALPHA_MULT_LOSS * debugScale, 1.0);
     }
     else if (debugMode == DEBUG_GRADIENT_MAG)
     {
+        // Already tile-based — unchanged
         uint tileIdx = GetTileIndex(tid);
-        uint count = min(gTileCounts[tileIdx], MAX_GAUSSIANS_PER_TILE);
+        uint count   = min(gTileCounts[tileIdx], MAX_GAUSSIANS_PER_TILE);
         float totalGradMag = 0.0;
         for (uint i = 0; i < count; ++i)
         {
@@ -320,6 +326,7 @@ void compute_debug(uint3 tid : SV_DispatchThreadID)
     }
     else if (debugMode == DEBUG_TILE_DENSITY)
     {
+        // Already tile-based — unchanged
         uint count = gTileCounts[GetTileIndex(tid)];
         float norm = float(count) * DEBUG_TILE_SCALE * debugScale;
         debugColor = heatmapColor(norm);
@@ -327,16 +334,19 @@ void compute_debug(uint3 tid : SV_DispatchThreadID)
     }
     else if (debugMode == DEBUG_OVERLAP)
     {
-        float density = gsDebug_computeDensityDirect(worldPos);
-        float norm = density * DEBUG_OVERLAP_SCALE * debugScale;
-        debugColor = heatmapColor(norm);
-        debugAlpha = min(density * DEBUG_ALPHA_MULT_OVERLAP * debugScale, 1.0);
+        // Tile-accelerated: replaces gsDebug_computeDensityDirect
+        float density = gsDebug_computeDensityTiled(worldPos, tid);
+        float norm    = density * DEBUG_OVERLAP_SCALE * debugScale;
+        debugColor    = heatmapColor(norm);
+        debugAlpha    = min(density * DEBUG_ALPHA_MULT_OVERLAP * debugScale, 1.0);
     }
     else if (debugMode == DEBUG_PRED_VS_TARGET)
     {
-        float error = gsDebug_computeDensityDirect(worldPos) - ReferenceVol[tid];
-        debugColor = divergingColor(error * DEBUG_ERROR_SCALE * debugScale);
-        debugAlpha = min(abs(error) * DEBUG_ALPHA_MULT_ERROR * debugScale, 1.0);
+        // Tile-accelerated: replaces gsDebug_computeDensityDirect
+        float predicted = gsDebug_computeDensityTiled(worldPos, tid);
+        float error     = predicted - ReferenceVol[tid];
+        debugColor      = divergingColor(error * DEBUG_ERROR_SCALE * debugScale);
+        debugAlpha      = min(abs(error) * DEBUG_ALPHA_MULT_ERROR * debugScale, 1.0);
     }
 
     gDebugVolume[tid] = float4(debugColor, debugAlpha);

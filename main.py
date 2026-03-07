@@ -14,6 +14,8 @@ import time
 import threading
 import traceback
 
+from save_ply import save_gaussians_dialog, CloudLightingConfig
+
 
 # ==========================================
 # CONFIGURATION
@@ -27,7 +29,7 @@ PROFILE_WAIT_FOR_GPU = False
 PRINT_TILE_STATS = True  # Print tiling statistics
 PRINT_GRADIENT_STATS = True # Print gradient statistics
 
-VDB_FILE = "cloud_01_variant_0000.vdb" 
+VDB_FILE = "cloud_04_variant_0000.vdb" 
 VOL_SIZE = 196
 SHADER_FILE = "shaders/hybrid.slang"
 TILE_SIZE = 4
@@ -1539,6 +1541,8 @@ class App:
         self.adc = ADCController(self, ADCConfig())
         self.adc.train_config = self.train_config
 
+        self.ply_lighting = CloudLightingConfig()
+
     
     def apply_densification(self, new_params, surviving_indices=None):
         new_params = np.ascontiguousarray(new_params, dtype=np.float32)
@@ -1825,6 +1829,51 @@ class App:
             if self.is_training:
                 optimizer_name = "ADAM" if self.train_config.use_adam else "SGD"
                 imgui.text_colored((0, 1, 0, 1), f"TRAINING ACTIVE ({optimizer_name})")
+            
+            imgui.dummy((0, 5))
+            imgui.separator()
+            imgui.text("Export to SuperSplat")
+
+            # The ONLY knob you should normally need
+            _, self.ply_lighting.density_scale = imgui.slider_float(
+                "Density Scale##ply", self.ply_lighting.density_scale, 1.0, 200.0)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Match this to your Rendering > Density slider.\n"
+                    "Opacity is computed physically: alpha = 1 - exp(-w * sigma * sqrt(2pi) * density_scale)\n"
+                    "Too transparent? Raise it. Too solid? Lower it.")
+
+            imgui.text_colored(imgui.ImVec4(0.6,0.6,0.6,1), "Shading")
+            _, self.ply_lighting.bright_luminance = imgui.slider_float(
+                "Bright##ply", self.ply_lighting.bright_luminance, 0.7, 1.0, "%.2f")
+            _, self.ply_lighting.dark_luminance = imgui.slider_float(
+                "Dark##ply", self.ply_lighting.dark_luminance, 0.05, 0.6, "%.2f")
+            _, self.ply_lighting.depth_gamma = imgui.slider_float(
+                "Depth Gamma##ply", self.ply_lighting.depth_gamma, 0.5, 4.0, "%.1f")
+            _, self.ply_lighting.shadow_warmth = imgui.slider_float(
+                "Shadow Warmth##ply", self.ply_lighting.shadow_warmth, 0.0, 0.4, "%.2f")
+
+            imgui.dummy((0, 3))
+            if imgui.button("Sync Density from Renderer"):
+                self.ply_lighting.density_scale = self.settings.density_scale
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Copy density_scale from your Rendering panel")
+
+            imgui.dummy((0, 3))
+            if imgui.button("Save to PLY (SuperSplat)"):
+                gpu_params = (
+                    self.renderer.gaussian_buffer
+                    .to_numpy()
+                    .view(np.float32)
+                    .reshape(-1, PARAMS_PER_GAUSSIAN)
+                    .copy()
+                )
+                save_gaussians_dialog(gpu_params, self.ply_lighting)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Opacity is physically derived from weight * sigma * density_scale.\n"
+                    "This matches what your volumetric renderer shows.\n"
+                    "Check console for opacity stats after saving.")
             
 
             # Debug

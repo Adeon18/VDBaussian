@@ -1,3 +1,5 @@
+// 3drasterizer.slang
+
 struct Gaussian
 {
     float3 pos;
