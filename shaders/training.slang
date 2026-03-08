@@ -90,6 +90,10 @@ groupshared uint   gsBatchGaussianIDs[GAUSS_BATCH];
 // Native float atomic needed here
 groupshared float  gsBatchGradAccum[GAUSS_BATCH * PARAMS_PER_GAUSSIAN];
 
+// Loss mode constants
+static const uint LOSS_L2    = 0;
+static const uint LOSS_L1    = 1;
+static const uint LOSS_HUBER = 2;
 
 cbuffer TrainParams {
     uint3 volumeResolution;
@@ -108,6 +112,10 @@ cbuffer TrainParams {
     float adamBeta2;
     float adamEpsilon;
     uint adamIteration;
+
+    //! Loss modes
+    uint lossMode;
+    float huberDelta;
 
     // Debug
     uint debugMode;
@@ -515,14 +523,31 @@ float gsBatch_computeDensity(no_diff float3 worldPos, no_diff uint batchCount)
     return density;
 }
 
-//! L2 loss
 [Differentiable]
 float gsBatch_computeLoss(
     float predicted,
-    no_diff float  target
+    no_diff float target,
+    no_diff uint mode,
+    no_diff float huberDelta
 ) {
     float diff = predicted - target;
-    return diff * diff;
+    
+    if (mode == LOSS_L1) {
+        // Pseudo-Huber approximation of L1 (smooth, differentiable everywhere)
+        // Behaves like |diff| but with smooth zero crossing
+        return sqrt(diff * diff + 1e-8);
+    }
+    else if (mode == LOSS_HUBER) {
+        float absDiff = abs(diff);
+        if (absDiff <= huberDelta)
+            return 0.5 * diff * diff;
+        else
+            return huberDelta * (absDiff - 0.5 * huberDelta);
+    }
+    else {
+        // L2 (default)
+        return diff * diff;
+    }
 }
 
 // TRAINING
@@ -559,7 +584,7 @@ void train_main(uint3 tid : SV_DispatchThreadID)
     }
 
     var dpDensity = diffPair(totalDensity);
-    bwd_diff(gsBatch_computeLoss)(dpDensity, target, 1.0);
+    bwd_diff(gsBatch_computeLoss)(dpDensity, target, lossMode, huberDelta, 1.0);
     float dLoss_dPredicted = dpDensity.getDifferential();
 
     // PASS 2: Backward on batches to speed up training

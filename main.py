@@ -874,6 +874,9 @@ class TrainingConfig:
         self.sigma_scale = 2.0
         self.jitter_scale = 5.0
 
+        self.loss_mode = 0       # 0=L2, 1=L1(pseudo), 2=Huber
+        self.huber_delta = 0.1
+
 # ==========================================
 # RENDERER SYSTEM
 # ==========================================
@@ -1252,6 +1255,9 @@ class Renderer:
             cursor["TrainParams"]["minWorld"] = tuple(vol_min)
             cursor["TrainParams"]["maxWorld"] = tuple(vol_max)
             cursor["TrainParams"]["tileSize"] = TILE_SIZE
+
+            cursor["TrainParams"]["lossMode"] = train_config.loss_mode
+            cursor["TrainParams"]["huberDelta"] = train_config.huber_delta
 
             cp.dispatch(thread_count=(VOL_SIZE, VOL_SIZE, VOL_SIZE))
 
@@ -1817,6 +1823,26 @@ class App:
                 "Initial Sigma Scale", self.train_config.sigma_scale, 1.0, 20.0)
             _, self.train_config.jitter_scale = imgui.slider_float(
                 "Position Jitter", self.train_config.jitter_scale, 0.0, 200.0)
+            
+            imgui.dummy((0, 10))
+            imgui.text("Loss Function")
+            imgui.separator()
+            loss_modes = ["L2 (MSE)", "L1 (Pseudo-Huber smooth)", "Huber"]
+            _, self.train_config.loss_mode = imgui.combo(
+                "Loss Mode", self.train_config.loss_mode, loss_modes)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "L2: Standard MSE. Fast convergence but ignores sparse regions.\n"
+                    "L1: Constant gradient everywhere. Helps fill low-density voids.\n"
+                    "Huber: L2 for small errors, L1 for large. Best of both worlds.")
+
+            if self.train_config.loss_mode == 2:  # Huber only
+                _, self.train_config.huber_delta = imgui.slider_float(
+                    "Huber Delta", self.train_config.huber_delta, 0.01, 1.0, format="%.3f")
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip(
+                        "Errors below delta use L2, above use L1.\n"
+                        "Set near your typical per-voxel error magnitude.")
 
             imgui.separator()
             if imgui.button("Regenerate Gaussians"):
