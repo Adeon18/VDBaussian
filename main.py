@@ -15,6 +15,7 @@ import threading
 import traceback
 
 from save_ply import save_gaussians_dialog, CloudLightingConfig
+from metrics import MetricsCollector
 
 
 # ==========================================
@@ -883,6 +884,7 @@ class Renderer:
         self.pipeline = None
         self.last_mod_time = 0
         self.error_msg = ""
+        self.tile_size = TILE_SIZE
         
         self.linear_sampler = device.create_sampler(
             min_filter=spy.TextureFilteringMode.linear,
@@ -1543,6 +1545,8 @@ class App:
 
         self.ply_lighting = CloudLightingConfig()
 
+        self.metrics = MetricsCollector(self.device, self.renderer, (VOL_SIZE, VOL_SIZE, VOL_SIZE))
+
     
     def apply_densification(self, new_params, surviving_indices=None):
         new_params = np.ascontiguousarray(new_params, dtype=np.float32)
@@ -1665,6 +1669,9 @@ class App:
             
             self.adc.tick(frame_count, self.is_training)
             self.adc.apply_pending()
+
+            self.metrics.tick(frame_count, self.vol_min_world, self.vol_max_world, self.is_training)
+            
                 
             
             if not self.is_training:
@@ -2115,6 +2122,7 @@ class App:
                     scale_max=np.max(grad_array) * 1.1 if len(grad_array) > 0 else 1.0,
                     graph_size=(300, 80)
                 )
+            self.metrics.draw_ui_inline()
         
         imgui.end()
 
