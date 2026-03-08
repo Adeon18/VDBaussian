@@ -674,15 +674,13 @@ void optimizer_adam(uint3 tid : SV_DispatchThreadID) {
         float g_t = gGradientsRaw[idx];
         float currentVal = asfloat(gGaussianParamsRaw[idx]);
         if (paramID >= PARAM_SCALE_X && paramID <= PARAM_SCALE_Z) {
-            float sx = clamp(asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_X]), 1e-4, 15.0);
-            float sy = clamp(asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_Y]), 1e-4, 15.0);
-            float sz = clamp(asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_SCALE_Z]), 1e-4, 15.0);
-            float volume = sx * sy * sz;
-            float penalty_strength = 0.00005 * (1.0 + float(adamIteration) / 1000.0);
-            g_t += currentVal * volume * penalty_strength;
-            g_t = clamp(g_t, -0.5, 0.5);  
+            g_t = clamp(g_t, -2.0, 0.3); 
         } else {
             g_t = clamp(g_t, -100.0, 100.0);  
+        }
+
+        if (paramID == PARAM_WEIGHT) {
+            g_t += currentVal * 0.0005;
         }
         
         // Load previous moments
@@ -711,6 +709,13 @@ void optimizer_adam(uint3 tid : SV_DispatchThreadID) {
         
         // Clamp
         newVal = clamp(newVal, meta.minVal, meta.maxVal);
+        if (paramID >= PARAM_SCALE_X && paramID <= PARAM_SCALE_Z) {
+            // Completely invisible when scale is healthy (>0.01)
+            float scale_floor = 1e-4;
+            if (newVal < scale_floor * 10.0) {
+                newVal = max(newVal, scale_floor);
+            }
+        }   
         
         gGaussianParamsRaw[idx] = asuint(newVal);
     }

@@ -14,7 +14,6 @@ from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
 
-
 SH_C0 = 0.28209479177387814
 SH_C1 = 0.4886025119029199
 
@@ -25,24 +24,24 @@ class CloudLightingConfig:
     density_scale: float = 40.0
 
     # Clamp computed alpha to this range so nothing is invisible or fully solid
-    opacity_floor:  float = 0.02
-    opacity_ceil:   float = 0.98
+    opacity_floor: float = 0.02
+    opacity_ceil: float = 0.98
 
     # Color: depth-based self-shadowing
-    bright_luminance:     float = 0.95
-    dark_luminance:       float = 0.28
-    depth_gamma:          float = 2.0
-    top_light_strength:   float = 0.05
-    shadow_warmth:        float = 0.10
-    weight_influence:     float = 0.20
+    bright_luminance: float = 0.95
+    dark_luminance: float = 0.28
+    depth_gamma: float = 2.0
+    top_light_strength: float = 0.05
+    shadow_warmth: float = 0.10
+    weight_influence: float = 0.20
 
 
 def compute_physical_opacity(
     weight: np.ndarray,
-    scale:  np.ndarray,
+    scale: np.ndarray,
     density_scale: float,
     floor: float,
-    ceil:  float,
+    ceil: float,
 ) -> np.ndarray:
     """
     alpha_i = 1 - exp(-weight_i * sigma_mean_i * sqrt(2*pi) * density_scale)
@@ -52,29 +51,27 @@ def compute_physical_opacity(
     step by step. Exporting this as 3DGS opacity makes SuperSplat match your
     renderer without any fudge factors.
     """
-    sigma_mean = np.mean(scale, axis=1)                          # isotropic approx
-    line_integral = sigma_mean * np.sqrt(2.0 * np.pi)           # ∫ gaussian dx
+    sigma_mean = np.mean(scale, axis=1)  # isotropic approx
+    line_integral = sigma_mean * np.sqrt(2.0 * np.pi)  # ∫ gaussian dx
     alpha = 1.0 - np.exp(-weight * line_integral * density_scale)
     return np.clip(alpha, floor, ceil)
 
 
 def bake_cloud_colors(params: np.ndarray, cfg: CloudLightingConfig):
-    N   = len(params)
+    N = len(params)
     pos = params[:, 0:3].astype(np.float64)
-    w   = params[:, 10].astype(np.float64)
+    w = params[:, 10].astype(np.float64)
 
-    w_norm   = w / (w.sum() + 1e-12)
+    w_norm = w / (w.sum() + 1e-12)
     centroid = (pos * w_norm[:, None]).sum(axis=0)
-    diff     = pos - centroid
-    var      = (w_norm[:, None] * diff ** 2).sum(axis=0)
-    sigma    = np.sqrt(var) + 1e-8
-    maha     = np.sqrt(np.sum((diff / sigma) ** 2, axis=1))
+    diff = pos - centroid
+    var = (w_norm[:, None] * diff**2).sum(axis=0)
+    sigma = np.sqrt(var) + 1e-8
+    maha = np.sqrt(np.sum((diff / sigma) ** 2, axis=1))
 
     p_inner = np.percentile(maha, 5)
     p_outer = np.percentile(maha, 95)
-    depth_geo = 1.0 - np.clip(
-        (maha - p_inner) / (p_outer - p_inner + 1e-8), 0.0, 1.0
-    )
+    depth_geo = 1.0 - np.clip((maha - p_inner) / (p_outer - p_inner + 1e-8), 0.0, 1.0)
 
     p_w_lo = np.percentile(w, 10)
     p_w_hi = np.percentile(w, 90)
@@ -83,23 +80,24 @@ def bake_cloud_colors(params: np.ndarray, cfg: CloudLightingConfig):
     depth = np.clip(
         (1.0 - cfg.weight_influence) * depth_geo
         + cfg.weight_influence * (depth_geo * 0.5 + depth_w * 0.5),
-        0.0, 1.0,
+        0.0,
+        1.0,
     )
 
-    lum = cfg.bright_luminance - (depth ** cfg.depth_gamma) * (
+    lum = cfg.bright_luminance - (depth**cfg.depth_gamma) * (
         cfg.bright_luminance - cfg.dark_luminance
     )
     lum = np.clip(lum, 0.001, 0.999)
 
-    shadow  = (1.0 - lum) * cfg.shadow_warmth
-    lum_r   = np.clip(lum + shadow * 0.6, 0.001, 0.999)
-    lum_g   = np.clip(lum + shadow * 0.3, 0.001, 0.999)
-    lum_b   = lum.copy()
+    shadow = (1.0 - lum) * cfg.shadow_warmth
+    lum_r = np.clip(lum + shadow * 0.6, 0.001, 0.999)
+    lum_g = np.clip(lum + shadow * 0.3, 0.001, 0.999)
+    lum_b = lum.copy()
     lum_rgb = np.stack([lum_r, lum_g, lum_b], axis=1)
-    dc_sh   = (lum_rgb / SH_C0).astype(np.float32)
+    dc_sh = (lum_rgb / SH_C0).astype(np.float32)
 
-    coeff  = cfg.top_light_strength / SH_C1
-    band1  = np.zeros(9, dtype=np.float32)
+    coeff = cfg.top_light_strength / SH_C1
+    band1 = np.zeros(9, dtype=np.float32)
     band1[0] = band1[3] = band1[6] = coeff
     rest_9 = np.tile(band1, (N, 1)).astype(np.float32)
 
@@ -107,6 +105,7 @@ def bake_cloud_colors(params: np.ndarray, cfg: CloudLightingConfig):
 
 
 N_SH_REST = 45
+
 
 def save_gaussians_to_ply(
     params: np.ndarray,
@@ -128,9 +127,9 @@ def save_gaussians_to_ply(
 
     output_path = Path(output_path)
 
-    pos    = params[:, 0:3]
-    scale  = params[:, 3:6]
-    quat   = params[:, 6:10]
+    pos = params[:, 0:3]
+    scale = params[:, 3:6]
+    quat = params[:, 6:10]
     weight = params[:, 10]
 
     # Scale: export as-is (physical opacity already accounts for sigma)
@@ -160,17 +159,27 @@ def save_gaussians_to_ply(
     normals = np.zeros((N, 3), dtype=np.float32)
 
     prop_names = (
-        ["x", "y", "z"] + ["nx", "ny", "nz"]
+        ["x", "y", "z"]
+        + ["nx", "ny", "nz"]
         + ["f_dc_0", "f_dc_1", "f_dc_2"]
         + [f"f_rest_{i}" for i in range(N_SH_REST)]
-        + ["opacity"] + ["scale_0", "scale_1", "scale_2"]
+        + ["opacity"]
+        + ["scale_0", "scale_1", "scale_2"]
         + ["rot_0", "rot_1", "rot_2", "rot_3"]
     )
 
-    data = np.concatenate([
-        pos, normals, dc_sh, sh_rest,
-        opacity_logit[:, None], log_scale, quat_wxyz,
-    ], axis=1).astype(np.float32)
+    data = np.concatenate(
+        [
+            pos,
+            normals,
+            dc_sh,
+            sh_rest,
+            opacity_logit[:, None],
+            log_scale,
+            quat_wxyz,
+        ],
+        axis=1,
+    ).astype(np.float32)
 
     header = (
         "ply\nformat binary_little_endian 1.0\n"
@@ -208,6 +217,7 @@ def save_gaussians_dialog(
     try:
         import tkinter as tk
         from tkinter import filedialog
+
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
