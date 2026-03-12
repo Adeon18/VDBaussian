@@ -14,6 +14,7 @@ import time
 from save_ply import save_gaussians_dialog, CloudLightingConfig
 from metrics import MetricsCollector
 from adc import ADCConfig, ADCController
+from screen_metrics import ScreenMetricsCollector
 
 # ==========================================
 # CONFIGURATION
@@ -1239,6 +1240,8 @@ class App:
             memory_type=spy.MemoryType.device_local,
             data=self.gaussians,
         )
+        self.renderer._vol_min = self.vol_min_world
+        self.renderer._vol_max = self.vol_max_world
         self.renderer.init_training()
 
         cmd = self.device.create_command_encoder()
@@ -1252,6 +1255,9 @@ class App:
 
         self.metrics = MetricsCollector(
             self.device, self.renderer, (VOL_SIZE, VOL_SIZE, VOL_SIZE)
+        )
+        self.screen_metrics = ScreenMetricsCollector(
+            self.device, self.renderer, self.settings
         )
 
         self.sgld_diag = SGLDDiagnostics(self)
@@ -1401,9 +1407,14 @@ class App:
             self.adc.tick(frame_count, self.is_training)
             self.adc.apply_pending()
 
+            # Collect regular (3D) metrics and screen space ones
             self.metrics.tick(
                 frame_count, self.vol_min_world, self.vol_max_world, self.is_training
             )
+            self.screen_metrics.tick(frame_count, self.is_training)
+            if self.screen_metrics._wants_snapshot:
+                self.screen_metrics.snapshot_live_camera(self.camera)
+                self.screen_metrics._wants_snapshot = False
 
             if not self.is_training:
                 needs_compute = (
@@ -2064,6 +2075,7 @@ class App:
                     graph_size=(300, 80),
                 )
             self.metrics.draw_ui_inline()
+            self.screen_metrics.draw_ui_inline()
 
         imgui.end()
 
