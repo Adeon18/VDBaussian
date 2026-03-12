@@ -117,6 +117,11 @@ cbuffer TrainParams {
     uint lossMode;
     float huberDelta;
 
+    //! MCMC But just jitter
+    uint  sgldEnabled;
+    float sgldTemperature;
+    float sgldK;  // controls how fast noise suppresses as weight increases, ~5-20
+
     // Debug
     uint debugMode;
     float debugScale;
@@ -162,7 +167,7 @@ static const ParamMetadata PARAM_META[PARAMS_PER_GAUSSIAN] = {
     { LR_GROUP_POSITION, -1e6, 1e6  },  // pos.x
     { LR_GROUP_POSITION, -1e6, 1e6  },  // pos.y
     { LR_GROUP_POSITION, -1e6, 1e6  },  // pos.z
-    { LR_GROUP_SCALE,    1e-4, 15.0  },  // scale.x (must stay positive)
+    { LR_GROUP_SCALE,    1e-4, 15.0  },  // scale.x
     { LR_GROUP_SCALE,    1e-4, 15.0  },  // scale.y
     { LR_GROUP_SCALE,    1e-4, 15.0  },  // scale.z
     { LR_GROUP_ROTATION, -1.0, 1.0  },  // quat.x
@@ -172,7 +177,38 @@ static const ParamMetadata PARAM_META[PARAMS_PER_GAUSSIAN] = {
     { LR_GROUP_WEIGHT,   0.0,  1.0  },  // weight
 };
 
+static const float SGLD_NOISE_SCALE[NUM_LR_GROUPS] = {
+    1.0,   // LR_GROUP_POSITION
+    0.1,   // LR_GROUP_SCALE
+    0.1,   // LR_GROUP_ROTATION
+    0.5,   // LR_GROUP_WEIGHT
+};
+
 // MATH
+// Noise functions
+float hash_rng(uint seed) {
+    seed = seed ^ (seed >> 16);
+    seed *= 0x45d9f3bu;
+    seed = seed ^ (seed >> 16);
+    seed *= 0x45d9f3bu;
+    seed = seed ^ (seed >> 16);
+    return float(seed) / 4294967296.0;
+}
+
+float box_muller(float u1, float u2) {
+    return sqrt(-2.0 * log(u1 + 1e-10)) * cos(6.28318530718 * u2);
+}
+
+float sgld_noise_term(uint gid, uint paramID, uint lrGroup, uint iteration, float temperature) {
+    float lr      = learningRates[lrGroup];
+    float damping = SGLD_NOISE_SCALE[lrGroup];
+    float scale   = sqrt(2.0 * lr * temperature) * damping;
+    uint seed1 = gid * 1000003u + paramID * 7919u + iteration * 6271u;
+    uint seed2 = gid * 999983u  + paramID * 7907u + iteration * 7681u + 1234567u;
+    return scale * box_muller(hash_rng(seed1), hash_rng(seed2));
+}
+
+
 // Build 3x3 rotation matrix from unit quaternion (x,y,z,w)
 [Differentiable]
 float3x3 quatToMatrix(float4 q)
@@ -613,6 +649,23 @@ void clear_gradients(uint3 tid : SV_DispatchThreadID) {
     }
 }
 
+void renormalize_quat(uint gid) {
+    uint qBase = gid * PARAMS_PER_GAUSSIAN + PARAM_QUAT_X;
+    float4 q = float4(
+        asfloat(gGaussianParamsRaw[qBase + 0]),
+        asfloat(gGaussianParamsRaw[qBase + 1]),
+        asfloat(gGaussianParamsRaw[qBase + 2]),
+        asfloat(gGaussianParamsRaw[qBase + 3])
+    );
+    float qLen = length(q);
+    if (qLen > 1e-6) q /= qLen;
+    else q = float4(0, 0, 0, 1);
+    gGaussianParamsRaw[qBase + 0] = asuint(q.x);
+    gGaussianParamsRaw[qBase + 1] = asuint(q.y);
+    gGaussianParamsRaw[qBase + 2] = asuint(q.z);
+    gGaussianParamsRaw[qBase + 3] = asuint(q.w);
+}
+
 // SGD OPTIMIZER
 [shader("compute")]
 [numthreads(256, 1, 1)]
@@ -626,34 +679,27 @@ void optimizer_sgd(uint3 tid : SV_DispatchThreadID) {
         float gradient = gGradientsRaw[idx];
         float currentVal = asfloat(gGaussianParamsRaw[idx]);
         
-        // Get metadata
         ParamMetadata meta = PARAM_META[paramID];
         float lr = learningRates[meta.lrGroup];
         
         // Update
         float newVal = currentVal - gradient * lr;
+    
+        if (sgldEnabled != 0 && paramID <= PARAM_POS_Z)
+        {
+            float w              = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_WEIGHT]);
+            float opacity_factor = exp(-w * sgldK);
+            float noise          = sgld_noise_term(gid, paramID, meta.lrGroup, adamIteration, sgldTemperature);
+            newVal += noise * opacity_factor;
+        }
+        newVal = clamp(newVal, meta.minVal, meta.maxVal);
         
-        // Clamp
         newVal = clamp(newVal, meta.minVal, meta.maxVal);
         
         gGaussianParamsRaw[idx] = asuint(newVal);
     }
 
-    // quat renormalization
-    uint qBase = gid * PARAMS_PER_GAUSSIAN + PARAM_QUAT_X;
-    float4 q = float4(
-        asfloat(gGaussianParamsRaw[qBase + 0]),
-        asfloat(gGaussianParamsRaw[qBase + 1]),
-        asfloat(gGaussianParamsRaw[qBase + 2]),
-        asfloat(gGaussianParamsRaw[qBase + 3])
-    );
-    float qLen = length(q);
-    if (qLen > 1e-6) q /= qLen;
-    else q = float4(0, 0, 0, 1);  // fallback to identity
-    gGaussianParamsRaw[qBase + 0] = asuint(q.x);
-    gGaussianParamsRaw[qBase + 1] = asuint(q.y);
-    gGaussianParamsRaw[qBase + 2] = asuint(q.z);
-    gGaussianParamsRaw[qBase + 3] = asuint(q.w);
+    renormalize_quat(gid);
 }
 
 // ADAM OPTIMIZER
@@ -706,6 +752,15 @@ void optimizer_adam(uint3 tid : SV_DispatchThreadID) {
         // Compute update
         float update = (lr / (sqrt(v_t_hat) + adamEpsilon)) * m_t_hat;
         float newVal = currentVal - update;
+
+        if (sgldEnabled != 0 && paramID <= PARAM_POS_Z)
+        {
+            float w              = asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_WEIGHT]);
+            float opacity_factor = exp(-w * sgldK);
+            float noise          = sgld_noise_term(gid, paramID, meta.lrGroup, adamIteration, sgldTemperature);
+            newVal += noise * opacity_factor;
+        }
+        newVal = clamp(newVal, meta.minVal, meta.maxVal);
         
         // Clamp
         newVal = clamp(newVal, meta.minVal, meta.maxVal);
@@ -719,21 +774,7 @@ void optimizer_adam(uint3 tid : SV_DispatchThreadID) {
         
         gGaussianParamsRaw[idx] = asuint(newVal);
     }
-    // quat renormalization
-    uint qBase = gid * PARAMS_PER_GAUSSIAN + PARAM_QUAT_X;
-    float4 q = float4(
-        asfloat(gGaussianParamsRaw[qBase + 0]),
-        asfloat(gGaussianParamsRaw[qBase + 1]),
-        asfloat(gGaussianParamsRaw[qBase + 2]),
-        asfloat(gGaussianParamsRaw[qBase + 3])
-    );
-    float qLen = length(q);
-    if (qLen > 1e-6) q /= qLen;
-    else q = float4(0, 0, 0, 1);  // fallback to identity
-    gGaussianParamsRaw[qBase + 0] = asuint(q.x);
-    gGaussianParamsRaw[qBase + 1] = asuint(q.y);
-    gGaussianParamsRaw[qBase + 2] = asuint(q.z);
-    gGaussianParamsRaw[qBase + 3] = asuint(q.w);
+    renormalize_quat(gid);
 }
 
 // INITIALIZE ADAM STATE

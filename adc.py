@@ -566,15 +566,16 @@ class ADCController:
             return
 
         # Adaptive prune threshold based on current count
+        # TODO: This MAY be needed
         n = self.app.renderer.gaussian_count
-        if n < 10_000:
-            self.config.prune_weight_min = 0.004
-        elif n < 15_000:
-            self.config.prune_weight_min = 0.007
-        elif n < 25_000:
-            self.config.prune_weight_min = 0.010
-        else:
-            self.config.prune_weight_min = 0.013
+        # if n < 10_000:
+        #     self.config.prune_weight_min = 0.004
+        # elif n < 15_000:
+        #     self.config.prune_weight_min = 0.007
+        # elif n < 25_000:
+        #     self.config.prune_weight_min = 0.010
+        # else:
+        #     self.config.prune_weight_min = 0.013
 
         if frame >= self._next_full_frame:
             self._trigger(do_full=True)

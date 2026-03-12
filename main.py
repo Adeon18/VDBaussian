@@ -59,6 +59,32 @@ class DebugMode:
 # DATA & LOGIC CLASSES
 # ==========================================
 
+class SGLDConfig:
+    def __init__(self):
+        self.enabled = False
+        self.temperature_start = 1e-4
+        self.temperature_decay = 0.9999
+        self.temperature_min   = 1e-7
+        self.sgld_k = 10.0
+        self._current_temperature = self.temperature_start
+
+    def reset(self):
+        self._current_temperature = self.temperature_start
+
+    def step(self):
+        self._current_temperature = max(
+            self._current_temperature * self.temperature_decay,
+            self.temperature_min,
+        )
+
+    @property
+    def current_temperature(self):
+        return self._current_temperature
+
+    @property
+    def gpu_enabled_flag(self):
+        return 1 if self.enabled else 0
+
 
 class ProfilingContext:
     """
@@ -304,6 +330,81 @@ def convert_grid_to_gaussians(grid, config):
     return np.array(gaussians, dtype=np.float32)
 
 
+class SGLDDiagnostics:
+    def __init__(self, app):
+        self.app = app
+        self._tracked_positions = None
+        self._tracked_indices   = None
+        self._tile_history      = []
+        self._mobility_history  = []
+
+    def snapshot(self):
+        """Call once after ~100 training steps to establish baseline."""
+        params  = self._get_params()
+        weights = params[:, 10]
+        mask    = weights < np.percentile(weights, 20)
+        self._tracked_positions = params[mask, 0:3].copy()
+        self._tracked_indices   = np.where(mask)[0]
+        print(f"[SGLD Diag] Tracking {mask.sum()} low-weight Gaussians (n={len(params)})")
+
+    def tick(self):
+        """Call every 500 frames while training."""
+        params  = self._get_params()
+        weights = params[:, 10]
+        n       = len(params)
+
+        # Тoise sanity: displacement binned by weight
+        if self._tracked_positions is not None and self._tracked_indices is not None:
+            valid_mask      = self._tracked_indices < n
+            valid_indices   = self._tracked_indices[valid_mask]
+            valid_positions = self._tracked_positions[valid_mask]
+
+            if len(valid_indices) > 0:
+                current   = params[valid_indices, 0:3]
+                disp      = np.linalg.norm(current - valid_positions, axis=1)
+                mean_disp = np.mean(disp)
+                self._mobility_history.append(mean_disp)
+                print(f"[SGLD Diag] Low-weight displacement  mean={mean_disp:.5f}  max={np.max(disp):.5f}"
+                    f"  ({len(valid_indices)}/{len(self._tracked_indices)} survivors)")
+            else:
+                print(f"[SGLD Diag] All tracked Gaussians pruned — re-snapshotting")
+                self.snapshot()
+                return
+
+        # Gradient magnitude binned by weight band
+        g = self.app.renderer.grad_buffer.to_numpy().view(np.float32).reshape(-1, 11)
+        for lo, hi in [(0.0, 0.1), (0.1, 0.3), (0.3, 0.6), (0.6, 1.0)]:
+            mask = (weights >= lo) & (weights < hi)
+            if mask.sum() > 0:
+                pos_grad_mag = np.linalg.norm(g[mask, 0:3], axis=1).mean()
+                print(f"[SGLD Diag]   w[{lo:.1f}-{hi:.1f}]  n={mask.sum():4d}  "
+                    f"pos_grad_mag={pos_grad_mag:.6f}")
+
+        # Tile coverage
+        tile_counts = self.app.renderer.tile_counts.to_numpy().view(np.uint32)
+        occupied    = np.sum(tile_counts > 0)
+        total       = len(tile_counts)
+        self._tile_history.append(occupied)
+        print(f"[SGLD Diag] Tile coverage  {occupied}/{total}  ({occupied/total*100:.1f}%)")
+
+        if len(self._tile_history) >= 3:
+            trend = self._tile_history[-1] - self._tile_history[-3]
+            if trend > 0:
+                print(f"[SGLD Diag]   ↑ Coverage growing (+{trend} tiles) — Gaussians migrating")
+            elif trend == 0:
+                print(f"[SGLD Diag]   → Coverage static — Gaussians not migrating")
+            else:
+                print(f"[SGLD Diag]   ↓ Coverage shrinking — ADC pruning faster than migration")
+
+    def _get_params(self):
+        return (
+            self.app.renderer.gaussian_buffer.to_numpy()
+            .view(np.float32)
+            .reshape(-1, 11)
+            .copy()
+        )
+
+
 class TrainingConfig:
     """Configurable training hyperparameters"""
 
@@ -327,6 +428,8 @@ class TrainingConfig:
 
         self.loss_mode = 0  # 0=L2, 1=L1(pseudo), 2=Huber
         self.huber_delta = 0.1
+
+        self.sgld = SGLDConfig()
 
 
 # ==========================================
@@ -556,6 +659,11 @@ class Renderer:
         self.debug_needs_update = True
         # Initialize Adam state to zeros
         self._init_adam_state()
+    
+    def _bind_sgld_params(self, cursor, train_config):
+        cursor["TrainParams"]["sgldEnabled"]    = train_config.sgld.gpu_enabled_flag
+        cursor["TrainParams"]["sgldTemperature"] = train_config.sgld.current_temperature
+        cursor["TrainParams"]["sgldK"]           = train_config.sgld.sgld_k
 
     def _init_adam_state(self):
         """Initialize Adam momentum buffers to zero"""
@@ -712,6 +820,10 @@ class Renderer:
         self.debug_needs_update = False
 
     def run_training_step(self, vol_min, vol_max, train_config):
+        # Manage the SGLD temps
+        if train_config.sgld.enabled:
+            train_config.sgld.step()
+
         cmd = self.device.create_command_encoder()
 
         total_tiles = self.tile_res[0] * self.tile_res[1] * self.tile_res[2]
@@ -803,6 +915,8 @@ class Renderer:
             ]
 
             cursor["TrainParams"]["tileSize"] = TILE_SIZE
+            # Adam iter is not used as training iter because I said so
+            cursor["TrainParams"]["adamIteration"] = self.adam_iteration
 
             if train_config.use_adam:
                 cursor["gAdamFirstMoment"] = self.adam_first_moment
@@ -810,7 +924,8 @@ class Renderer:
                 cursor["TrainParams"]["adamBeta1"] = train_config.adam_beta1
                 cursor["TrainParams"]["adamBeta2"] = train_config.adam_beta2
                 cursor["TrainParams"]["adamEpsilon"] = train_config.adam_epsilon
-                cursor["TrainParams"]["adamIteration"] = self.adam_iteration
+            
+            self._bind_sgld_params(cursor, train_config)
 
             cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
 
@@ -826,8 +941,8 @@ class Renderer:
         self._needs_rasterization = True
         self.debug_needs_update = True
 
-        if train_config.use_adam:
-            self.adam_iteration += 1
+        # SGD uses this as welll
+        self.adam_iteration += 1
 
     def resize(self, w, h):
         if w == self.width and h == self.height:
@@ -1139,6 +1254,10 @@ class App:
             self.device, self.renderer, (VOL_SIZE, VOL_SIZE, VOL_SIZE)
         )
 
+        self.sgld_diag = SGLDDiagnostics(self)
+        self.train_step = 0
+    
+
     def apply_densification(self, new_params, surviving_indices=None):
         new_params = np.ascontiguousarray(new_params, dtype=np.float32)
         if new_params.ndim == 2:
@@ -1247,43 +1366,32 @@ class App:
                 self.renderer.run_training_step(
                     self.vol_min_world, self.vol_max_world, self.train_config
                 )
+                self.train_step += 1
 
-                if frame_count % 100 == 0:
-                    tile_debug = self.renderer.tile_counts.to_numpy().view(
-                        dtype=np.uint32
-                    )
+                if self.train_step == 100:
+                    self.sgld_diag.snapshot()
+                if self.train_step % 500 == 0 and self.train_step > 100:
+                    self.sgld_diag.tick()
+
+                if self.train_step % 100 == 0:
+                    tile_debug = self.renderer.tile_counts.to_numpy().view(dtype=np.uint32)
                     total_refs = np.sum(tile_debug)
-
                     grad_bytes = self.renderer.grad_buffer.to_numpy()
-                    grad_all = grad_bytes.view(dtype=np.float32).reshape(
-                        -1, PARAMS_PER_GAUSSIAN
-                    )
-
-                    # Check weight gradients across ALL Gaussians (param index 10)
+                    grad_all = grad_bytes.view(dtype=np.float32).reshape(-1, PARAMS_PER_GAUSSIAN)
                     weight_grads = grad_all[:, 10]
                     grad_max = np.max(np.abs(grad_all))
                     nonzero = np.count_nonzero(weight_grads)
-
                     if total_refs == 0:
                         print(f"[CRITICAL] Tiler is empty! (Total Refs: {total_refs})")
                     elif grad_max == 0:
-                        print(
-                            f"[ALERT] Tiler works ({total_refs} refs) but ALL gradients are ZERO."
-                        )
+                        print(f"[ALERT] Tiler works ({total_refs} refs) but ALL gradients are ZERO.")
                     else:
-                        print(
-                            f"[OK] Training Running. Refs: {total_refs}, "
-                            f"GradMax: {grad_max:.6f}, "
-                            f"ActiveWeightGrads: {nonzero}/{len(weight_grads)}"
-                        )
+                        print(f"[OK] Training Running. Refs: {total_refs}, GradMax: {grad_max:.6f}, ActiveWeightGrads: {nonzero}/{len(weight_grads)}")
                     maxed_tiles = np.sum(tile_debug >= MAX_GAUSSIANS_PER_TILE)
                     if maxed_tiles > 0:
-                        print(
-                            f"[WARN] {maxed_tiles} tiles at MAX_GAUSSIANS_PER_TILE cap!"
-                        )
+                        print(f"[WARN] {maxed_tiles} tiles at MAX_GAUSSIANS_PER_TILE cap!")
 
-                # Track loss every 50 frames
-                if frame_count % 50 == 0:
+                if self.train_step % 50 == 0:
                     self.renderer.analyze_gradients()
                     loss = self.compute_current_loss()
                     self.renderer.loss_history.append(loss)
@@ -1464,6 +1572,50 @@ class App:
                 imgui.set_tooltip(
                     "Adam: Adaptive learning with momentum (faster, smoother)\nSGD: Simple gradient descent"
                 )
+            
+            sgld = self.train_config.sgld
+
+            imgui.dummy((0, 10))
+            imgui.text("SGLD Noise (Langevin Dynamics)")
+            imgui.separator()
+
+            _, sgld.enabled = imgui.checkbox("Enable SGLD Noise##sgld", sgld.enabled)
+            imgui.same_line()
+            if sgld.enabled:
+                imgui.text_colored(imgui.ImVec4(0.4, 0.9, 0.4, 1.0), "ACTIVE")
+            else:
+                imgui.text_colored(imgui.ImVec4(0.5, 0.5, 0.5, 1.0), "off")
+
+            if sgld.enabled:
+                imgui.text(f"Current T: {sgld.current_temperature:.2e}")
+
+                _, sgld.temperature_start = imgui.slider_float(
+                    "T0 (Initial Temp)##sgld", sgld.temperature_start, 1e-7, 1e-2, format="%.2e"
+                )
+                _, sgld.temperature_decay = imgui.slider_float(
+                    "Decay Rate##sgld", sgld.temperature_decay, 0.999, 0.99999, format="%.5f"
+                )
+                _, sgld.temperature_min = imgui.slider_float(
+                    "T_min (Floor)##sgld", sgld.temperature_min, 1e-10, 1e-5, format="%.2e"
+                )
+                _, sgld.sgld_k = imgui.slider_float(
+                    "Opacity Gate K##sgld", sgld.sgld_k, 1.0, 50.0, format="%.1f"
+                )
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip(
+                        "Controls how strongly density suppresses noise.\n"
+                        "exp(-weight * K): higher K = only very transparent\n"
+                        "Gaussians swoosh. Lower K = even dense ones jitter.\n"
+                        "Typical range: 5-20"
+                    )
+
+                t_progress = (sgld.current_temperature - sgld.temperature_min) / max(
+                    sgld.temperature_start - sgld.temperature_min, 1e-12
+                )
+                imgui.progress_bar(t_progress, imgui.ImVec2(-1, 0), f"Temperature: {t_progress*100:.1f}%")
+                
+                if imgui.button("Reset Temperature##sgld"):
+                    sgld.reset()
 
             imgui.dummy((0, 10))
             imgui.text("Learning Rates")
@@ -1523,7 +1675,7 @@ class App:
                     format="%.2e",
                 )
 
-                imgui.text(f"Iteration: {self.renderer.adam_iteration}")
+            imgui.text(f"Iteration: {self.renderer.adam_iteration}")
 
             imgui.dummy((0, 10))
             imgui.text("Gaussian Generation")
@@ -1575,12 +1727,14 @@ class App:
                 self.gaussians = convert_grid_to_gaussians(self.grid, self.train_config)
                 self.apply_densification(self.gaussians)
                 self.renderer.adam_iteration = 1
+                self.train_step = 0
                 self.adc._ref_cache = None
                 cmd = self.device.create_command_encoder()
                 self.renderer.rasterize_gaussians(
                     cmd, self.vol_min_world, self.vol_max_world
                 )
                 self.device.submit_command_buffer(cmd.finish())
+                self.train_config.sgld.reset()
                 print("Gaussians regenerated!")
 
             imgui.dummy((0, 10))
@@ -1588,10 +1742,14 @@ class App:
                 "Start Training" if not self.is_training else "Stop Training"
             ):
                 self.is_training = not self.is_training
+                if self.is_training:
+                    self.train_step = 0
+                    self.train_config.sgld.reset()
 
             if self.is_training:
                 optimizer_name = "ADAM" if self.train_config.use_adam else "SGD"
-                imgui.text_colored((0, 1, 0, 1), f"TRAINING ACTIVE ({optimizer_name})")
+                sgld_suffix    = "+SGLD" if self.train_config.sgld.enabled else ""
+                imgui.text_colored((0, 1, 0, 1), f"TRAINING ACTIVE ({optimizer_name}{sgld_suffix})")
 
             imgui.dummy((0, 5))
             imgui.separator()
