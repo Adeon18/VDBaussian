@@ -43,7 +43,8 @@ float getLightAttenuation(float3 p, float3 lightDir, float step_size, float dens
         
         if (abs(lightP.x) > 1.0 || abs(lightP.y) > 1.0 || abs(lightP.z) > 1.0) break;
 
-        float3 uvw = lightP * 0.5 + 0.5;
+        float3 uvw = p * 0.5 + 0.5;
+        uvw.y = 1.0 - uvw.y;  // VDB Y-up fix
         float d = inVolume.SampleLevel(linearSampler, uvw, 0);
         
         accumulated_density += d;
@@ -120,9 +121,9 @@ float4 fragment_main(VertexOut pin) : SV_Target
 
         float3 p = ro + rd * t;
         float3 uvw = p * 0.5 + 0.5;
-        
+        uvw.y = 1.0 - uvw.y;  // VDB Y-up fix
         float d = inVolume.SampleLevel(linearSampler, uvw, 0);
-        
+                
         if(d > DENSITY_THRESHOLD) {
             float shape = pow(d, density_curve); 
             float segment_alpha = shape * density_scale * step_size;

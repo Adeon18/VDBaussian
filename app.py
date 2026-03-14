@@ -28,7 +28,7 @@ PROFILE_WAIT_FOR_GPU = False
 PRINT_TILE_STATS = True  # Print tiling statistics
 PRINT_GRADIENT_STATS = True  # Print gradient statistics
 
-VDB_FILE = "cloud_04_variant_0000.vdb"
+VDB_FILE = "C:\\Users\\ade0n\\Downloads\\TornadoLoopingVDB\\TornadoLooping\\TornadoVDB\\tornado_0115.vdb"
 VOL_SIZE = 196
 SHADER_FILE = "shaders/hybrid.slang"
 TILE_SIZE = 4
@@ -248,33 +248,51 @@ def convert_grid_to_dense_volume(grid, size):
 
     bbox = grid.evalActiveVoxelBoundingBox()
     min_i, max_i = np.array(bbox[0]), np.array(bbox[1])
+    
+    vdb_dims = max_i - min_i + 1  # +1 because bbox is inclusive
+    print(f"=== VDB Info ===")
+    print(f"  Active bbox (index): {tuple(min_i)} -> {tuple(max_i)}")
+    print(f"  VDB dimensions: {vdb_dims[0]} x {vdb_dims[1]} x {vdb_dims[2]} voxels")
+    print(f"  Total active voxels: ~{int(np.prod(vdb_dims)):,}")
+    print(f"  Resampling to: {size} x {size} x {size}")
+    
+    transform = grid.transform
+    min_w = np.array(transform.indexToWorld(tuple(min_i.astype(float))))
+    max_w = np.array(transform.indexToWorld(tuple(max_i.astype(float))))
+    print(f"  World bounds: {min_w} -> {max_w}")
+    print(f"================")
+
     center = (min_i + max_i) / 2.0
-
-    extent = np.max(max_i - min_i)
-    r = extent / 2.0
-
+    # Per-axis extent — fixes squash/stretch on non-cubic VDBs
+    half_extents = (max_i - min_i) / 2.0
+    # Use max extent for uniform scaling (preserves aspect ratio)
+    r = np.max(half_extents)
+    
     min_index_bound = center - r
     max_index_bound = center + r
 
-    transform = grid.transform
-    min_w = np.array(transform.indexToWorld(tuple(min_index_bound)))
-    max_w = np.array(transform.indexToWorld(tuple(max_index_bound)))
+    min_world_bound = np.array(transform.indexToWorld(tuple(min_index_bound)))
+    max_world_bound = np.array(transform.indexToWorld(tuple(max_index_bound)))
 
     accessor = grid.getAccessor()
     data = np.zeros((size, size, size), dtype=np.float32)
-    inv_size = 1.0 / size
 
-    for z, y, x in itertools.product(range(size), range(size), range(size)):
-        uvw = (np.array([x, y, z]) * inv_size) - 0.5
-        pos = center + uvw * extent
-        val = accessor.getValue(tuple(pos.astype(int)))
-        data[z, y, x] = val
+    for z in range(size):
+        for y in range(size):
+            for x in range(size):
+                # Normalized [0, 1] then to [-0.5, 0.5]
+                # Critically: sample x->x, y->y, z->z in index space
+                t = (np.array([x, y, z], dtype=np.float64) + 0.5) / size  # (0,1)
+                idx = min_index_bound + t * (max_index_bound - min_index_bound)
+                val = accessor.getValue(tuple(idx.astype(int)))
+                data[z, y, x] = val
 
     m = np.max(data)
     if m > 0:
         data /= m
+    print(f"  Sampling efficiency: {np.prod(max_i - min_i) / (2*r)**3 * 100:.1f}% (100% = perfect cube)")
 
-    return min_w, max_w, np.ascontiguousarray(data, dtype=np.float32)
+    return min_world_bound, max_world_bound, np.ascontiguousarray(data, dtype=np.float32)
 
 
 def convert_grid_to_gaussians(grid, config):

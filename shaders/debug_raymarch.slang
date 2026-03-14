@@ -59,7 +59,7 @@ float4 fragment_main(VertexOut pin) : SV_Target
 
         float3 p = ro + rd * t;
         float3 uvw = p * 0.5 + 0.5;
-        
+        uvw.y = 1.0 - uvw.y;  // VDB Y-up fix
         float4 sample = debugVolume.SampleLevel(linearSampler, uvw, 0);
         
         // Front-to-back compositing
