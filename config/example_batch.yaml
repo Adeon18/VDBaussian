@@ -1,0 +1,21 @@
+# =============================================================================
+# example_batch.yaml  —  Example batch run
+# Usage: python experiment_runner.py --batch config/example_batch.yaml
+# =============================================================================
+
+# Applied on top of defaults for ALL experiments in this batch.
+# Only override what you want to fix across the whole run.
+global_overrides:
+  training:
+    max_steps: 3000
+  output:
+    checkpoints: [0, 50, 200, 500, 1000, 2000, 3000, -1]
+    result_dir: "results/run_002"
+
+experiments:
+
+  # ── Baseline ───────────────────────────────────────────────────────────────
+  - name: "baseline_adam_l2"
+    description: "Default Adam + L2. Reference point for all comparisons."
+
+  

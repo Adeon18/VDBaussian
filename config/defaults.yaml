@@ -1,0 +1,194 @@
+# =============================================================================
+# defaults.yaml  —  Master defaults for headless experiment runner
+# Every single tuneable parameter lives here with a sensible default.
+# Experiment configs only need to override what they change.
+# =============================================================================
+
+# --- Volume / Data -----------------------------------------------------------
+volume:
+  vdb_file: "cloud_04_variant_0000.vdb"
+  vol_size: 196                   # Voxels per axis (cube). Hardcoded in some shaders.
+  tile_size: 4                    # Must match TILE_SIZE constant in shaders.
+  max_gaussians_per_tile: 256     # Must match MAX_GAUSSIANS_PER_TILE in shaders.
+
+# --- Training Loop -----------------------------------------------------------
+training:
+  max_steps: 5000
+  use_adam: true
+  loss_mode: 0                    # 0=L2(MSE), 1=L1(pseudo-Huber), 2=Huber
+  huber_delta: 0.1
+
+  # Per-parameter learning rates
+  learning_rate_pos: 0.1
+  learning_rate_scale: 0.01
+  learning_rate_rotation: 0.001
+  learning_rate_weight: 0.1
+
+  # Adam hyperparameters (ignored when use_adam: false)
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+
+  # LR schedule: applied once when train_step >= at_step.
+  # Any field on TrainingConfig (or sgld sub-object) can be patched.
+  # Examples:
+  #   lr_schedule:
+  #     - at_step: 1000
+  #       learning_rate_pos: 0.03
+  #       learning_rate_weight: 0.03
+  #     - at_step: 2000
+  #       use_adam: false
+  lr_schedule: []
+
+# --- SGLD (Stochastic Gradient Langevin Dynamics) ----------------------------
+sgld:
+  enabled: false
+  temperature_start: 1.0e-4
+  temperature_decay: 0.9999
+  temperature_min: 1.0e-7
+  sgld_k: 10.0
+
+# --- Gaussian Initialisation -------------------------------------------------
+gaussian_init:
+  probability_scale: 0.02
+  sigma_scale: 2.0
+  jitter_scale: 5.0
+
+# --- ADC (Adaptive Density Control) -----------------------------------------
+adc:
+  enabled: true
+  start_frame: 300
+  full_adc_every: 400
+  prune_only_every: 150
+  backoff_factor: 1.05
+  max_interval: 2000
+  max_gaussians: 50000
+
+  # Pruning thresholds
+  prune_weight_min: 0.005
+  prune_scale_max_frac: 0.30
+  prune_scale_min_frac: 0.002
+  prune_aniso_max: 50.0
+  prune_contribution_min: 1.0e-5
+
+  # Anisotropy split
+  aniso_thresh: 4.0
+  aniso_n_split: 60
+  aniso_child_overlap: 0.55
+
+  # Gradient-driven split
+  grad_n_split: 60
+  grad_size_thresh_frac: 0.04
+  grad_percentile: 80
+
+  # Clone — dense regions
+  clone_n_dense: 400
+  clone_substance_thresh: 0.02
+  clone_sigma_scale: 2.0          # Synced from gaussian_init.sigma_scale at runtime
+
+  # Clone — sparse / wispy regions
+  clone_n_sparse: 200
+  clone_sparse_min: 0.001
+  clone_sparse_sigma_scale: 0.8
+
+  # Clone — shared params
+  clone_weight_init_frac: 0.25
+  clone_weight_min: 0.04
+  clone_weight_max: 0.30
+  clone_error_percentile: 30
+
+# --- 3D Volumetric Metrics ---------------------------------------------------
+metrics_3d:
+  enabled: true
+  fast_interval: 50               # PSNR / L1 / IoU computed every N steps
+  slow_interval: 200              # SSIM computed every N steps (more expensive)
+  history_length: 500
+  ssim_slices_per_axis: 16
+  iou_threshold: 0.05
+  ssim_window_half: 5
+  ssim_c1: 0.0001
+  ssim_c2: 0.0009
+  enable_psnr: true
+  enable_l1: true
+  enable_iou: true
+  enable_ssim: true
+
+# --- 2D Screen-Space Metrics -------------------------------------------------
+metrics_2d:
+  enabled: true
+  interval: 200                   # Full raymarch pair per camera — keep this ≥100
+  history_length: 300
+  camera_preset: "orbit 6"        # Key from screen_metrics.CAMERA_PRESETS
+  iou_threshold: 0.1
+  ssim_window_half: 5
+  ssim_c1: 0.0001
+  ssim_c2: 0.0009
+  enable_psnr: true
+  enable_l1: true
+  enable_iou: true
+  enable_ssim: true
+  render_width: 1440
+  render_height: 1080
+
+# --- Rendering / Raymarcher --------------------------------------------------
+rendering:
+  step_size: 0.015
+  density_scale: 40.0
+  density_curve: 1.0
+  step_count: 256
+  smoke_color: [0.9, 0.95, 1.0]
+  light_penetration: 0.15
+  phase_g: 0.4
+  sun_direction: [1.0, -1.0, 0.0]
+  sun_color: [1.0, 0.9, 0.7]
+  sun_intensity: 8.0
+  ambient_color: [0.6, 0.7, 0.8]
+  ambient_intensity: 0.6
+  shadow_steps: 6
+  shadow_step_mult: 4.0
+
+# --- Output / Checkpoints ----------------------------------------------------
+output:
+  result_dir: "results"           # Base dir; each experiment gets its own subdir
+
+  # Steps at which to save metrics + render PNGs.
+  # 0 = before any training, -1 = automatically replaced with max_steps.
+  checkpoints: [0, 10, 50, 100, 300, 500, 1000, 2000, 5000, -1]
+
+  save_ply_at_end: true           # Export final Gaussians as .ply (SuperSplat)
+
+  # Cameras used for checkpoint render snapshots.
+  # Each entry: name, pos, front, right, up  (world-space, matches get_gpu_data layout)
+  snapshot_cameras:
+    - name: "front"
+      pos:   [ 0.0,  0.0,  2.5]
+      front: [ 0.0,  0.0, -1.0]
+      right: [ 0.667, 0.0, 0.0]
+      up:    [ 0.0,  0.5,  0.0]
+
+  # PLY export lighting (should match rendering.density_scale)
+  ply_density_scale: 40.0
+  ply_bright_luminance: 0.95
+  ply_dark_luminance: 0.28
+  ply_depth_gamma: 2.0
+  ply_shadow_warmth: 0.10
+
+# --- Performance Logging -----------------------------------------------------
+perf:
+  step_time_sample_interval: 10   # Record step time every N steps (not every step)
+  rolling_window: 100             # Steps used for rolling average shown in progress bar
+
+# --- Health / Divergence Detection ------------------------------------------
+health:
+  # Gradient max above this for N consecutive checks → flag as "exploding"
+  grad_explosion_threshold: 50.0
+  # Gradient mean below this for N consecutive checks → flag as "vanishing"
+  grad_vanish_threshold: 1.0e-7
+  # How many consecutive bad health checks before the event is recorded
+  consecutive_bad_steps_before_flag: 5
+  # Abort the current experiment on explosion (false = flag and continue)
+  abort_on_explosion: false
+  # Always abort if NaN appears in gradients
+  abort_on_nan: true
+  # Check health every N steps
+  check_interval: 50

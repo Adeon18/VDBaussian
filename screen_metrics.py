@@ -5,6 +5,7 @@
 #
 # Public API:
 #   sm = ScreenMetricsCollector(device, renderer, settings)
+#   sm = ScreenMetricsCollector(device, renderer, settings, render_w=512, render_h=384)
 #   sm.tick(frame, is_training)        # call every frame in run loop
 #   sm.get_latest() -> dict            # JSON-safe snapshot
 #   sm.get_config() -> dict            # serialise config
@@ -33,12 +34,15 @@ SLOT_SSIM_COUNT    = 5
 SLOT_PIXEL_COUNT   = 6
 NUM_SLOTS          = 8
 
-# Off-screen render resolution — independent of window size
-METRICS_W = 256
-METRICS_H = 192
+# Default off-screen render resolution — overridable per-instance via render_w/render_h
+DEFAULT_METRICS_W = 512
+DEFAULT_METRICS_H = 384
 
 
-# Data classes — all trivially serialisable via .to_dict() / from_dict()
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
 @dataclasses.dataclass
 class ScreenMetricsSnapshot:
     """One timestep. NaN until computed. to_dict() is JSON/CSV safe."""
@@ -112,16 +116,24 @@ class ScreenMetricsConfig:
         return ScreenMetricsConfig(**d)
 
 
+# ---------------------------------------------------------------------------
 # Camera orbit helpers
+# ---------------------------------------------------------------------------
+
 def make_orbit_cameras(
     n: int = 6,
     radius: float = 2.5,
     elevation_deg: float = 15.0,
-    aspect: float = METRICS_W / METRICS_H,
+    aspect: float = DEFAULT_METRICS_W / DEFAULT_METRICS_H,
 ) -> list[CanonicalCamera]:
     """
     n evenly-spaced cameras orbiting the origin at a fixed elevation.
     aspect bakes into the right vector as aspect * 0.5, matching main.py.
+
+    Note: preset cameras are built with the default aspect ratio. If you use
+    a significantly different render_w/render_h ratio the right/up vectors
+    will be slightly off — call make_orbit_cameras() with your own aspect
+    and use set_cameras_from_dicts() to replace the preset if this matters.
     """
     cameras = []
     elev = math.radians(elevation_deg)
@@ -146,7 +158,6 @@ def make_orbit_cameras(
         rx, ry, rz = rx/rlen * aspect * 0.5, ry/rlen * aspect * 0.5, rz/rlen * aspect * 0.5
 
         # Up: right × front (after scaling — direction only), scaled by 0.5
-        # Use unscaled right direction for cross product
         ux_r, uy_r, uz_r = rx / (aspect * 0.5), ry / (aspect * 0.5), rz / (aspect * 0.5)
         ux = uy_r * fz - uz_r * fy
         uy = uz_r * fx - ux_r * fz
@@ -164,7 +175,7 @@ def make_orbit_cameras(
     return cameras
 
 
-# Built-in presets, can extend freely, all are just lists of CanonicalCamera
+# Built-in presets
 CAMERA_PRESETS: dict[str, list[CanonicalCamera]] = {
     "front only": [
         CanonicalCamera(
@@ -187,14 +198,22 @@ CAMERA_PRESETS: dict[str, list[CanonicalCamera]] = {
     ],
 }
 
-_PRESET_NAMES = list(CAMERA_PRESETS.keys())
+_PRESET_NAMES  = list(CAMERA_PRESETS.keys())
 _DEFAULT_PRESET = "orbit 6"
 
 
+# ---------------------------------------------------------------------------
 # Main collector
+# ---------------------------------------------------------------------------
+
 class ScreenMetricsCollector:
     """
     GPU screen-space metrics collector.
+
+    render_w / render_h control the off-screen resolution used for all metric
+    computations. Set once at construction; consistent across all checkpoints
+    so metrics are comparable within an experiment. Configure per-experiment
+    via the metrics_2d.render_width / render_height config keys.
 
     Serialisation contract
     ----------------------
@@ -206,7 +225,11 @@ class ScreenMetricsCollector:
         sm.set_cameras_from_dicts(l)
     """
 
-    def __init__(self, device, renderer, settings):
+    def __init__(self, device, renderer, settings,
+                 render_w: int = DEFAULT_METRICS_W,
+                 render_h: int = DEFAULT_METRICS_H):
+        self.render_w = render_w
+        self.render_h = render_h
         self.device   = device
         self.renderer = renderer
         self.settings = settings
@@ -219,11 +242,11 @@ class ScreenMetricsCollector:
         self._cameras: list[CanonicalCamera] = CAMERA_PRESETS[_DEFAULT_PRESET]
 
         # History
-        self._frames: list[int]         = []
-        self._psnr:   list[float]       = []
-        self._l1:     list[float]       = []
-        self._iou:    list[float]       = []
-        self._ssim:   list[float]       = []
+        self._frames: list[int]              = []
+        self._psnr:   list[float]            = []
+        self._l1:     list[float]            = []
+        self._iou:    list[float]            = []
+        self._ssim:   list[float]            = []
         self._per_view_psnr: list[list[float]] = []
         self._reset_per_view_history()
 
@@ -233,15 +256,18 @@ class ScreenMetricsCollector:
         self._build_gpu_resources()
         self._compile_pipelines()
 
+    # -----------------------------------------------------------------------
     # GPU setup
+    # -----------------------------------------------------------------------
+
     def _build_gpu_resources(self):
         d = self.device
 
         def make_rw_tex(label: str):
             return d.create_texture(
                 format=spy.Format.rgba32_float,
-                width=METRICS_W,
-                height=METRICS_H,
+                width=self.render_w,
+                height=self.render_h,
                 usage=spy.TextureUsage.unordered_access | spy.TextureUsage.shader_resource,
                 label=label,
             )
@@ -257,7 +283,7 @@ class ScreenMetricsCollector:
         )
 
     def _compile_pipelines(self):
-        print("[ScreenMetrics] Compiling kernels...")
+        print(f"[ScreenMetrics] Compiling kernels... (res {self.render_w}×{self.render_h})")
         load = self.device.load_program
 
         self._pipe_clear   = self.device.create_compute_pipeline(
@@ -273,7 +299,10 @@ class ScreenMetricsCollector:
         self._compiled = True
         print("[ScreenMetrics] Done")
 
+    # -----------------------------------------------------------------------
     # Public serialisation interface
+    # -----------------------------------------------------------------------
+
     def get_latest(self) -> dict:
         return self._snap.to_dict()
 
@@ -291,8 +320,10 @@ class ScreenMetricsCollector:
         self._preset_name = "custom"
         self._reset_per_view_history()
 
-    def snapshot_live_camera(self, camera, aspect: float = METRICS_W / METRICS_H):
+    def snapshot_live_camera(self, camera, aspect: float | None = None):
         """Add (or replace) the first camera with the current interactive camera."""
+        if aspect is None:
+            aspect = self.render_w / self.render_h
         cam = CanonicalCamera.from_live_camera(camera, aspect)
         if self._cameras:
             self._cameras[0] = cam
@@ -313,8 +344,11 @@ class ScreenMetricsCollector:
                 ])
         print(f"[ScreenMetrics] {len(self._frames)} rows → {path}")
 
+    # -----------------------------------------------------------------------
     # Main loop entry point
-    def tick(self, frame: int, is_training: bool):
+    # -----------------------------------------------------------------------
+
+    def tick(self, frame: int, is_training: bool, force: bool = False):
         """Call every frame. Near-zero cost on skipped frames."""
         if not self._compiled:
             return
@@ -322,12 +356,14 @@ class ScreenMetricsCollector:
             return
         if self.renderer.gaussian_buffer is None:
             return
-        if frame % max(1, self.config.interval) != 0:
+        if not force and frame % max(1, self.config.interval) != 0:
             return
-
         self._run(frame)
 
+    # -----------------------------------------------------------------------
     # GPU execution
+    # -----------------------------------------------------------------------
+
     def _bind_params(self, cursor, cam: CanonicalCamera):
         s   = self.settings
         cfg = self.config
@@ -360,8 +396,8 @@ class ScreenMetricsCollector:
         p["shadowSteps"]    = s.shadow_steps
         p["shadowStepMult"] = s.shadow_step_mult
 
-        p["screenW"]            = METRICS_W
-        p["screenH"]            = METRICS_H
+        p["screenW"]            = self.render_w
+        p["screenH"]            = self.render_h
         p["iouLumaThreshold"]   = cfg.iou_threshold
         p["ssimC1"]             = cfg.ssim_c1
         p["ssimC2"]             = cfg.ssim_c2
@@ -378,8 +414,8 @@ class ScreenMetricsCollector:
             cp.dispatch(thread_count=(8, 1, 1))
 
         # Render ref + pred
-        gx = (METRICS_W + 7) // 8
-        gy = (METRICS_H + 7) // 8
+        gx = (self.render_w + 7) // 8
+        gy = (self.render_h + 7) // 8
         with cmd.begin_compute_pass() as cp:
             cursor = spy.ShaderCursor(cp.bind_pipeline(self._pipe_render))
             cursor["gRefVolume"]     = self.renderer.volume_tex
@@ -392,7 +428,7 @@ class ScreenMetricsCollector:
             cp.dispatch(thread_count=(gx * 8, gy * 8, 1))
 
         # Pixel-wise metrics
-        total_px = METRICS_W * METRICS_H
+        total_px = self.render_w * self.render_h
         groups   = (total_px + 255) // 256
         with cmd.begin_compute_pass() as cp:
             cursor = spy.ShaderCursor(cp.bind_pipeline(self._pipe_metrics))
@@ -405,11 +441,11 @@ class ScreenMetricsCollector:
         self.device.submit_command_buffer(cmd.finish())
 
         # Readback
-        buf      = self._result_buf.to_numpy().view(np.float32)
-        px       = float(buf[SLOT_PIXEL_COUNT])
-        mse      = float(buf[SLOT_MSE_SUM])      / max(px, 1.0)
-        iou_i    = float(buf[SLOT_IOU_INTERSECT])
-        iou_u    = float(buf[SLOT_IOU_UNION])
+        buf   = self._result_buf.to_numpy().view(np.float32)
+        px    = float(buf[SLOT_PIXEL_COUNT])
+        mse   = float(buf[SLOT_MSE_SUM])      / max(px, 1.0)
+        iou_i = float(buf[SLOT_IOU_INTERSECT])
+        iou_u = float(buf[SLOT_IOU_UNION])
 
         return {
             "psnr": 10.0 * math.log10(1.0 / mse) if mse > 1e-12 else 100.0,
@@ -424,8 +460,8 @@ class ScreenMetricsCollector:
             cmd = self.device.create_command_encoder()
             self.renderer.rasterize_gaussians(
                 cmd,
-                self.renderer._vol_min if hasattr(self.renderer, "_vol_min") else (0,0,0),
-                self.renderer._vol_max if hasattr(self.renderer, "_vol_max") else (1,1,1),
+                self.renderer._vol_min if hasattr(self.renderer, "_vol_min") else (0, 0, 0),
+                self.renderer._vol_max if hasattr(self.renderer, "_vol_max") else (1, 1, 1),
             )
             self.device.submit_command_buffer(cmd.finish())
 
@@ -458,7 +494,10 @@ class ScreenMetricsCollector:
 
         self._trim_history()
 
+    # -----------------------------------------------------------------------
     # History helpers
+    # -----------------------------------------------------------------------
+
     def _reset_per_view_history(self):
         self._per_view_psnr = [[] for _ in self._cameras]
 
@@ -471,7 +510,10 @@ class ScreenMetricsCollector:
             if len(lst) > cap:
                 lst[:] = lst[-cap:]
 
-    # ImGui UI inline, no begin/end
+    # -----------------------------------------------------------------------
+    # ImGui UI
+    # -----------------------------------------------------------------------
+
     def draw_ui_inline(self):
         snap = self._snap
         cfg  = self.config
@@ -506,7 +548,7 @@ class ScreenMetricsCollector:
         imgui.text_colored(
             imgui.ImVec4(0.45, 0.45, 0.45, 1.0),
             f"  {len(self._cameras)} view(s)   "
-            f"render res {METRICS_W}×{METRICS_H}"
+            f"render res {self.render_w}×{self.render_h}"
         )
 
         imgui.separator()
@@ -606,9 +648,9 @@ class ScreenMetricsCollector:
                     f"{label}: waiting..."
                 )
                 return
-            arr  = np.array(clean, dtype=np.float32)
-            lo   = float(arr.min())
-            hi   = float(arr.max())
+            arr = np.array(clean, dtype=np.float32)
+            lo  = float(arr.min())
+            hi  = float(arr.max())
             if hi - lo < 1e-9:
                 hi = lo + 1e-3
             imgui.text(label)

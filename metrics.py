@@ -123,33 +123,24 @@ class MetricsCollector:
         print("[Metrics] Done:D")
 
     # Main loop entry point
-    def tick(self, frame: int, vol_min: tuple, vol_max: tuple, is_training: bool):
+    def tick(self, frame: int, vol_min: tuple, vol_max: tuple, is_training: bool, force: bool = False):
         """Zero cost on frames where nothing is scheduled."""
         if not is_training:
             return
         if not self._compiled:
             return
-
-        do_fast = frame % max(1, self.config.fast_interval) == 0
-        do_slow = frame % max(1, self.config.slow_interval) == 0
-
+        do_fast = force or frame % max(1, self.config.fast_interval) == 0
+        do_slow = force or frame % max(1, self.config.slow_interval) == 0
         if not (do_fast or do_slow):
             return
-
-        # Tile data must be populated. If a training step ran this frame
-        # it already is. If not (paused), we need a fresh bin pass.
         if self.renderer._needs_rebinning:
             self._run_bin_pass(vol_min, vol_max)
-
         cmd = self.device.create_command_encoder()
         self._clear(cmd)
-
         if do_fast:
             self._dispatch_fast(cmd, vol_min, vol_max)
-
         if do_slow and self.config.enable_ssim:
             self._dispatch_ssim(cmd, vol_min, vol_max)
-
         self.device.submit_command_buffer(cmd.finish())
         self._readback(frame, do_slow)
 
