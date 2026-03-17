@@ -151,8 +151,10 @@ void render_both(uint3 tid : SV_DispatchThreadID)
     bool   missed = (bounds.x > bounds.y || bounds.y < 0.0);
     float3 bg     = lerp(float3(0.1, 0.1, 0.1), float3(0.0, 0.0, 0.0), uv.y);
 
-    gRefImage[tid.xy]  = float4(missed ? bg : raymarch(gRefVolume,  camPos, rd, uv, bounds.x, bounds.y), 1.0);
-    gPredImage[tid.xy] = float4(missed ? bg : raymarch(gPredVolume, camPos, rd, uv, bounds.x, bounds.y), 1.0);
+    float3 refCol  = missed ? bg : raymarch(gRefVolume,  camPos, rd, uv, bounds.x, bounds.y);
+    float3 predCol = missed ? bg : raymarch(gPredVolume, camPos, rd, uv, bounds.x, bounds.y);
+    gRefImage[tid.xy]  = float4(saturate(refCol),  1.0);
+    gPredImage[tid.xy] = float4(saturate(predCol), 1.0);
 }
 
 // PASS 2: pixel-wise metrics with groupshared reduction
@@ -184,8 +186,10 @@ void compute_screen_metrics(uint3 tid : SV_DispatchThreadID, uint lane : SV_Grou
 
         mse_v = diff * diff;
         l1_v  = abs(diff);
-        ii_v  = min(refL, predL);
-        uu_v  = max(refL, predL);
+        float predBin = (predL > iouLumaThreshold) ? 1.0 : 0.0;
+        float refBin  = (refL  > iouLumaThreshold) ? 1.0 : 0.0;
+        ii_v  = predBin * refBin;
+        uu_v  = max(predBin, refBin);
         cnt_v = 1.0;
 
         // SSIM box window

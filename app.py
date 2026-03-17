@@ -28,7 +28,7 @@ PROFILE_WAIT_FOR_GPU = False
 PRINT_TILE_STATS = True  # Print tiling statistics
 PRINT_GRADIENT_STATS = True  # Print gradient statistics
 
-VDB_FILE = "C:\\Users\\ade0n\\Downloads\\TornadoLoopingVDB\\TornadoLooping\\TornadoVDB\\tornado_0115.vdb"
+VDB_FILE = "cloud_04_variant_0000.vdb"
 VOL_SIZE = 196
 SHADER_FILE = "shaders/hybrid.slang"
 TILE_SIZE = 4

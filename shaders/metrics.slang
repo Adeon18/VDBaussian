@@ -182,8 +182,10 @@ void fast_metrics(uint3 tid : SV_DispatchThreadID, uint lane : SV_GroupIndex)
         float diff = pred - ref;
         mse_v  = diff * diff;
         l1_v   = abs(diff);
-        ii_v   = min(pred, ref);
-        uu_v   = max(pred, ref);
+        float predBin = (pred > iouThreshold) ? 1.0 : 0.0;
+        float refBin  = (ref  > iouThreshold) ? 1.0 : 0.0;
+        ii_v   = predBin * refBin;
+        uu_v   = max(predBin, refBin);
         cnt_v  = 1.0;
     }
 

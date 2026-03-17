@@ -284,15 +284,20 @@ class MetricsCollector:
 
         # only touch SSIM fields when they were actually computed
         if has_ssim and self.config.enable_ssim:
-            n = float(self.config.ssim_slices_per_axis)
+            depth_xy = self.vol_res[2]
+            depth_xz = self.vol_res[1]
+            depth_yz = self.vol_res[0]
+            n_xy = float(min(self.config.ssim_slices_per_axis, depth_xy))
+            n_xz = float(min(self.config.ssim_slices_per_axis, depth_xz))
+            n_yz = float(min(self.config.ssim_slices_per_axis, depth_yz))
 
             px_xy = float(self.vol_res[0] * self.vol_res[1])
             px_xz = float(self.vol_res[0] * self.vol_res[2])
             px_yz = float(self.vol_res[1] * self.vol_res[2])
 
-            self._last_snap.ssim_xy = ssim_xy_sum / (n * px_xy)
-            self._last_snap.ssim_xz = ssim_xz_sum / (n * px_xz)
-            self._last_snap.ssim_yz = ssim_yz_sum / (n * px_yz)
+            self._last_snap.ssim_xy = ssim_xy_sum / (n_xy * px_xy)
+            self._last_snap.ssim_xz = ssim_xz_sum / (n_xz * px_xz)
+            self._last_snap.ssim_yz = ssim_yz_sum / (n_yz * px_yz)
             self._last_snap.ssim_mean = (
                 self._last_snap.ssim_xy
                 + self._last_snap.ssim_xz
