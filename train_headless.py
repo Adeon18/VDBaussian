@@ -417,8 +417,9 @@ class HeadlessTrainer:
             raise RuntimeError(f"Failed to load VDB: {vdb_path}")
 
         self.logger.info("Converting to dense volume...")
-        self.vol_min, self.vol_max, vol_data = convert_grid_to_dense_volume(
-            self.grid, self.VOL_SIZE
+        up_axis = self.cfg.get("volume", {}).get("up_axis", "+Y")
+        self.vol_min, self.vol_max, vol_data, self.axis_remap = convert_grid_to_dense_volume(
+            self.grid, self.VOL_SIZE, up_axis_name=up_axis
         )
 
         # Aliases expected by ADCController
@@ -435,7 +436,7 @@ class HeadlessTrainer:
 
         # ---- Gaussians ----
         self.logger.info("Generating Gaussians...")
-        self.gaussians = convert_grid_to_gaussians(self.grid, self.train_config)
+        self.gaussians = convert_grid_to_gaussians(self.grid, self.train_config, self.axis_remap)
         self.logger.info(f"Generated {len(self.gaussians):,} Gaussians")
 
         # ---- Renderer ----

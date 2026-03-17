@@ -28,8 +28,11 @@ PROFILE_WAIT_FOR_GPU = False
 PRINT_TILE_STATS = True  # Print tiling statistics
 PRINT_GRADIENT_STATS = True  # Print gradient statistics
 
+# VDB_FILE = "C:\\Users\\ade0n\\Downloads\\bunny_cloud.vdb"
 VDB_FILE = "cloud_04_variant_0000.vdb"
+# VDB_FILE = "C:\\Users\\ade0n\\Downloads\\TornadoLoopingVDB\\TornadoLooping\\TornadoVDB\\tornado_0109.vdb"
 VOL_SIZE = 196
+VDB_UP_AXIS = "-Z"  # Source VDB up axis: "+Y" (Houdini/Maya), "+Z" (Blender/3dsMax), etc.
 SHADER_FILE = "shaders/hybrid.slang"
 TILE_SIZE = 4
 MAX_GAUSSIANS_PER_TILE = 256
@@ -240,39 +243,136 @@ def load_vdb_grid(vdb_path):
         return None
 
 
-def convert_grid_to_dense_volume(grid, size):
-    """Convert sparse VDB grid to dense 3D texture"""
+# VDB files do not store an up-axis convention.  Different DCC tools
+# bake data in their own coordinate system:
+#   Houdini / Maya  → +Y up   (most common for VDB content)
+#   Blender / 3ds Max → +Z up
+#   EmberGen        → configurable at export
+# Real engines (UE, Unity) let the user pick — we do the same.
+VDB_UP_AXES = {
+    "+Y": (1,  1),   # Houdini / Maya (default)
+    "-Y": (1, -1),
+    "+Z": (2,  1),   # Blender / 3ds Max
+    "-Z": (2, -1),
+    "+X": (0,  1),
+    "-X": (0, -1),
+}
+VDB_UP_AXIS_NAMES = list(VDB_UP_AXES.keys())
+
+
+def _build_axis_remap(up_axis, up_sign):
+    """Build permutation and sign arrays that remap VDB world space so
+    that the detected up axis becomes Y with the correct direction.
+
+    Returns (perm, signs) where:
+        our_pos[i] = signs[i] * vdb_pos[perm[i]]
+        vdb_pos[perm[i]] = signs[i] * our_pos[i]   (inverse)
+    """
+    if up_axis == 0:       # VDB X is up → swap X↔Y
+        perm = [1, 0, 2]
+    elif up_axis == 2:     # VDB Z is up → swap Y↔Z
+        perm = [0, 2, 1]
+    else:                  # VDB Y is up → identity
+        perm = [0, 1, 2]
+
+    signs = [1, up_sign, 1]
+    return perm, signs
+
+
+def _remap_position(pos, perm, signs):
+    """VDB world position → our coordinate system."""
+    return np.array([signs[i] * pos[perm[i]] for i in range(3)])
+
+
+def _remap_bounds(world_min, world_max, perm, signs):
+    """Remap an axis-aligned bounding box from VDB world to our space."""
+    our_min = np.zeros(3)
+    our_max = np.zeros(3)
+    for i in range(3):
+        lo = world_min[perm[i]]
+        hi = world_max[perm[i]]
+        if signs[i] < 0:
+            lo, hi = -hi, -lo
+        our_min[i] = lo
+        our_max[i] = hi
+    return our_min, our_max
+
+
+def _inverse_remap_position(pos, perm, signs):
+    """Our coordinate system → VDB world position."""
+    vdb = np.zeros(3)
+    for i in range(3):
+        vdb[perm[i]] = signs[i] * pos[i]
+    return vdb
+
+
+def convert_grid_to_dense_volume(grid, size, up_axis_name="+Y"):
+    """Convert sparse VDB grid to dense 3D texture.
+
+    Remaps the VDB so the specified source up axis becomes +Y in our
+    coordinate system, then samples uniformly in world space.
+
+    Args:
+        grid:          OpenVDB grid object.
+        size:          Voxels per axis for the output cube.
+        up_axis_name:  Source up axis — one of "+Y", "-Y", "+Z", "-Z",
+                       "+X", "-X".  Default "+Y" (Houdini/Maya).
+
+    Returns (vol_min, vol_max, data, axis_remap) where axis_remap is a
+    (perm, signs) tuple needed by convert_grid_to_gaussians.
+    """
     if grid is None:
         print("Error! Grid is None!")
         return None
 
     bbox = grid.evalActiveVoxelBoundingBox()
     min_i, max_i = np.array(bbox[0]), np.array(bbox[1])
-    
-    vdb_dims = max_i - min_i + 1  # +1 because bbox is inclusive
+
+    vdb_dims = max_i - min_i + 1
     print(f"=== VDB Info ===")
     print(f"  Active bbox (index): {tuple(min_i)} -> {tuple(max_i)}")
     print(f"  VDB dimensions: {vdb_dims[0]} x {vdb_dims[1]} x {vdb_dims[2]} voxels")
     print(f"  Total active voxels: ~{int(np.prod(vdb_dims)):,}")
     print(f"  Resampling to: {size} x {size} x {size}")
-    
+
     transform = grid.transform
-    min_w = np.array(transform.indexToWorld(tuple(min_i.astype(float))))
-    max_w = np.array(transform.indexToWorld(tuple(max_i.astype(float))))
-    print(f"  World bounds: {min_w} -> {max_w}")
+
+    # Compute world-space AABB from all 8 corners of the index bbox
+    corners_idx = np.array([
+        [min_i[0], min_i[1], min_i[2]],
+        [max_i[0], min_i[1], min_i[2]],
+        [min_i[0], max_i[1], min_i[2]],
+        [min_i[0], min_i[1], max_i[2]],
+        [max_i[0], max_i[1], min_i[2]],
+        [max_i[0], min_i[1], max_i[2]],
+        [min_i[0], max_i[1], max_i[2]],
+        [max_i[0], max_i[1], max_i[2]],
+    ], dtype=np.float64)
+    corners_world = np.array([
+        transform.indexToWorld(tuple(c)) for c in corners_idx
+    ])
+    vdb_world_min = corners_world.min(axis=0)
+    vdb_world_max = corners_world.max(axis=0)
+
+    # Build axis remap from user-specified up axis
+    up_axis, up_sign = VDB_UP_AXES[up_axis_name]
+    perm, signs = _build_axis_remap(up_axis, up_sign)
+    axis_remap = (perm, signs)
+
+    print(f"  Source up axis: {up_axis_name} → remap to +Y")
+
+    # Remap bounds to our coordinate system (Y-up)
+    our_min, our_max = _remap_bounds(vdb_world_min, vdb_world_max, perm, signs)
+
+    print(f"  VDB world bounds: {vdb_world_min} -> {vdb_world_max}")
+    print(f"  Remapped bounds:  {our_min} -> {our_max}")
     print(f"================")
 
-    center = (min_i + max_i) / 2.0
-    # Per-axis extent — fixes squash/stretch on non-cubic VDBs
-    half_extents = (max_i - min_i) / 2.0
-    # Use max extent for uniform scaling (preserves aspect ratio)
-    r = np.max(half_extents)
-    
-    min_index_bound = center - r
-    max_index_bound = center + r
-
-    min_world_bound = np.array(transform.indexToWorld(tuple(min_index_bound)))
-    max_world_bound = np.array(transform.indexToWorld(tuple(max_index_bound)))
+    # Make a uniform cube (preserves aspect ratio)
+    center = (our_min + our_max) / 2.0
+    half = np.max(our_max - our_min) / 2.0
+    min_world_bound = center - half
+    max_world_bound = center + half
 
     accessor = grid.getAccessor()
     data = np.zeros((size, size, size), dtype=np.float32)
@@ -280,23 +380,29 @@ def convert_grid_to_dense_volume(grid, size):
     for z in range(size):
         for y in range(size):
             for x in range(size):
-                # Normalized [0, 1] then to [-0.5, 0.5]
-                # Critically: sample x->x, y->y, z->z in index space
-                t = (np.array([x, y, z], dtype=np.float64) + 0.5) / size  # (0,1)
-                idx = min_index_bound + t * (max_index_bound - min_index_bound)
+                t = (np.array([x, y, z], dtype=np.float64) + 0.5) / size
+                our_pos = min_world_bound + t * (max_world_bound - min_world_bound)
+                vdb_pos = _inverse_remap_position(our_pos, perm, signs)
+                idx = np.array(transform.worldToIndex(tuple(vdb_pos)))
                 val = accessor.getValue(tuple(idx.astype(int)))
                 data[z, y, x] = val
 
     m = np.max(data)
     if m > 0:
         data /= m
-    print(f"  Sampling efficiency: {np.prod(max_i - min_i) / (2*r)**3 * 100:.1f}% (100% = perfect cube)")
+    fill_ratio = np.count_nonzero(data) / data.size * 100
+    print(f"  Fill ratio: {fill_ratio:.1f}% of voxels non-zero")
 
-    return min_world_bound, max_world_bound, np.ascontiguousarray(data, dtype=np.float32)
+    return min_world_bound, max_world_bound, np.ascontiguousarray(data, dtype=np.float32), axis_remap
 
 
-def convert_grid_to_gaussians(grid, config):
-    """Stochastically sample VDB grid to create Gaussians"""
+def convert_grid_to_gaussians(grid, config, axis_remap=None):
+    """Stochastically sample VDB grid to create Gaussians.
+
+    If axis_remap is provided (from convert_grid_to_dense_volume),
+    Gaussian positions are remapped into the same Y-up coordinate
+    system as the dense volume.
+    """
     if grid is None:
         return np.array([], dtype=np.float32)
 
@@ -310,6 +416,11 @@ def convert_grid_to_gaussians(grid, config):
     p1 = np.array(transform.indexToWorld((1, 0, 0)))
     voxel_size = np.linalg.norm(p1 - p0)
 
+    if axis_remap is not None:
+        perm, signs = axis_remap
+    else:
+        perm, signs = [0, 1, 2], [1, 1, 1]
+
     gaussians = []
 
     for z in range(min_i[2], max_i[2] + 1):
@@ -322,9 +433,9 @@ def convert_grid_to_gaussians(grid, config):
                 if value * config.probability_scale < random.random():
                     continue
 
-                center = np.array(transform.indexToWorld((x, y, z)), dtype=np.float32)
+                center = np.array(transform.indexToWorld((x, y, z)), dtype=np.float64)
                 jitter = (np.random.rand(3) - 0.5) * voxel_size * config.jitter_scale
-                position = center + jitter
+                position = _remap_position(center + jitter, perm, signs)
 
                 sigma = voxel_size * config.sigma_scale
                 weight = value
@@ -1243,10 +1354,11 @@ class App:
         )
 
         self.grid = load_vdb_grid(VDB_FILE)
-        self.vol_min_world, self.vol_max_world, vol_data = convert_grid_to_dense_volume(
-            self.grid, VOL_SIZE
+        self.vdb_up_axis = VDB_UP_AXIS
+        self.vol_min_world, self.vol_max_world, vol_data, self.axis_remap = convert_grid_to_dense_volume(
+            self.grid, VOL_SIZE, up_axis_name=self.vdb_up_axis
         )
-        self.gaussians = convert_grid_to_gaussians(self.grid, self.train_config)
+        self.gaussians = convert_grid_to_gaussians(self.grid, self.train_config, self.axis_remap)
 
         self.renderer = Renderer(self.device, vol_data)
         self.renderer.resize(self.width, self.height)
@@ -1752,8 +1864,46 @@ class App:
                     )
 
             imgui.separator()
+
+            # VDB up axis selector
+            imgui.text("VDB up axis")
+            imgui.same_line()
+            imgui.push_item_width(80)
+            cur_idx = VDB_UP_AXIS_NAMES.index(self.vdb_up_axis) if self.vdb_up_axis in VDB_UP_AXIS_NAMES else 0
+            changed_up, new_up_idx = imgui.combo("##vdb_up", cur_idx, VDB_UP_AXIS_NAMES)
+            imgui.pop_item_width()
+            if changed_up:
+                self.vdb_up_axis = VDB_UP_AXIS_NAMES[new_up_idx]
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Source VDB coordinate convention.\n"
+                    "+Y = Houdini / Maya (most common)\n"
+                    "+Z = Blender / 3ds Max\n"
+                    "Change and press Reload VDB to apply."
+                )
+            imgui.same_line()
+            if imgui.button("Reload VDB"):
+                self.vol_min_world, self.vol_max_world, vol_data, self.axis_remap = convert_grid_to_dense_volume(
+                    self.grid, VOL_SIZE, up_axis_name=self.vdb_up_axis
+                )
+                cmd = self.device.create_command_encoder()
+                cmd.upload_texture_data(self.renderer.volume_tex, [vol_data])
+                self.device.submit_command_buffer(cmd.finish())
+                self.renderer._vol_min = self.vol_min_world
+                self.renderer._vol_max = self.vol_max_world
+                self.gaussians = convert_grid_to_gaussians(self.grid, self.train_config, self.axis_remap)
+                self.apply_densification(self.gaussians)
+                self.renderer.adam_iteration = 1
+                self.train_step = 0
+                self.adc._ref_cache = None
+                cmd = self.device.create_command_encoder()
+                self.renderer.rasterize_gaussians(cmd, self.vol_min_world, self.vol_max_world)
+                self.device.submit_command_buffer(cmd.finish())
+                self.train_config.sgld.reset()
+                print(f"VDB reloaded with up axis: {self.vdb_up_axis}")
+
             if imgui.button("Regenerate Gaussians"):
-                self.gaussians = convert_grid_to_gaussians(self.grid, self.train_config)
+                self.gaussians = convert_grid_to_gaussians(self.grid, self.train_config, self.axis_remap)
                 self.apply_densification(self.gaussians)
                 self.renderer.adam_iteration = 1
                 self.train_step = 0

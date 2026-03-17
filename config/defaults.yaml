@@ -10,6 +10,7 @@ volume:
   vol_size: 196                   # Voxels per axis (cube). Hardcoded in some shaders.
   tile_size: 4                    # Must match TILE_SIZE constant in shaders.
   max_gaussians_per_tile: 256     # Must match MAX_GAUSSIANS_PER_TILE in shaders.
+  up_axis: "+Y"                   # Source VDB up axis. +Y = Houdini/Maya, +Z = Blender/3dsMax.
 
 # --- Training Loop -----------------------------------------------------------
 training:
