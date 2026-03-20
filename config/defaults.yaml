@@ -51,7 +51,11 @@ sgld:
 
 # --- Gaussian Initialisation -------------------------------------------------
 gaussian_init:
-  probability_scale: 0.02
+  mode: "percentage"              # "percentage" or "count"
+  probability_scale: 0.02         # Used when mode: percentage
+  target_count: 8000              # Used when mode: count
+  min_count: 500                  # Floor — retry with higher prob if below this
+  max_count: 50000                # Ceiling — randomly subsample if exceeded
   sigma_scale: 2.0
   jitter_scale: 5.0
 

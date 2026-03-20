@@ -151,7 +151,11 @@ def apply_config_to_train_config(cfg: dict, train_config) -> None:
     train_config.adam_epsilon         = float(t["adam_epsilon"])
 
     g = cfg["gaussian_init"]
+    train_config.gaussian_mode        = str(g.get("mode", "percentage"))
     train_config.probability_scale    = float(g["probability_scale"])
+    train_config.target_count         = int(g.get("target_count", 8000))
+    train_config.min_count            = int(g.get("min_count", 500))
+    train_config.max_count            = int(g.get("max_count", 50000))
     train_config.sigma_scale          = float(g["sigma_scale"])
     train_config.jitter_scale         = float(g["jitter_scale"])
 

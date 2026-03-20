@@ -399,6 +399,18 @@ def convert_grid_to_dense_volume(grid, size, up_axis_name="+Y"):
 def convert_grid_to_gaussians(grid, config, axis_remap=None):
     """Stochastically sample VDB grid to create Gaussians.
 
+    Supports two modes (config.gaussian_mode):
+      "percentage" — each active voxel is kept with probability
+                     value * config.probability_scale.
+      "count"      — targets config.target_count Gaussians by
+                     auto-calculating the probability from the
+                     number of active voxels.
+
+    In both modes, config.min_count / config.max_count are enforced.
+    If the result undershoots min_count the probability is bumped and
+    generation retried.  If it overshoots max_count, excess Gaussians
+    are randomly dropped.
+
     If axis_remap is provided (from convert_grid_to_dense_volume),
     Gaussian positions are remapped into the same Y-up coordinate
     system as the dense volume.
@@ -421,42 +433,79 @@ def convert_grid_to_gaussians(grid, config, axis_remap=None):
     else:
         perm, signs = [0, 1, 2], [1, 1, 1]
 
-    gaussians = []
-
+    # Collect all active voxels (index, value) once — reused across retries
+    active_voxels = []
     for z in range(min_i[2], max_i[2] + 1):
         for y in range(min_i[1], max_i[1] + 1):
             for x in range(min_i[0], max_i[0] + 1):
                 value = accessor.getValue((x, y, z))
-                if value <= 0.0:
-                    continue
+                if value > 0.0:
+                    active_voxels.append(((x, y, z), value))
 
-                if value * config.probability_scale < random.random():
-                    continue
+    n_active = len(active_voxels)
+    print(f"  Active voxels: {n_active:,}")
 
-                center = np.array(transform.indexToWorld((x, y, z)), dtype=np.float64)
-                jitter = (np.random.rand(3) - 0.5) * voxel_size * config.jitter_scale
-                position = _remap_position(center + jitter, perm, signs)
+    if n_active == 0:
+        print("  No active voxels — returning empty.")
+        return np.array([], dtype=np.float32)
 
-                sigma = voxel_size * config.sigma_scale
-                weight = value
+    # Determine probability
+    mode = getattr(config, "gaussian_mode", "percentage")
+    min_count = getattr(config, "min_count", 0)
+    max_count = getattr(config, "max_count", 999_999)
 
-                gaussians.append(
-                    (
-                        position[0],
-                        position[1],
-                        position[2],  # pos
-                        sigma,
-                        sigma,
-                        sigma,  # scale (isotropic start)
-                        0.0,
-                        0.0,
-                        0.0,
-                        1.0,  # quaternion (identity)
-                        weight,  # weight
-                    )
-                )
+    if mode == "count":
+        target = getattr(config, "target_count", 8000)
+        prob = min(target / max(n_active, 1), 1.0)
+        print(f"  Mode: count (target={target}, auto prob={prob:.5f})")
+    else:
+        prob = config.probability_scale
+        print(f"  Mode: percentage (prob_scale={prob:.5f})")
 
-    print(f"Generated {len(gaussians)} gaussians.")
+    # Generate with retry if undershooting min_count
+    # In percentage mode: acceptance = value * prob (density-weighted)
+    # In count mode:      acceptance = prob          (uniform sampling)
+    density_weighted = (mode == "percentage")
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        gaussians = []
+        sigma = voxel_size * config.sigma_scale
+
+        for (ix, iy, iz), value in active_voxels:
+            acceptance = value * prob if density_weighted else prob
+            if acceptance < random.random():
+                continue
+
+            center = np.array(transform.indexToWorld((ix, iy, iz)), dtype=np.float64)
+            jitter = (np.random.rand(3) - 0.5) * voxel_size * config.jitter_scale
+            position = _remap_position(center + jitter, perm, signs)
+
+            gaussians.append((
+                position[0], position[1], position[2],
+                sigma, sigma, sigma,
+                0.0, 0.0, 0.0, 1.0,
+                value,
+            ))
+
+        count = len(gaussians)
+
+        if count >= min_count or attempt == max_attempts - 1:
+            break
+
+        # Undershoot — bump probability for next attempt
+        old_prob = prob
+        prob = min(min_count / max(n_active, 1), 1.0)
+        print(f"  Retry {attempt + 1}: {count} < min_count {min_count}, "
+              f"bumping prob {old_prob:.5f} -> {prob:.5f}")
+
+    # Clamp to max_count by random subsampling
+    if len(gaussians) > max_count:
+        print(f"  Clamping {len(gaussians):,} -> {max_count:,} (random subsample)")
+        indices = random.sample(range(len(gaussians)), max_count)
+        gaussians = [gaussians[i] for i in indices]
+
+    print(f"  Generated {len(gaussians):,} Gaussians "
+          f"(active={n_active:,}, mode={mode})")
     return np.array(gaussians, dtype=np.float32)
 
 
@@ -552,7 +601,11 @@ class TrainingConfig:
         self.use_adam = True  # Toggle between SGD and Adam
 
         # Gaussian Generation
+        self.gaussian_mode = "percentage"  # "percentage" or "count"
         self.probability_scale = 0.02
+        self.target_count = 8000
+        self.min_count = 500
+        self.max_count = 50000
         self.sigma_scale = 2.0
         self.jitter_scale = 5.0
 
@@ -1821,13 +1874,46 @@ class App:
             imgui.dummy((0, 10))
             imgui.text("Gaussian Generation")
             imgui.separator()
-            _, self.train_config.probability_scale = imgui.slider_float(
-                "Spawn Probability",
-                self.train_config.probability_scale,
-                0.001,
-                0.1,
-                format="%.4f",
+
+            gauss_modes = ["percentage", "count"]
+            cur_mode_idx = gauss_modes.index(self.train_config.gaussian_mode) \
+                if self.train_config.gaussian_mode in gauss_modes else 0
+            imgui.push_item_width(140)
+            changed_gm, new_gm_idx = imgui.combo(
+                "Init Mode##gm", cur_mode_idx, ["Percentage", "Target Count"]
             )
+            imgui.pop_item_width()
+            if changed_gm:
+                self.train_config.gaussian_mode = gauss_modes[new_gm_idx]
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Percentage: keep each voxel with prob = value * scale.\n"
+                    "Target Count: auto-calculate probability to hit a target."
+                )
+
+            if self.train_config.gaussian_mode == "percentage":
+                _, self.train_config.probability_scale = imgui.slider_float(
+                    "Spawn Probability",
+                    self.train_config.probability_scale,
+                    0.001,
+                    0.2,
+                    format="%.4f",
+                )
+            else:
+                _, self.train_config.target_count = imgui.slider_int(
+                    "Target Count##gc",
+                    self.train_config.target_count,
+                    100,
+                    100000,
+                )
+
+            _, self.train_config.min_count = imgui.slider_int(
+                "Min Gaussians", self.train_config.min_count, 0, 10000
+            )
+            _, self.train_config.max_count = imgui.slider_int(
+                "Max Gaussians", self.train_config.max_count, 1000, 200000
+            )
+
             _, self.train_config.sigma_scale = imgui.slider_float(
                 "Initial Sigma Scale", self.train_config.sigma_scale, 1.0, 20.0
             )
