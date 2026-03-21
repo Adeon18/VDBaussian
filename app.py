@@ -1,20 +1,29 @@
 import slangpy as spy
 import numpy as np
-import glfw
-from OpenGL.GL import *
 from pathlib import Path
 import math
-import ctypes
-from imgui_bundle import imgui
 import random
 import openvdb as vdb
 import itertools
 import time
 
-from save_ply import save_gaussians_dialog, CloudLightingConfig
-from metrics import MetricsCollector
-from adc import ADCConfig, ADCController
-from screen_metrics import ScreenMetricsCollector
+# ==========================================
+# UI MODE: Set to False for slim slangpy-native window (no OpenGL/imgui)
+# ==========================================
+EXTENDED_UI = False
+
+if EXTENDED_UI:
+    import glfw
+    from OpenGL.GL import *
+    import ctypes
+    from imgui_bundle import imgui
+    from save_ply import save_gaussians_dialog, CloudLightingConfig
+    from metrics import MetricsCollector
+    from adc import ADCConfig, ADCController
+    from screen_metrics import ScreenMetricsCollector
+else:
+    import slangpy.ui as sui
+    from adc import ADCConfig, ADCController
 
 # ==========================================
 # CONFIGURATION
@@ -1137,21 +1146,28 @@ class Renderer:
         self.width, self.height = w, h
 
         self.screen_tex = self.device.create_texture(
-            format=spy.Format.rgba8_unorm,  # was rgba32_float
+            format=spy.Format.rgba8_unorm,
             width=w,
             height=h,
-            usage=spy.TextureUsage.render_target,
+            usage=spy.TextureUsage.render_target | spy.TextureUsage.shader_resource,
             label="Screen",
         )
 
-        if self.display_gl_tex is None:
-            self.display_gl_tex = glGenTextures(1)
-        glBindTexture(GL_TEXTURE_2D, self.display_gl_tex)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
-        glTexImage2D(
-            GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, None
-        )
+        if EXTENDED_UI:
+            if self.display_gl_tex is None:
+                self.display_gl_tex = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, self.display_gl_tex)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+            glTexImage2D(
+                GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, None
+            )
+
+    def blit_to_surface(self, cmd, surface_tex):
+        """Blit the rendered output to a swapchain surface texture (slim mode)."""
+        src = self.splat_output_tex if self.use_splatting else self.screen_tex
+        if src is not None:
+            cmd.blit(surface_tex, src)
 
     def check_hot_reload(self):
         try:
@@ -1177,13 +1193,16 @@ class Renderer:
             self.error_msg = str(e)
             print("Shader Compile Error (Safe)")
 
-    def render(self, camera, settings):
+    def render(self, camera, settings, ext_cmd=None):
+        """Render the scene. If ext_cmd is provided, record commands onto it
+        instead of creating/submitting our own (used by slim app to avoid
+        swapchain semaphore conflicts)."""
         if self.debug_mode > 0:
             self.render_debug(camera)
         elif self.use_splatting:
-            self.render_splat(camera, settings)
+            self.render_splat(camera, settings, ext_cmd=ext_cmd)
         else:
-            self.render_main(camera, settings)
+            self.render_main(camera, settings, ext_cmd=ext_cmd)
 
     def render_debug(self, camera):
         """Debug visualization using raymarcher"""
@@ -1214,7 +1233,7 @@ class Renderer:
 
         self.device.submit_command_buffer(cmd.finish())
 
-    def render_main(self, camera, settings):
+    def render_main(self, camera, settings, ext_cmd=None):
         if not self.pipeline:
             return
 
@@ -1246,7 +1265,8 @@ class Renderer:
 
         self.settings_buffer.copy_from_numpy(s_data)
 
-        cmd = self.device.create_command_encoder()
+        own_cmd = ext_cmd is None
+        cmd = self.device.create_command_encoder() if own_cmd else ext_cmd
         cmd.set_texture_state(self.volume_tex, spy.ResourceState.shader_resource)
 
         with cmd.begin_render_pass(
@@ -1274,7 +1294,8 @@ class Renderer:
             )
             rp.draw({"vertex_count": 3})
 
-        self.device.submit_command_buffer(cmd.finish())
+        if own_cmd:
+            self.device.submit_command_buffer(cmd.finish())
 
     def update_display(self):
         pixels = self.screen_tex.to_numpy()  # already RGBA8, no clip/cast needed
@@ -1453,8 +1474,10 @@ class Renderer:
                 label="SplatOutput",
             )
 
-    def render_splat(self, camera, settings):
-        """Render gaussians via volumetric splatting."""
+    def render_splat(self, camera, settings, ext_cmd=None):
+        """Render gaussians via volumetric splatting.
+        If ext_cmd is provided, passes 2-4 are recorded onto it (no submit).
+        Pass 1 always uses its own encoder because it requires a CPU readback."""
         if self.gaussian_count == 0:
             return
 
@@ -1487,13 +1510,12 @@ class Renderer:
         tile_res = self.splat_tile_res
         total_tiles = tile_res[0] * tile_res[1]
 
-        cmd = self.device.create_command_encoder()
-
         vol_min = tuple(self._vol_min)
         vol_max = tuple(self._vol_max)
 
-        # Pass 1: Project gaussians
-        with cmd.begin_compute_pass() as cp:
+        # Pass 1: Project gaussians (always own encoder — needs CPU readback)
+        cmd1 = self.device.create_command_encoder()
+        with cmd1.begin_compute_pass() as cp:
             cursor = spy.ShaderCursor(cp.bind_pipeline(self.pipe_splat_project))
             cursor["gGaussians"] = self.gaussian_buffer
             cursor["gCamera"] = self.cam_buffer
@@ -1508,8 +1530,7 @@ class Renderer:
             cursor["SplatParams"]["volumeMax"] = vol_max
             cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
 
-        # Submit and read back depths for CPU sorting
-        self.device.submit_command_buffer(cmd.finish())
+        self.device.submit_command_buffer(cmd1.finish())
 
         # Read projected data to get depths for sorting
         projected_data = self.splat_projected_buf.to_numpy()
@@ -1523,7 +1544,9 @@ class Renderer:
 
         self.splat_sorted_indices_buf.copy_from_numpy(sorted_indices)
 
-        cmd = self.device.create_command_encoder()
+        # Passes 2-4: use ext_cmd if provided, else own encoder
+        own_cmd = ext_cmd is None
+        cmd = self.device.create_command_encoder() if own_cmd else ext_cmd
 
         # Pass 2: Clear screen tiles
         with cmd.begin_compute_pass() as cp:
@@ -1574,7 +1597,8 @@ class Renderer:
             cursor["SplatParams"]["volumeMax"] = vol_max
             cp.dispatch(thread_count=(self.width, self.height, 1))
 
-        self.device.submit_command_buffer(cmd.finish())
+        if own_cmd:
+            self.device.submit_command_buffer(cmd.finish())
 
     def update_display_splat(self):
         """Read splatting output and upload to GL for display."""
@@ -2605,9 +2629,438 @@ class App:
 
 
 # ==========================================
+# SLIM APP (slangpy-native, no OpenGL/imgui)
+# ==========================================
+
+
+class SlimApp(spy.AppWindow):
+    """Lightweight app using slangpy's native Vulkan window and UI."""
+
+    def __init__(self, app):
+        super().__init__(
+            app,
+            width=WINDOW_WIDTH,
+            height=WINDOW_HEIGHT,
+            title=WINDOW_TITLE,
+            enable_vsync=False,
+        )
+
+        self._app = app
+        self._width = WINDOW_WIDTH
+        self._height = WINDOW_HEIGHT
+
+        self.is_training = False
+        self.settings = Settings()
+        self.camera = Camera(self._width, self._height)
+        self.train_config = TrainingConfig()
+
+        # Use the device from AppWindow (created in entry point and passed via spy.App)
+        self._device = self.device
+
+        self.grid = load_vdb_grid(VDB_FILE)
+        self.vdb_up_axis = VDB_UP_AXIS
+        self.vol_min_world, self.vol_max_world, vol_data, self.axis_remap = (
+            convert_grid_to_dense_volume(
+                self.grid, VOL_SIZE, up_axis_name=self.vdb_up_axis
+            )
+        )
+        self.gaussians = convert_grid_to_gaussians(
+            self.grid, self.train_config, self.axis_remap
+        )
+
+        self.renderer = Renderer(self._device, vol_data)
+        self.renderer.resize(self._width, self._height)
+        self.renderer.gaussian_count = len(self.gaussians)
+        self.renderer.gaussian_buffer = self._device.create_buffer(
+            element_count=self.renderer.gaussian_count,
+            struct_size=PARAMS_PER_GAUSSIAN * 4,
+            usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+            memory_type=spy.MemoryType.device_local,
+            data=self.gaussians,
+        )
+        self.renderer._vol_min = self.vol_min_world
+        self.renderer._vol_max = self.vol_max_world
+        self.renderer.init_training()
+
+        cmd = self._device.create_command_encoder()
+        self.renderer.rasterize_gaussians(
+            cmd, self.vol_min_world, self.vol_max_world
+        )
+        self._device.submit_command_buffer(cmd.finish())
+
+        self.adc = ADCController(self, ADCConfig())
+        self.adc.train_config = self.train_config
+
+        self.sgld_diag = SGLDDiagnostics(self)
+        self.train_step = 0
+
+        # Input state
+        self._keys_down = set()
+        self._right_mouse_down = False
+        self._last_mouse_pos = None
+
+        # Timing
+        self._last_time = time.perf_counter()
+        self._frame_count = 0
+        self._fps = 0.0
+        self._fps_timer = 0.0
+        self._fps_frames = 0
+
+        # Build UI
+        self._build_ui()
+
+    def _build_ui(self):
+        """Create spy.ui widgets for minimal controls."""
+        screen = self.screen
+        win = sui.Window(screen, title="Controls", size=spy.math.float2(300, 500))
+
+        self._ui_fps = sui.Text(win, text="FPS: --")
+        self._ui_gauss_count = sui.Text(
+            win, text=f"Gaussians: {self.renderer.gaussian_count:,}"
+        )
+
+        sui.Text(win, text="--- Render ---")
+        self._ui_splatting = sui.CheckBox(
+            win, label="Splatting Mode", value=self.renderer.use_splatting,
+            callback=self._on_splatting_toggle,
+        )
+        self._ui_gauss_vol = sui.CheckBox(
+            win, label="Gaussian Volume", value=self.renderer.use_gaussian_volume,
+            callback=self._on_gauss_vol_toggle,
+        )
+        self._ui_density = sui.SliderFloat(
+            win, label="Density Scale", value=self.settings.density_scale,
+            min=0.1, max=200.0,
+            callback=self._on_density_change,
+        )
+        self._ui_light_pen = sui.SliderFloat(
+            win, label="Light Penetration", value=self.settings.light_penetration,
+            min=0.0, max=1.0,
+            callback=self._on_light_pen_change,
+        )
+
+        sui.Text(win, text="--- Training ---")
+        self._ui_train_btn = sui.Button(
+            win, label="Start Training", callback=self._on_train_toggle
+        )
+        self._ui_train_step = sui.Text(win, text="Step: 0")
+        self._ui_lr_pos = sui.SliderFloat(
+            win, label="LR Position", value=self.train_config.learning_rate_pos,
+            min=0.001, max=1.0, format="%.4f",
+            callback=lambda v: setattr(self.train_config, 'learning_rate_pos', v),
+        )
+        self._ui_lr_weight = sui.SliderFloat(
+            win, label="LR Weight", value=self.train_config.learning_rate_weight,
+            min=0.001, max=1.0, format="%.4f",
+            callback=lambda v: setattr(self.train_config, 'learning_rate_weight', v),
+        )
+        self._ui_lr_scale = sui.SliderFloat(
+            win, label="LR Scale", value=self.train_config.learning_rate_scale,
+            min=0.0001, max=0.1, format="%.5f",
+            callback=lambda v: setattr(self.train_config, 'learning_rate_scale', v),
+        )
+
+        sui.Text(win, text="--- Gaussians ---")
+        self._ui_target_count = sui.SliderInt(
+            win, label="Target Count", value=self.train_config.target_count,
+            min=500, max=50000,
+            callback=lambda v: setattr(self.train_config, 'target_count', v),
+        )
+        sui.Button(
+            win, label="Regenerate Gaussians", callback=self._on_regenerate
+        )
+
+    # ---- UI callbacks ----
+
+    def _on_splatting_toggle(self, val):
+        self.renderer.use_splatting = val
+
+    def _on_gauss_vol_toggle(self, val):
+        self.renderer.use_gaussian_volume = val
+        if val:
+            self.renderer._needs_rasterization = True
+
+    def _on_density_change(self, val):
+        self.settings.density_scale = val
+
+    def _on_light_pen_change(self, val):
+        self.settings.light_penetration = val
+
+    def _on_train_toggle(self):
+        self.is_training = not self.is_training
+        self._ui_train_btn.label = (
+            "Stop Training" if self.is_training else "Start Training"
+        )
+        if self.is_training:
+            print("[SlimApp] Training started")
+        else:
+            print("[SlimApp] Training stopped")
+
+    def _on_regenerate(self):
+        was_training = self.is_training
+        self.is_training = False
+        self.train_config.gaussian_mode = "count"
+
+        self.gaussians = convert_grid_to_gaussians(
+            self.grid, self.train_config, self.axis_remap
+        )
+        self.renderer.gaussian_count = len(self.gaussians)
+        self.renderer.gaussian_buffer = self._device.create_buffer(
+            element_count=self.renderer.gaussian_count,
+            struct_size=PARAMS_PER_GAUSSIAN * 4,
+            usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+            memory_type=spy.MemoryType.device_local,
+            data=self.gaussians,
+        )
+        self.renderer.init_training()
+        self.renderer._needs_rebinning = True
+        self.renderer._needs_rasterization = True
+        self.renderer.adam_iteration = 1
+        self.train_step = 0
+
+        cmd = self._device.create_command_encoder()
+        self.renderer.rasterize_gaussians(
+            cmd, self.vol_min_world, self.vol_max_world
+        )
+        self._device.submit_command_buffer(cmd.finish())
+
+        self._ui_gauss_count.text = f"Gaussians: {self.renderer.gaussian_count:,}"
+        self._ui_train_step.text = "Step: 0"
+        print(f"[SlimApp] Regenerated {self.renderer.gaussian_count:,} gaussians")
+
+        if was_training:
+            self.is_training = True
+
+    # ---- Densification support (needed by ADC) ----
+
+    def apply_densification(self, new_params, surviving_indices=None):
+        """Same as App.apply_densification — needed by ADCController."""
+        new_params = np.ascontiguousarray(new_params, dtype=np.float32)
+        if new_params.ndim == 2:
+            new_params = new_params.reshape(-1, PARAMS_PER_GAUSSIAN)
+        flat_params = new_params.flatten()
+
+        if len(new_params) == 0:
+            print("[ADC] Warning: 0 Gaussians, skipping apply")
+            return
+
+        saved_iteration = self.renderer.adam_iteration
+
+        if surviving_indices is not None:
+            try:
+                old_m1 = (
+                    self.renderer.adam_first_moment.to_numpy()
+                    .view(np.float32).reshape(-1, PARAMS_PER_GAUSSIAN).copy()
+                )
+                old_m2 = (
+                    self.renderer.adam_second_moment.to_numpy()
+                    .view(np.float32).reshape(-1, PARAMS_PER_GAUSSIAN).copy()
+                )
+            except Exception as e:
+                print(f"[ADC] Could not read momentum buffers: {e}")
+                old_m1 = old_m2 = None
+        else:
+            old_m1 = old_m2 = None
+
+        self.gaussians = new_params
+        self.renderer.gaussian_count = len(new_params)
+        self.renderer.gaussian_buffer = self._device.create_buffer(
+            element_count=len(new_params),
+            struct_size=PARAMS_PER_GAUSSIAN * 4,
+            usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+            memory_type=spy.MemoryType.device_local,
+            data=flat_params,
+        )
+        self.renderer.init_training()
+        self.renderer.adam_iteration = saved_iteration
+
+        if surviving_indices is not None and old_m1 is not None:
+            try:
+                n_new = len(new_params)
+                new_m1 = np.zeros((n_new, PARAMS_PER_GAUSSIAN), dtype=np.float32)
+                new_m2 = np.zeros((n_new, PARAMS_PER_GAUSSIAN), dtype=np.float32)
+                for i, src in enumerate(surviving_indices):
+                    if i >= n_new:
+                        break
+                    if src >= 0 and src < len(old_m1):
+                        new_m1[i] = old_m1[src]
+                        new_m2[i] = old_m2[src]
+                self.renderer.adam_first_moment.copy_from_numpy(new_m1.flatten())
+                self.renderer.adam_second_moment.copy_from_numpy(new_m2.flatten())
+            except Exception as e:
+                print(f"[ADC] Momentum restore failed (non-fatal): {e}")
+
+        self.renderer._needs_rebinning = True
+        self.renderer._needs_rasterization = True
+        self._ui_gauss_count.text = f"Gaussians: {len(new_params):,}"
+        print(f"[ADC] Buffer rebuilt: {len(new_params):,} Gaussians")
+
+    def compute_current_loss(self):
+        if self.renderer.use_gaussian_volume:
+            vol = self.renderer.gaussian_volume_tex.to_numpy()
+        else:
+            cmd = self._device.create_command_encoder()
+            self.renderer.rasterize_gaussians(
+                cmd, self.vol_min_world, self.vol_max_world
+            )
+            self._device.submit_command_buffer(cmd.finish())
+            vol = self.renderer.gaussian_volume_tex.to_numpy()
+        ref = self.renderer.volume_tex.to_numpy()
+        diff = vol - ref
+        return np.mean(diff * diff)
+
+    # ---- Input ----
+
+    def on_keyboard_event(self, event):
+        if event.is_key_press() or event.is_key_repeat():
+            self._keys_down.add(event.key)
+            # Toggle shortcuts
+            if event.is_key_press():
+                if event.key == spy.KeyCode.space:
+                    self._on_train_toggle()
+                elif event.key == spy.KeyCode.t:
+                    self.renderer.use_splatting = not self.renderer.use_splatting
+                    self._ui_splatting.value = self.renderer.use_splatting
+                    print(f"Splatting: {self.renderer.use_splatting}")
+                elif event.key == spy.KeyCode.g:
+                    self.renderer.use_gaussian_volume = not self.renderer.use_gaussian_volume
+                    self._ui_gauss_vol.value = self.renderer.use_gaussian_volume
+                    if self.renderer.use_gaussian_volume:
+                        self.renderer._needs_rasterization = True
+                    print(f"Gaussian Volume: {self.renderer.use_gaussian_volume}")
+        elif event.is_key_release():
+            self._keys_down.discard(event.key)
+
+    def on_mouse_event(self, event):
+        if event.is_button_down() and event.button == spy.MouseButton.right:
+            self._right_mouse_down = True
+            self.camera.first_mouse = True
+            self.camera.is_dragging = True
+        elif event.is_button_up() and event.button == spy.MouseButton.right:
+            self._right_mouse_down = False
+            self.camera.is_dragging = False
+        elif event.is_move() and self._right_mouse_down:
+            x, y = event.pos.x, event.pos.y
+            self.camera.process_mouse(x, y)
+
+    def _process_movement(self, dt):
+        speed = self.camera.speed * dt
+        if spy.KeyCode.w in self._keys_down:
+            self.camera.pos += self.camera.front * speed
+        if spy.KeyCode.s in self._keys_down:
+            self.camera.pos -= self.camera.front * speed
+        if spy.KeyCode.a in self._keys_down:
+            self.camera.pos -= self.camera.right * speed
+        if spy.KeyCode.d in self._keys_down:
+            self.camera.pos += self.camera.right * speed
+        if spy.KeyCode.q in self._keys_down:
+            self.camera.pos += self.camera.up * speed
+        if spy.KeyCode.e in self._keys_down:
+            self.camera.pos -= self.camera.up * speed
+
+    def on_resize(self, width, height):
+        if width == 0 or height == 0:
+            return
+        self._device.wait_for_idle()
+        self._width = width
+        self._height = height
+        self.renderer.resize(width, height)
+
+    # ---- Main render callback ----
+
+    def render(self, render_context):
+        now = time.perf_counter()
+        dt = now - self._last_time
+        self._last_time = now
+
+        # FPS counter
+        self._fps_timer += dt
+        self._fps_frames += 1
+        if self._fps_timer >= 0.5:
+            self._fps = self._fps_frames / self._fps_timer
+            self._ui_fps.text = f"FPS: {self._fps:.1f}"
+            self._fps_timer = 0.0
+            self._fps_frames = 0
+
+        self._process_movement(dt)
+        self.renderer.check_hot_reload()
+
+        # Training
+        if self.is_training:
+            self.renderer.run_training_step(
+                self.vol_min_world, self.vol_max_world, self.train_config
+            )
+            self.train_step += 1
+
+            if self.train_step == 100:
+                self.sgld_diag.snapshot()
+            if self.train_step % 500 == 0 and self.train_step > 100:
+                self.sgld_diag.tick()
+
+            if self.train_step % 100 == 0:
+                self._ui_train_step.text = f"Step: {self.train_step}"
+                tile_debug = self.renderer.tile_counts.to_numpy().view(dtype=np.uint32)
+                total_refs = np.sum(tile_debug)
+                grad_bytes = self.renderer.grad_buffer.to_numpy()
+                grad_all = grad_bytes.view(dtype=np.float32).reshape(
+                    -1, PARAMS_PER_GAUSSIAN
+                )
+                grad_max = np.max(np.abs(grad_all))
+                if total_refs == 0:
+                    print(f"[CRITICAL] Tiler is empty!")
+                elif grad_max == 0:
+                    print(f"[ALERT] ALL gradients are ZERO.")
+                else:
+                    print(
+                        f"[OK] Step {self.train_step}, Refs: {total_refs}, "
+                        f"GradMax: {grad_max:.6f}"
+                    )
+
+            if self.train_step % 50 == 0:
+                self.renderer.analyze_gradients()
+                loss = self.compute_current_loss()
+                self.renderer.loss_history.append(loss)
+                if len(self.renderer.loss_history) > 200:
+                    self.renderer.loss_history.pop(0)
+
+        self.adc.tick(self._frame_count, self.is_training)
+        self.adc.apply_pending()
+
+        # Rasterize if needed (non-training)
+        if not self.is_training:
+            if self.renderer._needs_rasterization and self.renderer.use_gaussian_volume:
+                cmd = self._device.create_command_encoder()
+                self.renderer.rasterize_gaussians(
+                    cmd, self.vol_min_world, self.vol_max_world
+                )
+                self._device.submit_command_buffer(cmd.finish())
+
+        # Render + blit on the framework's command encoder to avoid
+        # swapchain semaphore conflicts (no extra submit_command_buffer).
+        # Note: splatting pass 1 still does its own submit for CPU depth sort
+        # readback, but passes 2-4 go on this encoder.
+        cmd = render_context.command_encoder
+        self.renderer.render(self.camera, self.settings, ext_cmd=cmd)
+        self.renderer.blit_to_surface(cmd, render_context.surface_texture)
+
+        self._frame_count += 1
+
+
+# ==========================================
 # ENTRY POINT
 # ==========================================
 
 if __name__ == "__main__":
-    app = App()
-    app.run()
+    if EXTENDED_UI:
+        app = App()
+        app.run()
+    else:
+        example_dir = Path(__file__).parent
+        device = spy.Device(
+            enable_debug_layers=True,
+            compiler_options={"include_paths": [example_dir]},
+            type=spy.DeviceType.vulkan,
+        )
+        app = spy.App(device=device)
+        window = SlimApp(app)
+        app.run()
