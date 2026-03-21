@@ -29,7 +29,7 @@ PRINT_TILE_STATS = True  # Print tiling statistics
 PRINT_GRADIENT_STATS = True  # Print gradient statistics
 
 # VDB_FILE = "C:\\Users\\ade0n\\Downloads\\bunny_cloud.vdb"
-VDB_FILE = "cloud_04_variant_0000.vdb"
+VDB_FILE = "cloud_01_variant_0000.vdb"
 # VDB_FILE = "C:\\Users\\ade0n\\Downloads\\TornadoLoopingVDB\\TornadoLooping\\TornadoVDB\\tornado_0109.vdb"
 VOL_SIZE = 196
 VDB_UP_AXIS = "-Z"  # Source VDB up axis: "+Y" (Houdini/Maya), "+Z" (Blender/3dsMax), etc.
@@ -692,6 +692,7 @@ class Renderer:
         )
 
         self.use_gaussian_volume = False
+        self.use_splatting = False  # Splatting render mode
 
         self.gaussian_buffer = None
         self.gaussian_count = 0
@@ -702,6 +703,9 @@ class Renderer:
         self.adam_second_moment = None
 
         self._training_initialized = False
+
+        # Splatting renderer setup
+        self._init_splatting_pipelines()
 
         self.check_hot_reload()
 
@@ -1176,6 +1180,8 @@ class Renderer:
     def render(self, camera, settings):
         if self.debug_mode > 0:
             self.render_debug(camera)
+        elif self.use_splatting:
+            self.render_splat(camera, settings)
         else:
             self.render_main(camera, settings)
 
@@ -1366,6 +1372,233 @@ class Renderer:
             cp.dispatch(thread_count=(VOL_SIZE, VOL_SIZE, VOL_SIZE))
 
         self._needs_rasterization = False
+
+    # ==== Splatting Renderer ====
+
+    SPLAT_TILE_SIZE = 16
+    MAX_GAUSSIANS_PER_SCREEN_TILE = 512
+
+    def _init_splatting_pipelines(self):
+        self.pipe_splat_project = self.device.create_compute_pipeline(
+            program=self.device.load_program("shaders/splatting.slang", ["project_gaussians"])
+        )
+        self.pipe_splat_clear_tiles = self.device.create_compute_pipeline(
+            program=self.device.load_program("shaders/splatting.slang", ["clear_screen_tiles"])
+        )
+        self.pipe_splat_tile_assign = self.device.create_compute_pipeline(
+            program=self.device.load_program("shaders/splatting.slang", ["tile_assign_screen"])
+        )
+        self.pipe_splat_render = self.device.create_compute_pipeline(
+            program=self.device.load_program("shaders/splatting.slang", ["render_splats"])
+        )
+
+        self.splat_output_tex = None
+        self.splat_projected_buf = None
+        self.splat_sorted_indices_buf = None
+        self.splat_tile_content_buf = None
+        self.splat_tile_counts_buf = None
+        self.splat_tile_res = (0, 0)
+
+    def _ensure_splat_buffers(self):
+        """Create/recreate splatting buffers when gaussian count or screen size changes."""
+        if self.gaussian_count == 0:
+            return
+
+        # Projected gaussians buffer — flat float array (11 floats per gaussian)
+        proj_floats = self.gaussian_count * 11
+        if self.splat_projected_buf is None or self.splat_projected_buf.size < proj_floats * 4:
+            self.splat_projected_buf = self.device.create_buffer(
+                element_count=proj_floats,
+                struct_size=4,
+                usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
+                memory_type=spy.MemoryType.device_local,
+            )
+
+        # Sorted indices buffer
+        if self.splat_sorted_indices_buf is None or self.splat_sorted_indices_buf.size < self.gaussian_count * 4:
+            self.splat_sorted_indices_buf = self.device.create_buffer(
+                element_count=self.gaussian_count,
+                struct_size=4,
+                usage=spy.BufferUsage.shader_resource,
+                memory_type=spy.MemoryType.upload,
+            )
+
+        # Screen tile buffers
+        tile_res_x = (self.width + self.SPLAT_TILE_SIZE - 1) // self.SPLAT_TILE_SIZE
+        tile_res_y = (self.height + self.SPLAT_TILE_SIZE - 1) // self.SPLAT_TILE_SIZE
+        total_tiles = tile_res_x * tile_res_y
+
+        if self.splat_tile_res != (tile_res_x, tile_res_y):
+            self.splat_tile_res = (tile_res_x, tile_res_y)
+            self.splat_tile_content_buf = self.device.create_buffer(
+                element_count=total_tiles * self.MAX_GAUSSIANS_PER_SCREEN_TILE,
+                struct_size=4,
+                usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
+                memory_type=spy.MemoryType.device_local,
+            )
+            self.splat_tile_counts_buf = self.device.create_buffer(
+                element_count=total_tiles,
+                struct_size=4,
+                usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
+                memory_type=spy.MemoryType.device_local,
+            )
+
+        # Output texture
+        if self.splat_output_tex is None or self.splat_output_tex.width != self.width or self.splat_output_tex.height != self.height:
+            self.splat_output_tex = self.device.create_texture(
+                format=spy.Format.rgba8_unorm,
+                width=self.width,
+                height=self.height,
+                usage=spy.TextureUsage.unordered_access | spy.TextureUsage.shader_resource,
+                label="SplatOutput",
+            )
+
+    def render_splat(self, camera, settings):
+        """Render gaussians via volumetric splatting."""
+        if self.gaussian_count == 0:
+            return
+
+        self._ensure_splat_buffers()
+
+        aspect = self.width / self.height
+        cam_data = camera.get_gpu_data(aspect)
+        self.cam_buffer.copy_from_numpy(cam_data)
+
+        # Pack settings for splatting (reuse same layout as raymarcher)
+        s_data = np.zeros(24, dtype=np.float32)
+        s_data[0] = settings.step_size
+        s_data[1] = settings.density_scale
+        s_data[2] = settings.density_curve
+        s_data[3] = float(settings.step_count)
+        s_data[4:7] = settings.smoke_color
+        s_data[7] = settings.light_penetration
+        s_data[8] = settings.phase_g
+        s_data[9:12] = settings.get_sun_dir()
+        s_data[12] = settings.sun_color_base[0] * settings.sun_intensity
+        s_data[13] = settings.sun_color_base[1] * settings.sun_intensity
+        s_data[14] = settings.sun_color_base[2] * settings.sun_intensity
+        s_data[15] = settings.ambient_color_base[0] * settings.ambient_intensity
+        s_data[16] = settings.ambient_color_base[1] * settings.ambient_intensity
+        s_data[17] = settings.ambient_color_base[2] * settings.ambient_intensity
+        s_data[18] = float(settings.shadow_steps)
+        s_data[19] = settings.shadow_step_mult
+        self.settings_buffer.copy_from_numpy(s_data)
+
+        tile_res = self.splat_tile_res
+        total_tiles = tile_res[0] * tile_res[1]
+
+        cmd = self.device.create_command_encoder()
+
+        vol_min = tuple(self._vol_min)
+        vol_max = tuple(self._vol_max)
+
+        # Pass 1: Project gaussians
+        with cmd.begin_compute_pass() as cp:
+            cursor = spy.ShaderCursor(cp.bind_pipeline(self.pipe_splat_project))
+            cursor["gGaussians"] = self.gaussian_buffer
+            cursor["gCamera"] = self.cam_buffer
+            cursor["gSettings"] = self.settings_buffer
+            cursor["gProjected"] = self.splat_projected_buf
+            cursor["SplatParams"]["gaussianCount"] = self.gaussian_count
+            cursor["SplatParams"]["screenWidth"] = self.width
+            cursor["SplatParams"]["screenHeight"] = self.height
+            cursor["SplatParams"]["tileResolution"] = tile_res
+            cursor["SplatParams"]["densityScale"] = settings.density_scale
+            cursor["SplatParams"]["volumeMin"] = vol_min
+            cursor["SplatParams"]["volumeMax"] = vol_max
+            cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
+
+        # Submit and read back depths for CPU sorting
+        self.device.submit_command_buffer(cmd.finish())
+
+        # Read projected data to get depths for sorting
+        projected_data = self.splat_projected_buf.to_numpy()
+        projected_floats = projected_data.view(np.float32).reshape(self.gaussian_count, 11)
+        depths = projected_floats[:, 2].copy()  # PROJ_DEPTH = index 2
+
+        # Sort by depth (front to back), invalid (depth < 0) go to end
+        valid_mask = depths > 0
+        sort_keys = np.where(valid_mask, depths, np.float32(1e30))
+        sorted_indices = np.argsort(sort_keys).astype(np.uint32)
+
+        self.splat_sorted_indices_buf.copy_from_numpy(sorted_indices)
+
+        cmd = self.device.create_command_encoder()
+
+        # Pass 2: Clear screen tiles
+        with cmd.begin_compute_pass() as cp:
+            cursor = spy.ShaderCursor(cp.bind_pipeline(self.pipe_splat_clear_tiles))
+            cursor["gScreenTileCounts"] = self.splat_tile_counts_buf
+            cursor["SplatParams"]["gaussianCount"] = self.gaussian_count
+            cursor["SplatParams"]["screenWidth"] = self.width
+            cursor["SplatParams"]["screenHeight"] = self.height
+            cursor["SplatParams"]["tileResolution"] = tile_res
+            cursor["SplatParams"]["densityScale"] = settings.density_scale
+            cursor["SplatParams"]["volumeMin"] = vol_min
+            cursor["SplatParams"]["volumeMax"] = vol_max
+            cp.dispatch(thread_count=(total_tiles, 1, 1))
+
+        # Pass 3: Tile assignment (sorted order)
+        with cmd.begin_compute_pass() as cp:
+            cursor = spy.ShaderCursor(cp.bind_pipeline(self.pipe_splat_tile_assign))
+            cursor["gProjected"] = self.splat_projected_buf
+            cursor["gSortedIndices"] = self.splat_sorted_indices_buf
+            cursor["gScreenTileContent"] = self.splat_tile_content_buf
+            cursor["gScreenTileCounts"] = self.splat_tile_counts_buf
+            cursor["SplatParams"]["gaussianCount"] = self.gaussian_count
+            cursor["SplatParams"]["screenWidth"] = self.width
+            cursor["SplatParams"]["screenHeight"] = self.height
+            cursor["SplatParams"]["tileResolution"] = tile_res
+            cursor["SplatParams"]["densityScale"] = settings.density_scale
+            cursor["SplatParams"]["volumeMin"] = vol_min
+            cursor["SplatParams"]["volumeMax"] = vol_max
+            cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
+
+        # Pass 4: Render splats — clear the output texture first
+        cmd.clear_texture_float(self.splat_output_tex)
+        cmd.set_texture_state(self.splat_output_tex, spy.ResourceState.unordered_access)
+        with cmd.begin_compute_pass() as cp:
+            cursor = spy.ShaderCursor(cp.bind_pipeline(self.pipe_splat_render))
+            cursor["gProjected"] = self.splat_projected_buf
+            cursor["gScreenTileContent"] = self.splat_tile_content_buf
+            cursor["gScreenTileCounts"] = self.splat_tile_counts_buf
+            cursor["gCamera"] = self.cam_buffer
+            cursor["gSettings"] = self.settings_buffer
+            cursor["gOutputTexture"] = self.splat_output_tex
+            cursor["SplatParams"]["gaussianCount"] = self.gaussian_count
+            cursor["SplatParams"]["screenWidth"] = self.width
+            cursor["SplatParams"]["screenHeight"] = self.height
+            cursor["SplatParams"]["tileResolution"] = tile_res
+            cursor["SplatParams"]["densityScale"] = settings.density_scale
+            cursor["SplatParams"]["volumeMin"] = vol_min
+            cursor["SplatParams"]["volumeMax"] = vol_max
+            cp.dispatch(thread_count=(self.width, self.height, 1))
+
+        self.device.submit_command_buffer(cmd.finish())
+
+    def update_display_splat(self):
+        """Read splatting output and upload to GL for display."""
+        pixels = self.splat_output_tex.to_numpy()
+        glBindTexture(GL_TEXTURE_2D, self.display_gl_tex)
+        glTexSubImage2D(
+            GL_TEXTURE_2D, 0, 0, 0,
+            self.width, self.height,
+            GL_RGBA, GL_UNSIGNED_BYTE, pixels,
+        )
+
+        fb = glGenFramebuffers(1)
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fb)
+        glFramebufferTexture2D(
+            GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D, self.display_gl_tex, 0,
+        )
+        glBlitFramebuffer(
+            0, 0, self.width, self.height,
+            0, 0, self.width, self.height,
+            GL_COLOR_BUFFER_BIT, GL_NEAREST,
+        )
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0)
+        glDeleteFramebuffers(1, [fb])
 
 
 # ==========================================
@@ -1625,7 +1858,10 @@ class App:
                     self.device.submit_command_buffer(cmd.finish())
 
             self.renderer.render(self.camera, self.settings)
-            self.renderer.update_display()
+            if self.renderer.use_splatting:
+                self.renderer.update_display_splat()
+            else:
+                self.renderer.update_display()
 
             frame_count += 1
 
@@ -1752,6 +1988,14 @@ class App:
             _, self.renderer.use_gaussian_volume = imgui.checkbox(
                 "Render Gaussian Volume", self.renderer.use_gaussian_volume
             )
+            _, self.renderer.use_splatting = imgui.checkbox(
+                "Splatting Mode (3DGS)", self.renderer.use_splatting
+            )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Render via volumetric gaussian splatting instead of raymarching.\n"
+                    "Uses closed-form ray integral for physically-based volumetric opacity."
+                )
 
         imgui.end()
 
