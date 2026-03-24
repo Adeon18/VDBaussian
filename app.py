@@ -10,7 +10,7 @@ import time
 # ==========================================
 # UI MODE: Set to False for slim slangpy-native window (no OpenGL/imgui)
 # ==========================================
-EXTENDED_UI = False
+EXTENDED_UI = True
 
 if EXTENDED_UI:
     import glfw
@@ -177,6 +177,13 @@ class Settings:
 
         self.shadow_steps = 6
         self.shadow_step_mult = 4.0
+
+        # Splatting-specific
+        self.shadow_strength = 1.0        # multiplier on self-shadow (1.0 = physical)
+        self.splat_softness = 0.3         # low-pass filter on 2D covariance (higher = softer edges)
+        self.enable_blur = False          # screen-space blur post-process
+        self.blur_radius = 2             # blur kernel half-size (1-4 pixels, only used when enable_blur=True)
+        self.use_depth_darkening = False   # view-dependent depth darkening
 
     def get_sun_dir(self):
         return self.sun_direction
@@ -1135,6 +1142,7 @@ class Renderer:
         self.device.submit_command_buffer(cmd.finish())
         self._needs_rebinning = True
         self._needs_rasterization = True
+        self._cached_light_dir = None  # invalidate light cache after training step
         self.debug_needs_update = True
 
         # SGD uses this as welll
@@ -1397,11 +1405,29 @@ class Renderer:
     # ==== Splatting Renderer ====
 
     SPLAT_TILE_SIZE = 16
-    MAX_GAUSSIANS_PER_SCREEN_TILE = 512
+    MAX_GAUSSIANS_PER_SCREEN_TILE = 2048
 
     def _init_splatting_pipelines(self):
         self.pipe_splat_project = self.device.create_compute_pipeline(
             program=self.device.load_program("shaders/splatting.slang", ["project_gaussians"])
+        )
+        self.pipe_splat_init_sort_light = self.device.create_compute_pipeline(
+            program=self.device.load_program("shaders/splatting.slang", ["init_sort_keys_light"])
+        )
+        self.pipe_splat_local_sort = self.device.create_compute_pipeline(
+            program=self.device.load_program("shaders/splatting.slang", ["local_bitonic_sort"])
+        )
+        self.pipe_splat_global_merge = self.device.create_compute_pipeline(
+            program=self.device.load_program("shaders/splatting.slang", ["global_bitonic_merge"])
+        )
+        self.pipe_splat_local_merge_finish = self.device.create_compute_pipeline(
+            program=self.device.load_program("shaders/splatting.slang", ["local_merge_finish"])
+        )
+        self.pipe_splat_compute_tau = self.device.create_compute_pipeline(
+            program=self.device.load_program("shaders/splatting.slang", ["compute_gaussian_tau"])
+        )
+        self.pipe_splat_scan_transmittance = self.device.create_compute_pipeline(
+            program=self.device.load_program("shaders/splatting.slang", ["scan_transmittance"])
         )
         self.pipe_splat_clear_tiles = self.device.create_compute_pipeline(
             program=self.device.load_program("shaders/splatting.slang", ["clear_screen_tiles"])
@@ -1412,13 +1438,25 @@ class Renderer:
         self.pipe_splat_render = self.device.create_compute_pipeline(
             program=self.device.load_program("shaders/splatting.slang", ["render_splats"])
         )
+        self.pipe_splat_blur = self.device.create_compute_pipeline(
+            program=self.device.load_program("shaders/splatting.slang", ["blur_splats"])
+        )
 
         self.splat_output_tex = None
         self.splat_projected_buf = None
         self.splat_sorted_indices_buf = None
+        self.splat_sort_keys_buf = None
         self.splat_tile_content_buf = None
         self.splat_tile_counts_buf = None
+        self.splat_light_transmittance_buf = None
+        self.splat_blur_tex = None
         self.splat_tile_res = (0, 0)
+        self._splat_sort_count = 0
+        self._cached_light_dir = None
+        self._cached_light_pen = None
+        self._cached_density_scale = None
+        self._cached_shadow_strength = None
+        self._cached_gaussian_count = None
 
     def _ensure_splat_buffers(self):
         """Create/recreate splatting buffers when gaussian count or screen size changes."""
@@ -1435,13 +1473,29 @@ class Renderer:
                 memory_type=spy.MemoryType.device_local,
             )
 
-        # Sorted indices buffer
-        if self.splat_sorted_indices_buf is None or self.splat_sorted_indices_buf.size < self.gaussian_count * 4:
+        # Sort buffers — padded to next power of 2 for bitonic sort
+        sort_count = 1
+        while sort_count < self.gaussian_count:
+            sort_count <<= 1
+        if self._splat_sort_count != sort_count:
+            self._splat_sort_count = sort_count
             self.splat_sorted_indices_buf = self.device.create_buffer(
+                element_count=sort_count,
+                struct_size=4,
+                usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
+                memory_type=spy.MemoryType.device_local,
+            )
+            self.splat_sort_keys_buf = self.device.create_buffer(
+                element_count=sort_count,
+                struct_size=4,
+                usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
+                memory_type=spy.MemoryType.device_local,
+            )
+            self.splat_light_transmittance_buf = self.device.create_buffer(
                 element_count=self.gaussian_count,
                 struct_size=4,
-                usage=spy.BufferUsage.shader_resource,
-                memory_type=spy.MemoryType.upload,
+                usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
+                memory_type=spy.MemoryType.device_local,
             )
 
         # Screen tile buffers
@@ -1473,11 +1527,53 @@ class Renderer:
                 usage=spy.TextureUsage.unordered_access | spy.TextureUsage.shader_resource,
                 label="SplatOutput",
             )
+            self.splat_blur_tex = self.device.create_texture(
+                format=spy.Format.rgba8_unorm,
+                width=self.width,
+                height=self.height,
+                usage=spy.TextureUsage.unordered_access | spy.TextureUsage.shader_resource,
+                label="SplatBlurTemp",
+            )
+
+    def _dispatch_sort(self, cmd, sort_count, num_sort_groups, LOCAL_SORT_SIZE):
+        """Dispatch local bitonic sort + global merge passes (reused for light and camera sorts)."""
+        with cmd.begin_compute_pass() as cp:
+            cursor = spy.ShaderCursor(cp.bind_pipeline(self.pipe_splat_local_sort))
+            cursor["gSortKeys"] = self.splat_sort_keys_buf
+            cursor["gSortedIndices"] = self.splat_sorted_indices_buf
+            cursor["SortParams"]["sortCount"] = sort_count
+            cursor["SortParams"]["blockSize"] = 0
+            cursor["SortParams"]["subBlockSize"] = 0
+            cp.dispatch(thread_count=(num_sort_groups * 1024, 1, 1))
+
+        if sort_count > LOCAL_SORT_SIZE:
+            block_size = LOCAL_SORT_SIZE * 2
+            while block_size <= sort_count:
+                sub_block = block_size >> 1
+                while sub_block >= LOCAL_SORT_SIZE:
+                    with cmd.begin_compute_pass() as cp:
+                        cursor = spy.ShaderCursor(cp.bind_pipeline(self.pipe_splat_global_merge))
+                        cursor["gSortKeys"] = self.splat_sort_keys_buf
+                        cursor["gSortedIndices"] = self.splat_sorted_indices_buf
+                        cursor["SortParams"]["sortCount"] = sort_count
+                        cursor["SortParams"]["blockSize"] = block_size
+                        cursor["SortParams"]["subBlockSize"] = sub_block
+                        cp.dispatch(thread_count=(sort_count, 1, 1))
+                    sub_block >>= 1
+
+                with cmd.begin_compute_pass() as cp:
+                    cursor = spy.ShaderCursor(cp.bind_pipeline(self.pipe_splat_local_merge_finish))
+                    cursor["gSortKeys"] = self.splat_sort_keys_buf
+                    cursor["gSortedIndices"] = self.splat_sorted_indices_buf
+                    cursor["SortParams"]["sortCount"] = sort_count
+                    cursor["SortParams"]["blockSize"] = block_size
+                    cursor["SortParams"]["subBlockSize"] = 0
+                    cp.dispatch(thread_count=(num_sort_groups * 1024, 1, 1))
+
+                block_size <<= 1
 
     def render_splat(self, camera, settings, ext_cmd=None):
-        """Render gaussians via volumetric splatting.
-        If ext_cmd is provided, passes 2-4 are recorded onto it (no submit).
-        Pass 1 always uses its own encoder because it requires a CPU readback."""
+        """Render gaussians via volumetric splatting — fully GPU, no CPU readback."""
         if self.gaussian_count == 0:
             return
 
@@ -1509,54 +1605,129 @@ class Renderer:
 
         tile_res = self.splat_tile_res
         total_tiles = tile_res[0] * tile_res[1]
+        sort_count = self._splat_sort_count
 
         vol_min = tuple(self._vol_min)
         vol_max = tuple(self._vol_max)
 
-        # Pass 1: Project gaussians (always own encoder — needs CPU readback)
-        cmd1 = self.device.create_command_encoder()
-        with cmd1.begin_compute_pass() as cp:
+        own_cmd = ext_cmd is None
+        cmd = self.device.create_command_encoder() if own_cmd else ext_cmd
+
+        # Pass 1: Project gaussians + init camera sort keys
+        with cmd.begin_compute_pass() as cp:
             cursor = spy.ShaderCursor(cp.bind_pipeline(self.pipe_splat_project))
             cursor["gGaussians"] = self.gaussian_buffer
             cursor["gCamera"] = self.cam_buffer
             cursor["gSettings"] = self.settings_buffer
             cursor["gProjected"] = self.splat_projected_buf
+            cursor["gSortKeys"] = self.splat_sort_keys_buf
+            cursor["gSortedIndices"] = self.splat_sorted_indices_buf
             cursor["SplatParams"]["gaussianCount"] = self.gaussian_count
+            cursor["SplatParams"]["paddedSortCount"] = sort_count
             cursor["SplatParams"]["screenWidth"] = self.width
             cursor["SplatParams"]["screenHeight"] = self.height
+            cursor["SplatParams"]["paddedSortCount"] = sort_count
             cursor["SplatParams"]["tileResolution"] = tile_res
             cursor["SplatParams"]["densityScale"] = settings.density_scale
+            cursor["SplatParams"]["lightPenetration"] = settings.light_penetration
+            cursor["SplatParams"]["shadowStrength"] = settings.shadow_strength
+            cursor["SplatParams"]["splatSoftness"] = settings.splat_softness
+            cursor["SplatParams"]["useDepthDarkening"] = 1 if settings.use_depth_darkening else 0
+            cursor["SplatParams"]["blurRadius"] = settings.blur_radius
             cursor["SplatParams"]["volumeMin"] = vol_min
             cursor["SplatParams"]["volumeMax"] = vol_max
-            cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
+            cp.dispatch(thread_count=(sort_count, 1, 1))
 
-        self.device.submit_command_buffer(cmd1.finish())
+        LOCAL_SORT_SIZE = 4096
+        num_sort_groups = (sort_count + LOCAL_SORT_SIZE - 1) // LOCAL_SORT_SIZE
+        sun_dir = np.array(settings.get_sun_dir(), dtype=np.float32)
+        sun_dir_norm = sun_dir / (np.linalg.norm(sun_dir) + 1e-8)
+        light_dir = tuple(sun_dir_norm.astype(np.float32))
 
-        # Read projected data to get depths for sorting
-        projected_data = self.splat_projected_buf.to_numpy()
-        projected_floats = projected_data.view(np.float32).reshape(self.gaussian_count, 11)
-        depths = projected_floats[:, 2].copy()  # PROJ_DEPTH = index 2
+        # === Light-direction sort + transmittance sweep (cached) ===
+        light_dirty = (
+            self._cached_light_dir != light_dir
+            or self._cached_light_pen != settings.light_penetration
+            or self._cached_density_scale != settings.density_scale
+            or self._cached_shadow_strength != settings.shadow_strength
+            or self._cached_gaussian_count != self.gaussian_count
+        )
 
-        # Sort by depth (front to back), invalid (depth < 0) go to end
-        valid_mask = depths > 0
-        sort_keys = np.where(valid_mask, depths, np.float32(1e30))
-        sorted_indices = np.argsort(sort_keys).astype(np.uint32)
+        if light_dirty:
+            # Init sort keys from light direction
+            with cmd.begin_compute_pass() as cp:
+                cursor = spy.ShaderCursor(cp.bind_pipeline(self.pipe_splat_init_sort_light))
+                cursor["gGaussians"] = self.gaussian_buffer
+                cursor["gSortKeys"] = self.splat_sort_keys_buf
+                cursor["gSortedIndices"] = self.splat_sorted_indices_buf
+                cursor["SplatParams"]["gaussianCount"] = self.gaussian_count
+                cursor["SplatParams"]["paddedSortCount"] = sort_count
+                cursor["SplatParams"]["volumeMin"] = vol_min
+                cursor["SplatParams"]["volumeMax"] = vol_max
+                cursor["SortParams"]["sortCount"] = sort_count
+                cursor["SortParams"]["lightDirX"] = light_dir[0]
+                cursor["SortParams"]["lightDirY"] = light_dir[1]
+                cursor["SortParams"]["lightDirZ"] = light_dir[2]
+                cp.dispatch(thread_count=(sort_count, 1, 1))
 
-        self.splat_sorted_indices_buf.copy_from_numpy(sorted_indices)
+            # Local bitonic sort (light order)
+            self._dispatch_sort(cmd, sort_count, num_sort_groups, LOCAL_SORT_SIZE)
 
-        # Passes 2-4: use ext_cmd if provided, else own encoder
-        own_cmd = ext_cmd is None
-        cmd = self.device.create_command_encoder() if own_cmd else ext_cmd
+            # Parallel: compute per-gaussian tau (one thread per gaussian)
+            with cmd.begin_compute_pass() as cp:
+                cursor = spy.ShaderCursor(cp.bind_pipeline(self.pipe_splat_compute_tau))
+                cursor["gGaussians"] = self.gaussian_buffer
+                cursor["gLightTransmittance"] = self.splat_light_transmittance_buf
+                cursor["SplatParams"]["gaussianCount"] = self.gaussian_count
+                cursor["SplatParams"]["paddedSortCount"] = sort_count
+                cursor["SplatParams"]["densityScale"] = settings.density_scale
+                cursor["SplatParams"]["lightPenetration"] = settings.light_penetration
+                cursor["SplatParams"]["shadowStrength"] = settings.shadow_strength
+                cursor["SplatParams"]["splatSoftness"] = settings.splat_softness
+                cursor["SplatParams"]["useDepthDarkening"] = 1 if settings.use_depth_darkening else 0
+                cursor["SplatParams"]["blurRadius"] = settings.blur_radius
+                cursor["SplatParams"]["volumeMin"] = vol_min
+                cursor["SplatParams"]["volumeMax"] = vol_max
+                cursor["SortParams"]["lightDirX"] = light_dir[0]
+                cursor["SortParams"]["lightDirY"] = light_dir[1]
+                cursor["SortParams"]["lightDirZ"] = light_dir[2]
+                cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
 
-        # Pass 2: Clear screen tiles
+            # Serial scan: prefix sum of taus + exp (lightweight, no matrix math)
+            with cmd.begin_compute_pass() as cp:
+                cursor = spy.ShaderCursor(cp.bind_pipeline(self.pipe_splat_scan_transmittance))
+                cursor["gSortedIndices"] = self.splat_sorted_indices_buf
+                cursor["gLightTransmittance"] = self.splat_light_transmittance_buf
+                cursor["SplatParams"]["gaussianCount"] = self.gaussian_count
+                cursor["SplatParams"]["paddedSortCount"] = sort_count
+                cp.dispatch(thread_count=(1, 1, 1))
+
+            self._cached_light_dir = light_dir
+            self._cached_light_pen = settings.light_penetration
+            self._cached_density_scale = settings.density_scale
+            self._cached_shadow_strength = settings.shadow_strength
+            self._cached_gaussian_count = self.gaussian_count
+
+        # === Camera-depth sort (keys already initialized in projection) ===
+
+        # Local bitonic sort (camera order)
+        self._dispatch_sort(cmd, sort_count, num_sort_groups, LOCAL_SORT_SIZE)
+
+        # Clear screen tiles
         with cmd.begin_compute_pass() as cp:
             cursor = spy.ShaderCursor(cp.bind_pipeline(self.pipe_splat_clear_tiles))
             cursor["gScreenTileCounts"] = self.splat_tile_counts_buf
             cursor["SplatParams"]["gaussianCount"] = self.gaussian_count
+            cursor["SplatParams"]["paddedSortCount"] = sort_count
             cursor["SplatParams"]["screenWidth"] = self.width
             cursor["SplatParams"]["screenHeight"] = self.height
             cursor["SplatParams"]["tileResolution"] = tile_res
             cursor["SplatParams"]["densityScale"] = settings.density_scale
+            cursor["SplatParams"]["lightPenetration"] = settings.light_penetration
+            cursor["SplatParams"]["shadowStrength"] = settings.shadow_strength
+            cursor["SplatParams"]["splatSoftness"] = settings.splat_softness
+            cursor["SplatParams"]["useDepthDarkening"] = 1 if settings.use_depth_darkening else 0
+            cursor["SplatParams"]["blurRadius"] = settings.blur_radius
             cursor["SplatParams"]["volumeMin"] = vol_min
             cursor["SplatParams"]["volumeMax"] = vol_max
             cp.dispatch(thread_count=(total_tiles, 1, 1))
@@ -1569,15 +1740,21 @@ class Renderer:
             cursor["gScreenTileContent"] = self.splat_tile_content_buf
             cursor["gScreenTileCounts"] = self.splat_tile_counts_buf
             cursor["SplatParams"]["gaussianCount"] = self.gaussian_count
+            cursor["SplatParams"]["paddedSortCount"] = sort_count
             cursor["SplatParams"]["screenWidth"] = self.width
             cursor["SplatParams"]["screenHeight"] = self.height
             cursor["SplatParams"]["tileResolution"] = tile_res
             cursor["SplatParams"]["densityScale"] = settings.density_scale
+            cursor["SplatParams"]["lightPenetration"] = settings.light_penetration
+            cursor["SplatParams"]["shadowStrength"] = settings.shadow_strength
+            cursor["SplatParams"]["splatSoftness"] = settings.splat_softness
+            cursor["SplatParams"]["useDepthDarkening"] = 1 if settings.use_depth_darkening else 0
+            cursor["SplatParams"]["blurRadius"] = settings.blur_radius
             cursor["SplatParams"]["volumeMin"] = vol_min
             cursor["SplatParams"]["volumeMax"] = vol_max
             cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
 
-        # Pass 4: Render splats — clear the output texture first
+        # Pass 4: Render splats
         cmd.clear_texture_float(self.splat_output_tex)
         cmd.set_texture_state(self.splat_output_tex, spy.ResourceState.unordered_access)
         with cmd.begin_compute_pass() as cp:
@@ -1588,14 +1765,37 @@ class Renderer:
             cursor["gCamera"] = self.cam_buffer
             cursor["gSettings"] = self.settings_buffer
             cursor["gOutputTexture"] = self.splat_output_tex
+            cursor["gLightTransmittance"] = self.splat_light_transmittance_buf
             cursor["SplatParams"]["gaussianCount"] = self.gaussian_count
+            cursor["SplatParams"]["paddedSortCount"] = sort_count
             cursor["SplatParams"]["screenWidth"] = self.width
             cursor["SplatParams"]["screenHeight"] = self.height
             cursor["SplatParams"]["tileResolution"] = tile_res
             cursor["SplatParams"]["densityScale"] = settings.density_scale
+            cursor["SplatParams"]["lightPenetration"] = settings.light_penetration
+            cursor["SplatParams"]["shadowStrength"] = settings.shadow_strength
+            cursor["SplatParams"]["splatSoftness"] = settings.splat_softness
+            cursor["SplatParams"]["useDepthDarkening"] = 1 if settings.use_depth_darkening else 0
+            cursor["SplatParams"]["blurRadius"] = settings.blur_radius
             cursor["SplatParams"]["volumeMin"] = vol_min
             cursor["SplatParams"]["volumeMax"] = vol_max
             cp.dispatch(thread_count=(self.width, self.height, 1))
+
+        # Post-process blur (if enabled)
+        blur_radius = settings.blur_radius if settings.enable_blur else 0
+        if blur_radius > 0:
+            cmd.set_texture_state(self.splat_output_tex, spy.ResourceState.unordered_access)
+            cmd.set_texture_state(self.splat_blur_tex, spy.ResourceState.unordered_access)
+            with cmd.begin_compute_pass() as cp:
+                cursor = spy.ShaderCursor(cp.bind_pipeline(self.pipe_splat_blur))
+                cursor["gOutputTexture"] = self.splat_output_tex
+                cursor["gBlurOutput"] = self.splat_blur_tex
+                cursor["SplatParams"]["screenWidth"] = self.width
+                cursor["SplatParams"]["screenHeight"] = self.height
+                cursor["SplatParams"]["blurRadius"] = blur_radius
+                cp.dispatch(thread_count=(self.width, self.height, 1))
+            # Swap: blur result becomes the output
+            self.splat_output_tex, self.splat_blur_tex = self.splat_blur_tex, self.splat_output_tex
 
         if own_cmd:
             self.device.submit_command_buffer(cmd.finish())
@@ -1992,6 +2192,22 @@ class App:
                 imgui.set_tooltip(
                     "Low = Light penetrates deep (fluffy clouds)\nHigh = Light blocked early (dark smoke)"
                 )
+
+            _, self.settings.shadow_strength = imgui.slider_float(
+                "Shadow Strength", self.settings.shadow_strength, 0.0, 20.0
+            )
+            _, self.settings.splat_softness = imgui.slider_float(
+                "Splat Softness", self.settings.splat_softness, 0.1, 10.0
+            )
+            _, self.settings.enable_blur = imgui.checkbox(
+                "Enable Blur", self.settings.enable_blur
+            )
+            _, self.settings.blur_radius = imgui.slider_int(
+                "Blur Radius", self.settings.blur_radius, 1, 4
+            )
+            _, self.settings.use_depth_darkening = imgui.checkbox(
+                "Depth Darkening", self.settings.use_depth_darkening
+            )
 
             _, self.settings.phase_g = imgui.slider_float(
                 "Phase G (Silver Lining)", self.settings.phase_g, -0.9, 0.9
@@ -2738,6 +2954,54 @@ class SlimApp(spy.AppWindow):
             min=0.0, max=1.0,
             callback=self._on_light_pen_change,
         )
+        self._ui_sun_x = sui.SliderFloat(
+            win, label="Sun Dir X", value=self.settings.sun_direction[0],
+            min=-1.0, max=1.0,
+            callback=lambda v: self._on_sun_dir_change(0, v),
+        )
+        self._ui_sun_y = sui.SliderFloat(
+            win, label="Sun Dir Y", value=self.settings.sun_direction[1],
+            min=-1.0, max=1.0,
+            callback=lambda v: self._on_sun_dir_change(1, v),
+        )
+        self._ui_sun_z = sui.SliderFloat(
+            win, label="Sun Dir Z", value=self.settings.sun_direction[2],
+            min=-1.0, max=1.0,
+            callback=lambda v: self._on_sun_dir_change(2, v),
+        )
+        self._ui_sun_intensity = sui.SliderFloat(
+            win, label="Sun Intensity", value=self.settings.sun_intensity,
+            min=0.0, max=20.0,
+            callback=lambda v: setattr(self.settings, 'sun_intensity', v),
+        )
+        self._ui_ambient_intensity = sui.SliderFloat(
+            win, label="Ambient Intensity", value=self.settings.ambient_intensity,
+            min=0.0, max=5.0,
+            callback=lambda v: setattr(self.settings, 'ambient_intensity', v),
+        )
+        self._ui_shadow_strength = sui.SliderFloat(
+            win, label="Shadow Strength", value=self.settings.shadow_strength,
+            min=0.0, max=20.0,
+            callback=lambda v: setattr(self.settings, 'shadow_strength', v),
+        )
+        self._ui_splat_softness = sui.SliderFloat(
+            win, label="Splat Softness", value=self.settings.splat_softness,
+            min=0.1, max=10.0,
+            callback=lambda v: setattr(self.settings, 'splat_softness', v),
+        )
+        self._ui_enable_blur = sui.CheckBox(
+            win, label="Enable Blur", value=self.settings.enable_blur,
+            callback=lambda v: setattr(self.settings, 'enable_blur', v),
+        )
+        self._ui_blur_radius = sui.SliderInt(
+            win, label="Blur Radius", value=self.settings.blur_radius,
+            min=1, max=4,
+            callback=lambda v: setattr(self.settings, 'blur_radius', v),
+        )
+        self._ui_depth_darkening = sui.CheckBox(
+            win, label="Depth Darkening", value=self.settings.use_depth_darkening,
+            callback=lambda v: setattr(self.settings, 'use_depth_darkening', v),
+        )
 
         sui.Text(win, text="--- Training ---")
         self._ui_train_btn = sui.Button(
@@ -2785,6 +3049,9 @@ class SlimApp(spy.AppWindow):
 
     def _on_light_pen_change(self, val):
         self.settings.light_penetration = val
+
+    def _on_sun_dir_change(self, axis, val):
+        self.settings.sun_direction[axis] = val
 
     def _on_train_toggle(self):
         self.is_training = not self.is_training
