@@ -416,11 +416,13 @@ def convert_grid_to_gaussians(grid, config, axis_remap=None):
     """Stochastically sample VDB grid to create Gaussians.
 
     Supports two modes (config.gaussian_mode):
-      "percentage" — each active voxel is kept with probability
-                     value * config.probability_scale.
-      "count"      — targets config.target_count Gaussians by
-                     auto-calculating the probability from the
-                     number of active voxels.
+      "percentage" — probability is config.probability_scale.
+      "count"      — probability is auto-calculated from
+                     config.target_count / n_active_voxels.
+
+    Sampling (config.density_weighted):
+      True  — acceptance = value * prob  (biased toward dense regions)
+      False — acceptance = prob          (uniform across all active voxels)
 
     In both modes, config.min_count / config.max_count are enforced.
     If the result undershoots min_count the probability is bumped and
@@ -470,18 +472,22 @@ def convert_grid_to_gaussians(grid, config, axis_remap=None):
     min_count = getattr(config, "min_count", 0)
     max_count = getattr(config, "max_count", 999_999)
 
+    density_weighted = getattr(config, "density_weighted", True)
+    sampling = "density-weighted" if density_weighted else "uniform"
+
     if mode == "count":
         target = getattr(config, "target_count", 8000)
-        prob = min(target / max(n_active, 1), 1.0)
-        print(f"  Mode: count (target={target}, auto prob={prob:.5f})")
+        if density_weighted:
+            mean_density = sum(v for _, v in active_voxels) / max(n_active, 1)
+            prob = min(target / (max(n_active, 1) * mean_density), 1.0)
+        else:
+            prob = min(target / max(n_active, 1), 1.0)
+        print(f"  Mode: count (target={target}, auto prob={prob:.5f}, {sampling})")
     else:
         prob = config.probability_scale
-        print(f"  Mode: percentage (prob_scale={prob:.5f})")
+        print(f"  Mode: percentage (prob_scale={prob:.5f}, {sampling})")
 
     # Generate with retry if undershooting min_count
-    # In percentage mode: acceptance = value * prob (density-weighted)
-    # In count mode:      acceptance = prob          (uniform sampling)
-    density_weighted = (mode == "percentage")
     max_attempts = 3
     for attempt in range(max_attempts):
         gaussians = []
@@ -618,6 +624,7 @@ class TrainingConfig:
 
         # Gaussian Generation
         self.gaussian_mode = "percentage"  # "percentage" or "count"
+        self.density_weighted = True       # True = bias toward dense voxels, False = uniform
         self.probability_scale = 0.02
         self.target_count = 8000
         self.min_count = 500
@@ -627,6 +634,10 @@ class TrainingConfig:
 
         self.loss_mode = 0  # 0=L2, 1=L1(pseudo), 2=Huber
         self.huber_delta = 0.1
+
+        # SSIM combined loss: L = (1-ssim_weight)*L_pervoxel + ssim_weight*D-SSIM
+        self.ssim_weight = 0.0  # 0.0 = off, 0.2 = recommended
+        self.ssim_window_radius = 2  # 1 = 3x3x3, 2 = 5x5x5
 
         self.sgld = SGLDConfig()
 
@@ -696,6 +707,16 @@ class Renderer:
             depth=VOL_SIZE,
             usage=spy.TextureUsage.unordered_access | spy.TextureUsage.shader_resource,
             label="GaussianVolume",
+        )
+
+        self.ssim_gradient_tex = device.create_texture(
+            type=spy.TextureType.texture_3d,
+            format=spy.Format.r32_float,
+            width=VOL_SIZE,
+            height=VOL_SIZE,
+            depth=VOL_SIZE,
+            usage=spy.TextureUsage.unordered_access | spy.TextureUsage.shader_resource,
+            label="SSIMGradient",
         )
 
         self._needs_rebinning = True
@@ -848,6 +869,13 @@ class Renderer:
             )
             self.pipe_init_adam = self.device.create_compute_pipeline(
                 program=prog_init_adam
+            )
+
+            prog_ssim = self.device.load_program(
+                "shaders/training.slang", ["compute_ssim_gradient"]
+            )
+            self.pipe_ssim_gradient = self.device.create_compute_pipeline(
+                program=prog_ssim
             )
 
             prog_debug = self.device.load_program(
@@ -1074,6 +1102,23 @@ class Renderer:
                 cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
             self._needs_rebinning = False
 
+        # 3.5. SSIM gradient precomputation (uses predicted volume from previous step)
+        ssim_active = train_config.ssim_weight > 0.0 and self.adam_iteration > 1
+        if ssim_active:
+            with cmd.begin_compute_pass() as cp:
+                root_object = cp.bind_pipeline(self.pipe_ssim_gradient)
+                cursor = spy.ShaderCursor(root_object)
+
+                cursor["PredictedVol"] = self.gaussian_volume_tex
+                cursor["ReferenceVol"] = self.volume_tex
+                cursor["gSSIMGradientVol"] = self.ssim_gradient_tex
+
+                cursor["TrainParams"]["volumeResolution"] = (VOL_SIZE, VOL_SIZE, VOL_SIZE)
+                cursor["TrainParams"]["ssimWeight"] = train_config.ssim_weight
+                cursor["TrainParams"]["ssimWindowRadius"] = train_config.ssim_window_radius
+
+                cp.dispatch(thread_count=(VOL_SIZE, VOL_SIZE, VOL_SIZE))
+
         # 4. Train
         with cmd.begin_compute_pass() as cp:
             root_object = cp.bind_pipeline(self.pipe_train)
@@ -1084,6 +1129,7 @@ class Renderer:
             cursor["gGradientsRaw"] = self.grad_buffer
             cursor["gTileContent"] = self.tile_content
             cursor["gTileCounts"] = self.tile_counts
+            cursor["gSSIMGradientVol"] = self.ssim_gradient_tex
 
             cursor["TrainParams"]["volumeResolution"] = (VOL_SIZE, VOL_SIZE, VOL_SIZE)
             cursor["TrainParams"]["tileResolution"] = self.tile_res
@@ -1093,6 +1139,8 @@ class Renderer:
 
             cursor["TrainParams"]["lossMode"] = train_config.loss_mode
             cursor["TrainParams"]["huberDelta"] = train_config.huber_delta
+            cursor["TrainParams"]["ssimWeight"] = train_config.ssim_weight if ssim_active else 0.0
+            cursor["TrainParams"]["ssimWindowRadius"] = train_config.ssim_window_radius
 
             cp.dispatch(thread_count=(VOL_SIZE, VOL_SIZE, VOL_SIZE))
 
@@ -1132,7 +1180,7 @@ class Renderer:
 
             cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
 
-        if self.use_gaussian_volume:
+        if self.use_gaussian_volume or train_config.ssim_weight > 0.0:
             self.rasterize_gaussians(cmd, vol_min, vol_max)
 
         # Pass 7: Debug visualization
@@ -2371,8 +2419,17 @@ class App:
                 self.train_config.gaussian_mode = gauss_modes[new_gm_idx]
             if imgui.is_item_hovered():
                 imgui.set_tooltip(
-                    "Percentage: keep each voxel with prob = value * scale.\n"
+                    "Percentage: user-specified spawn probability.\n"
                     "Target Count: auto-calculate probability to hit a target."
+                )
+
+            _, self.train_config.density_weighted = imgui.checkbox(
+                "Density Weighted##dw", self.train_config.density_weighted
+            )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "On: acceptance = density * prob (more Gaussians in dense regions).\n"
+                    "Off: acceptance = prob (uniform across all active voxels)."
                 )
 
             if self.train_config.gaussian_mode == "percentage":
@@ -2431,6 +2488,35 @@ class App:
                     imgui.set_tooltip(
                         "Errors below delta use L2, above use L1.\n"
                         "Set near your typical per-voxel error magnitude."
+                    )
+
+            imgui.dummy((0, 5))
+            imgui.text("SSIM Combined Loss")
+            _, self.train_config.ssim_weight = imgui.slider_float(
+                "SSIM Weight",
+                self.train_config.ssim_weight,
+                0.0,
+                1.0,
+                format="%.2f",
+            )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Blend weight for structural similarity loss.\n"
+                    "L = (1-w)*L_pervoxel + w*D-SSIM\n"
+                    "0.0 = per-voxel only, 0.2 = recommended (3DGS standard).\n"
+                    "Uses predicted volume from previous step."
+                )
+
+            if self.train_config.ssim_weight > 0.0:
+                window_sizes = ["3x3x3 (R=1)", "5x5x5 (R=2)", "7x7x7 (R=3)"]
+                cur_ws = self.train_config.ssim_window_radius - 1
+                _, new_ws = imgui.combo("SSIM Window", cur_ws, window_sizes)
+                self.train_config.ssim_window_radius = new_ws + 1
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip(
+                        "Local window size for SSIM computation.\n"
+                        "Larger = more structural awareness but slower.\n"
+                        "5x5x5 is a good default."
                     )
 
             imgui.separator()

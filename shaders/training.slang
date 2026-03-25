@@ -75,6 +75,8 @@ struct Gaussian
 [[vk::binding(5)]] RWStructuredBuffer<float> gAdamFirstMoment;
 [[vk::binding(6)]] RWStructuredBuffer<float> gAdamSecondMoment;
 [[vk::binding(7)]] RWTexture3D<float4> gDebugVolume;
+[[vk::binding(8)]] Texture3D<float> PredictedVol;          // Rasterized gaussian volume (prev step)
+[[vk::binding(9)]] RWTexture3D<float> gSSIMGradientVol;    // Per-voxel dDSSIM/dPredicted
 
 // Batch size for cooperative Gaussian processing <= TRAIN_WG_SIZE
 static const uint GAUSS_BATCH = 32;
@@ -94,6 +96,10 @@ groupshared float  gsBatchGradAccum[GAUSS_BATCH * PARAMS_PER_GAUSSIAN];
 static const uint LOSS_L2    = 0;
 static const uint LOSS_L1    = 1;
 static const uint LOSS_HUBER = 2;
+
+// SSIM constants: fixed C1/C2 assuming data range L=1 (densities in [0,1])
+static const float SSIM_C1 = 0.01 * 0.01;   // (K1*L)^2 = 0.0001
+static const float SSIM_C2 = 0.03 * 0.03;   // (K2*L)^2 = 0.0009
 
 cbuffer TrainParams {
     uint3 volumeResolution;
@@ -116,6 +122,10 @@ cbuffer TrainParams {
     //! Loss modes
     uint lossMode;
     float huberDelta;
+
+    //! SSIM
+    float ssimWeight;       // 0.0 = off, 0.2 = typical (lambda in combined loss)
+    int   ssimWindowRadius; // 1 = 3x3x3, 2 = 5x5x5
 
     //! MCMC But just jitter
     uint  sgldEnabled;
@@ -623,6 +633,13 @@ void train_main(uint3 tid : SV_DispatchThreadID)
     bwd_diff(gsBatch_computeLoss)(dpDensity, target, lossMode, huberDelta, 1.0);
     float dLoss_dPredicted = dpDensity.getDifferential();
 
+    // Combine with SSIM gradient if enabled
+    if (ssimWeight > 0.0 && voxelActive)
+    {
+        float ssimGrad = gSSIMGradientVol[tid];
+        dLoss_dPredicted = (1.0 - ssimWeight) * dLoss_dPredicted + ssimWeight * ssimGrad;
+    }
+
     // PASS 2: Backward on batches to speed up training
     for (uint batchStart = 0; batchStart < totalCount; batchStart += GAUSS_BATCH)
     {
@@ -638,6 +655,76 @@ void train_main(uint3 tid : SV_DispatchThreadID)
         gsBatch_flushGradAccum(batchCount, lane);
         GroupMemoryBarrierWithGroupSync();
     }
+}
+
+// ============================================================================
+// SSIM GRADIENT COMPUTATION
+// Computes per-voxel dD-SSIM/dPredicted using the window centered at each voxel.
+// D-SSIM = (1 - SSIM) / 2
+// Fixed C1/C2 (L=1), uniform box window.
+// ============================================================================
+[shader("compute")]
+[numthreads(4, 4, 4)]
+void compute_ssim_gradient(uint3 tid : SV_DispatchThreadID)
+{
+    if (any(tid >= volumeResolution)) return;
+
+    int3 voxel = int3(tid);
+    int3 res   = int3(volumeResolution);
+    int  R     = ssimWindowRadius;
+
+    int3 wMin = max(voxel - R, int3(0));
+    int3 wMax = min(voxel + R, res - int3(1));
+
+    float sumP = 0.0, sumR = 0.0;
+    float sumPP = 0.0, sumRR = 0.0, sumPR = 0.0;
+    float N = 0.0;
+
+    for (int wz = wMin.z; wz <= wMax.z; wz++)
+    for (int wy = wMin.y; wy <= wMax.y; wy++)
+    for (int wx = wMin.x; wx <= wMax.x; wx++)
+    {
+        float pv = PredictedVol[uint3(wx, wy, wz)];
+        float rv = ReferenceVol[uint3(wx, wy, wz)];
+        sumP  += pv;
+        sumR  += rv;
+        sumPP += pv * pv;
+        sumRR += rv * rv;
+        sumPR += pv * rv;
+        N     += 1.0;
+    }
+
+    float invN  = 1.0 / N;
+    float muP   = sumP * invN;
+    float muR   = sumR * invN;
+    float sigPP = max(sumPP * invN - muP * muP, 0.0);
+    float sigRR = max(sumRR * invN - muR * muR, 0.0);
+    float sigPR = sumPR * invN - muP * muR;
+
+    float A     = 2.0 * muP * muR + SSIM_C1;
+    float B     = 2.0 * sigPR + SSIM_C2;
+    float C_val = muP * muP + muR * muR + SSIM_C1;
+    float D     = sigPP + sigRR + SSIM_C2;
+    float denom = C_val * D;
+
+    float ssim = (A * B) / max(denom, 1e-8);
+
+    float p = PredictedVol[tid];
+    float r = ReferenceVol[tid];
+
+    // dSSIM/dp via quotient rule (C1/C2 are constants, no extra terms)
+    float dA = 2.0 * muR * invN;
+    float dB = 2.0 * (r - muR) * invN;
+    float dC = 2.0 * muP * invN;
+    float dD = 2.0 * (p - muP) * invN;
+
+    float dNum = dA * B + A * dB;
+    float dDen = dC * D + C_val * dD;
+
+    float dSSIM = (dNum - ssim * dDen) / max(denom, 1e-8);
+
+    // D-SSIM = (1 - SSIM) / 2  =>  grad = -dSSIM * 0.5
+    gSSIMGradientVol[tid] = clamp(-dSSIM * 0.5, -1.0, 1.0);
 }
 
 // CLEAR GRADIENTS

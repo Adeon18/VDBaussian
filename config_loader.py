@@ -142,6 +142,8 @@ def apply_config_to_train_config(cfg: dict, train_config) -> None:
     train_config.use_adam             = bool(t["use_adam"])
     train_config.loss_mode            = int(t["loss_mode"])
     train_config.huber_delta          = float(t["huber_delta"])
+    train_config.ssim_weight          = float(t.get("ssim_weight", 0.0))
+    train_config.ssim_window_radius   = int(t.get("ssim_window_radius", 2))
     train_config.learning_rate_pos    = float(t["learning_rate_pos"])
     train_config.learning_rate_scale  = float(t["learning_rate_scale"])
     train_config.learning_rate_rotation = float(t["learning_rate_rotation"])
@@ -152,6 +154,7 @@ def apply_config_to_train_config(cfg: dict, train_config) -> None:
 
     g = cfg["gaussian_init"]
     train_config.gaussian_mode        = str(g.get("mode", "percentage"))
+    train_config.density_weighted     = bool(g.get("density_weighted", True))
     train_config.probability_scale    = float(g["probability_scale"])
     train_config.target_count         = int(g.get("target_count", 8000))
     train_config.min_count            = int(g.get("min_count", 500))

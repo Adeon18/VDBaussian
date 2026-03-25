@@ -61,22 +61,19 @@ cbuffer SplatParams
     uint  gaussianCount;
     uint  screenWidth;
     uint  screenHeight;
-    uint  paddedSortCount;  // gaussianCount padded to next power of 2 (for sort init in projection)
+    uint  paddedSortCount;      // gaussianCount padded to next power of 2 (for sort init in projection)
     uint2 tileResolution;
     float densityScale;
-    float lightPenetration;  // controls shadow density (matches raymarcher usage)
-    float shadowStrength;    // multiplier on self-shadow transmittance (1.0 = physical, higher = darker shadows)
-    float splatSoftness;     // low-pass filter on 2D covariance (0.3 = sharp/default, higher = softer edges)
-    uint  useDepthDarkening; // 0 = off, 1 = view-dependent depth darkening
-    uint  blurRadius;        // screen-space blur radius (0 = off, 1-4 = kernel half-size)
-    float3 volumeMin;   // world-space AABB of the gaussian volume
+    float lightPenetration;     // controls shadow density
+    float shadowStrength;       // multiplier on self-shadow transmittance
+    float splatSoftness;        // low-pass filter on 2D covariance
+    uint  useDepthDarkening;    // 0 = off, 1 = view-dependent depth darkening
+    uint  blurRadius;           // screen-space blur radius
+    float3 volumeMin;           // world-space AABB of the gaussian volume
     float3 volumeMax;
 };
 
-// ============================================================
 // Math helpers
-// ============================================================
-
 float3x3 quatToMatrix(float4 q)
 {
     float x = q.x, y = q.y, z = q.z, w = q.w;
@@ -127,10 +124,7 @@ float henyeyGreenstein(float g, float costh)
     return (1.0 - g2) / (4.0 * PI * pow(1.0 + g2 - 2.0 * g * costh, 1.5));
 }
 
-// ============================================================
 // Projected-buffer helpers (avoid struct padding issues)
-// ============================================================
-
 void projWrite(uint gid, uint field, float val)
 {
     gProjected[gid * PROJ_STRIDE + field] = val;
@@ -141,10 +135,7 @@ float projRead(uint gid, uint field)
     return gProjected[gid * PROJ_STRIDE + field];
 }
 
-// ============================================================
 // Pass 1: Project gaussians to screen space
-// ============================================================
-
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void project_gaussians(uint3 tid : SV_DispatchThreadID)
@@ -170,7 +161,7 @@ void project_gaussians(uint3 tid : SV_DispatchThreadID)
     if (g.weight < 1e-5)
         return;
 
-    // Remap gaussian from VDB world space to [-1,1] cube space (where the camera lives)
+    // Remap gaussian from VDB world space to [-1,1] cube space
     float3 volExtent = volumeMax - volumeMin;
     g.pos   = (g.pos - volumeMin) / volExtent * 2.0 - 1.0;
     g.scale = g.scale / volExtent * 2.0;
@@ -178,8 +169,8 @@ void project_gaussians(uint3 tid : SV_DispatchThreadID)
     // Camera
     float3 camPos   = float3(gCamera[0], gCamera[1], gCamera[2]);
     float3 camFront = float3(gCamera[4], gCamera[5], gCamera[6]);
-    float3 camRight = float3(gCamera[8], gCamera[9], gCamera[10]);  // right_hat * aspect * 0.5
-    float3 camUp    = float3(gCamera[12], gCamera[13], gCamera[14]); // up_hat * 0.5
+    float3 camRight = float3(gCamera[8], gCamera[9], gCamera[10]);
+    float3 camUp    = float3(gCamera[12], gCamera[13], gCamera[14]);
 
     float3 rightHat = normalize(camRight);
     float3 upHat    = normalize(camUp);
@@ -195,13 +186,12 @@ void project_gaussians(uint3 tid : SV_DispatchThreadID)
         return;
 
     // Project to pixel coords.
-    // Y is negated so that camera-up maps to smaller pixel.y (= screen top)
-    // matching the convention where pixel (0,0) = top-left in compute shaders.
+    // Y is negated?? Should it be tho???
     float2 center;
     center.x =  focal * cx / cz + float(screenWidth)  * 0.5;
     center.y = -focal * cy / cz + float(screenHeight) * 0.5;
 
-    // ---- 2D covariance via EWA splatting ----
+    // 2D covariance via EWA splatting
     // World-to-camera rotation
     float3x3 W = float3x3(
         rightHat.x, rightHat.y, rightHat.z,
@@ -212,8 +202,8 @@ void project_gaussians(uint3 tid : SV_DispatchThreadID)
     float3x3 Sigma = buildCovarianceMatrix(g.scale, g.quat);
     float3x3 SigmaCam = mul(mul(W, Sigma), transpose(W));
 
-    // Jacobian of perspective projection (camera-space → pixel-space)
-    // Note: j12 sign is negated to match the Y-flip in the projection above
+    // Jacobian of perspective projection (camera-space to pixel-space)
+    // j12 sign is negated to match the Y-flip in the projection above
     float inv_cz  = 1.0 / cz;
     float inv_cz2 = inv_cz * inv_cz;
     float j00 =  focal * inv_cz;
@@ -229,16 +219,16 @@ void project_gaussians(uint3 tid : SV_DispatchThreadID)
                          j11 * SigmaCam[1][1] + j12 * SigmaCam[2][1],
                          j11 * SigmaCam[1][2] + j12 * SigmaCam[2][2]);
 
-    // (J * SigmaCam) * J^T → 2x2 covariance
+    // (J * SigmaCam) * J^T -> 2x2 covariance
     float cov_xx = js0.x * j00 + js0.z * j02;
     float cov_xy = js0.y * j11 + js0.z * j12;
     float cov_yy = js1.y * j11 + js1.z * j12;
 
-    // Low-pass filter — higher splatSoftness blurs gaussian footprints, hiding hard edges
+    // Low-pass filter to avoid alisasing
     cov_xx += splatSoftness;
     cov_yy += splatSoftness;
 
-    // Invert 2x2 → conic
+    // Invert 2x2-> conic
     float det = cov_xx * cov_yy - cov_xy * cov_xy;
     if (det <= 1e-6)
         return;
@@ -247,7 +237,7 @@ void project_gaussians(uint3 tid : SV_DispatchThreadID)
     float conic_b = -cov_xy * inv_det;
     float conic_c =  cov_xx * inv_det;
 
-    // Bounding box (3-sigma ellipse → AABB in tile coords)
+    // Bounding box (3-sigma ellipse-> AABB in tile coords)
     float radius_x = ceil(CUTOFF_SIGMA * sqrt(cov_xx));
     float radius_y = ceil(CUTOFF_SIGMA * sqrt(cov_yy));
 
@@ -293,9 +283,7 @@ void project_gaussians(uint3 tid : SV_DispatchThreadID)
     gSortKeys[gid] = depthToSortKey(cz);
 }
 
-// ============================================================
 // GPU Sort: Local bitonic sort in shared memory + global merge
-// ============================================================
 
 // Convert float depth to a uint that sorts in the same order (positive depths only, invalid → max).
 uint depthToSortKey(float depth)
@@ -331,11 +319,9 @@ static const uint LOCAL_SORT_THREADS = 1024;
 groupshared uint gs_keys[LOCAL_SORT_SIZE];
 groupshared uint gs_vals[LOCAL_SORT_SIZE];
 
-// ============================================================
 // Sort key initialization kernels
-// ============================================================
 
-// Init sort keys from camera depth (call before local_bitonic_sort for camera-order sorting)
+// Init sort keys from camera depth
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void init_sort_keys_depth(uint3 tid : SV_DispatchThreadID)
@@ -372,9 +358,7 @@ void init_sort_keys_light(uint3 tid : SV_DispatchThreadID)
     gSortedIndices[idx] = idx;
 }
 
-// ============================================================
 // Transmittance: parallel tau compute + lightweight serial scan
-// ============================================================
 
 // Step 1: Compute per-gaussian tau in parallel (one thread per gaussian).
 // Writes tau into gLightTransmittance[] indexed by gaussian ID (reused as temp storage).
@@ -418,7 +402,7 @@ void compute_gaussian_tau(uint3 tid : SV_DispatchThreadID)
     gLightTransmittance[idx] = lineIntegral * densityScale * lightPenetration * coverage * shadowStrength;
 }
 
-// Step 2: Serial exclusive prefix sum + exp — reads precomputed taus, writes final transmittance.
+// Step 2: Serial exclusive prefix sum + exp that reads precomputed taus, writes final transmittance.
 // Lightweight: just float additions and one exp per gaussian, no matrix math.
 [shader("compute")]
 [numthreads(1, 1, 1)]
@@ -435,10 +419,8 @@ void scan_transmittance(uint3 tid : SV_DispatchThreadID)
     }
 }
 
-// ============================================================
 // Phase 1: Sort blocks of LOCAL_SORT_SIZE entirely in shared memory (ONE dispatch).
 // Reads pre-filled gSortKeys/gSortedIndices (call init_sort_keys_* first).
-// ============================================================
 [shader("compute")]
 [numthreads(LOCAL_SORT_THREADS, 1, 1)]
 void local_bitonic_sort(uint3 groupID : SV_GroupID, uint localIdx : SV_GroupIndex)
@@ -601,10 +583,7 @@ void local_merge_finish(uint3 groupID : SV_GroupID, uint localIdx : SV_GroupInde
     }
 }
 
-// ============================================================
 // Pass 2: Clear screen tile counters
-// ============================================================
-
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void clear_screen_tiles(uint3 tid : SV_DispatchThreadID)
@@ -615,10 +594,7 @@ void clear_screen_tiles(uint3 tid : SV_DispatchThreadID)
     gScreenTileCounts[tid.x] = 0;
 }
 
-// ============================================================
 // Pass 3: Assign sorted gaussians to screen tiles
-// ============================================================
-
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void tile_assign_screen(uint3 tid : SV_DispatchThreadID)
@@ -651,10 +627,7 @@ void tile_assign_screen(uint3 tid : SV_DispatchThreadID)
     }
 }
 
-// ============================================================
 // Pass 4: Render splats (one workgroup = one tile)
-// ============================================================
-
 groupshared uint gs_tileCount;
 groupshared uint gs_gaussianIDs[MAX_GAUSSIANS_PER_SCREEN_TILE];
 
@@ -742,6 +715,8 @@ void render_splats(uint3 tid : SV_DispatchThreadID, uint3 groupID : SV_GroupID, 
             lightTransmit *= (1.0 - accAlpha);
 
         float3 light = sunLight * lightTransmit + ambientColor;
+        // float2 gaussianCenter = ...
+        // if pixel == gaussianCenter: gaussianTransmittance[gaussianIndex] = accAlpha;
 
         float w = (1.0 - accAlpha) * alpha;
         accColor += w * smokeAlbedo * light;
@@ -753,10 +728,7 @@ void render_splats(uint3 tid : SV_DispatchThreadID, uint3 groupID : SV_GroupID, 
     gOutputTexture[pixel] = float4(finalColor, 1.0);
 }
 
-// ============================================================
 // Post-process: screen-space Gaussian blur to soften splat edges
-// ============================================================
-
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void blur_splats(uint3 tid : SV_DispatchThreadID)

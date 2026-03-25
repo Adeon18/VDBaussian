@@ -18,6 +18,8 @@ training:
   use_adam: true
   loss_mode: 0                    # 0=L2(MSE), 1=L1(pseudo-Huber), 2=Huber
   huber_delta: 0.1
+  ssim_weight: 0.0               # 0.0=off, 0.2=recommended. L=(1-w)*L_pervoxel + w*D-SSIM
+  ssim_window_radius: 2          # 1=3x3x3, 2=5x5x5, 3=7x7x7
 
   # Per-parameter learning rates
   learning_rate_pos: 0.1
@@ -52,6 +54,7 @@ sgld:
 # --- Gaussian Initialisation -------------------------------------------------
 gaussian_init:
   mode: "percentage"              # "percentage" or "count"
+  density_weighted: true          # true = acceptance scaled by voxel density, false = uniform
   probability_scale: 0.02         # Used when mode: percentage
   target_count: 8000              # Used when mode: count
   min_count: 500                  # Floor — retry with higher prob if below this
