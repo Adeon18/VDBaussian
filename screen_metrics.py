@@ -175,6 +175,52 @@ def make_orbit_cameras(
     return cameras
 
 
+def make_6sided_cameras(
+    radius: float = 2.5,
+    aspect: float = DEFAULT_METRICS_W / DEFAULT_METRICS_H,
+) -> list[CanonicalCamera]:
+    """Axis-aligned cameras: front, back, left, right, top, bottom."""
+    a = aspect * 0.5
+    return [
+        CanonicalCamera(  # front (+Z looking -Z)
+            pos=(0.0, 0.0, radius),
+            front=(0.0, 0.0, -1.0),
+            right=(a, 0.0, 0.0),
+            up=(0.0, 0.5, 0.0),
+        ),
+        CanonicalCamera(  # back (-Z looking +Z)
+            pos=(0.0, 0.0, -radius),
+            front=(0.0, 0.0, 1.0),
+            right=(-a, 0.0, 0.0),
+            up=(0.0, 0.5, 0.0),
+        ),
+        CanonicalCamera(  # right (+X looking -X)
+            pos=(radius, 0.0, 0.0),
+            front=(-1.0, 0.0, 0.0),
+            right=(0.0, 0.0, -a),
+            up=(0.0, 0.5, 0.0),
+        ),
+        CanonicalCamera(  # left (-X looking +X)
+            pos=(-radius, 0.0, 0.0),
+            front=(1.0, 0.0, 0.0),
+            right=(0.0, 0.0, a),
+            up=(0.0, 0.5, 0.0),
+        ),
+        CanonicalCamera(  # top (+Y looking -Y)
+            pos=(0.0, radius, 0.0),
+            front=(0.0, -1.0, 0.0),
+            right=(a, 0.0, 0.0),
+            up=(0.0, 0.0, -0.5),
+        ),
+        CanonicalCamera(  # bottom (-Y looking +Y)
+            pos=(0.0, -radius, 0.0),
+            front=(0.0, 1.0, 0.0),
+            right=(a, 0.0, 0.0),
+            up=(0.0, 0.0, 0.5),
+        ),
+    ]
+
+
 # Built-in presets
 CAMERA_PRESETS: dict[str, list[CanonicalCamera]] = {
     "front only": [
@@ -185,6 +231,7 @@ CAMERA_PRESETS: dict[str, list[CanonicalCamera]] = {
             up=(0.0, 0.5, 0.0),
         )
     ],
+    "6-sided":  make_6sided_cameras(),
     "orbit 4":  make_orbit_cameras(n=4,  elevation_deg=0.0),
     "orbit 6":  make_orbit_cameras(n=6,  elevation_deg=15.0),
     "orbit 8":  make_orbit_cameras(n=8,  elevation_deg=20.0),
@@ -199,7 +246,7 @@ CAMERA_PRESETS: dict[str, list[CanonicalCamera]] = {
 }
 
 _PRESET_NAMES  = list(CAMERA_PRESETS.keys())
-_DEFAULT_PRESET = "orbit 6"
+_DEFAULT_PRESET = "6-sided"
 
 
 # ---------------------------------------------------------------------------

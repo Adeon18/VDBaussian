@@ -637,6 +637,247 @@ def _index_page(summaries, all_results, base_dir):
 </body></html>"""
 
 # ---------------------------------------------------------------------------
+# Matplotlib paper-quality plots (PDF + PNG)
+# ---------------------------------------------------------------------------
+
+_MPL_STYLE = {
+    "font.family": "serif",
+    "font.serif": ["Computer Modern Roman", "CMU Serif", "Times New Roman", "DejaVu Serif"],
+    "font.size": 10,
+    "axes.labelsize": 11,
+    "axes.titlesize": 12,
+    "legend.fontsize": 9,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "figure.dpi": 150,
+    "savefig.dpi": 300,
+    "savefig.bbox": "tight",
+    "axes.grid": True,
+    "grid.alpha": 0.3,
+    "grid.linewidth": 0.5,
+    "lines.linewidth": 1.5,
+    "lines.markersize": 5,
+}
+
+_MPL_COLORS = [
+    "#2176AE", "#B66D0D", "#009B72", "#D32F2F",
+    "#7B1FA2", "#0097A7", "#E64A19", "#455A64",
+]
+_MPL_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "h"]
+
+
+def _export_matplotlib_plots(all_results: dict, out_dir: Path):
+    """Generate paper-ready PDF+PNG plots for all overlay metrics."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[report] matplotlib not installed — skipping paper plots")
+        return
+
+    plt.rcParams.update(_MPL_STYLE)
+    plots_dir = out_dir / "plots"
+    plots_dir.mkdir(exist_ok=True)
+
+    metric_defs = [
+        ("psnr_3d",  "PSNR 3D (dB)",  "3d", "psnr"),
+        ("l1_3d",    "L1 3D (MAE)",    "3d", "l1"),
+        ("iou_3d",   "IoU 3D",         "3d", "iou"),
+        ("ssim_3d",  "SSIM 3D",        "3d", "ssim_mean"),
+        ("psnr_2d",  "PSNR 2D (dB)",   "2d", "psnr"),
+        ("l1_2d",    "L1 2D (MAE)",    "2d", "l1"),
+        ("iou_2d",   "IoU 2D",         "2d", "iou"),
+        ("ssim_2d",  "SSIM 2D",        "2d", "ssim"),
+    ]
+
+    for fname, ylabel, tier, key in metric_defs:
+        fig, ax = plt.subplots(figsize=(5.5, 3.5))
+        has_data = False
+
+        for i, (exp_name, r) in enumerate(all_results.items()):
+            xs, ys = [], []
+            for cp in r.get("checkpoints", []):
+                m = (cp.get(f"metrics_{tier}") or {})
+                v = m.get(key)
+                if v is not None:
+                    xs.append(cp["step"]); ys.append(v)
+            if not xs:
+                continue
+            has_data = True
+            color = _MPL_COLORS[i % len(_MPL_COLORS)]
+            marker = _MPL_MARKERS[i % len(_MPL_MARKERS)]
+            ax.plot(xs, ys, color=color, marker=marker,
+                    label=exp_name, markeredgecolor="white",
+                    markeredgewidth=0.5)
+
+            # Annotate final value
+            ax.annotate(f"{ys[-1]:.2f}", (xs[-1], ys[-1]),
+                        textcoords="offset points", xytext=(6, 0),
+                        fontsize=7, color=color, va="center")
+
+        if not has_data:
+            plt.close(fig)
+            continue
+
+        ax.set_xlabel("Step")
+        ax.set_ylabel(ylabel)
+        ax.legend(loc="best", framealpha=0.9, edgecolor="#ccc")
+        fig.tight_layout()
+
+        fig.savefig(plots_dir / f"{fname}.pdf")
+        fig.savefig(plots_dir / f"{fname}.png")
+        plt.close(fig)
+
+    # Combined 2x2 grid: PSNR + SSIM for both 3D and 2D
+    fig, axes = plt.subplots(2, 2, figsize=(10, 7))
+    quad = [
+        (axes[0, 0], "PSNR 3D (dB)", "3d", "psnr"),
+        (axes[0, 1], "PSNR 2D (dB)", "2d", "psnr"),
+        (axes[1, 0], "SSIM 3D",      "3d", "ssim_mean"),
+        (axes[1, 1], "SSIM 2D",      "2d", "ssim"),
+    ]
+    for ax, ylabel, tier, key in quad:
+        for i, (exp_name, r) in enumerate(all_results.items()):
+            xs, ys = [], []
+            for cp in r.get("checkpoints", []):
+                m = (cp.get(f"metrics_{tier}") or {})
+                v = m.get(key)
+                if v is not None:
+                    xs.append(cp["step"]); ys.append(v)
+            if not xs:
+                continue
+            color = _MPL_COLORS[i % len(_MPL_COLORS)]
+            marker = _MPL_MARKERS[i % len(_MPL_MARKERS)]
+            ax.plot(xs, ys, color=color, marker=marker, label=exp_name,
+                    markeredgecolor="white", markeredgewidth=0.5)
+        ax.set_xlabel("Step")
+        ax.set_ylabel(ylabel)
+        ax.legend(loc="best", framealpha=0.9, edgecolor="#ccc", fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(plots_dir / "overview_grid.pdf")
+    fig.savefig(plots_dir / "overview_grid.png")
+    plt.close(fig)
+
+    print(f"[report] Paper plots saved to {plots_dir}")
+
+
+# ---------------------------------------------------------------------------
+# LaTeX table export
+# ---------------------------------------------------------------------------
+
+def _escape_tex(s: str) -> str:
+    for ch in ("&", "%", "$", "#", "_", "{", "}"):
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+
+def _export_latex_tables(summaries: list[dict], all_results: dict, out_dir: Path):
+    """Export LaTeX-ready tables for inclusion in papers."""
+    tex_dir = out_dir / "latex"
+    tex_dir.mkdir(exist_ok=True)
+
+    sorted_s = sorted(summaries,
+                      key=lambda x: x.get("final_psnr_3d") or 0, reverse=True)
+
+    # --- Summary comparison table ---
+    lines = [
+        r"\begin{table}[htbp]",
+        r"  \centering",
+        r"  \caption{Experiment results comparison.}",
+        r"  \label{tab:results}",
+        r"  \begin{tabular}{l r r r r r r r r r}",
+        r"    \toprule",
+        r"    Experiment & Gaussians & PSNR 3D$\uparrow$ & L1 3D$\downarrow$ & IoU 3D$\uparrow$ & SSIM 3D$\uparrow$ & PSNR 2D$\uparrow$ & L1 2D$\downarrow$ & IoU 2D$\uparrow$ & SSIM 2D$\uparrow$ \\",
+        r"    \midrule",
+    ]
+
+    # Find best values for bolding
+    metrics_keys = ["final_psnr_3d", "final_l1_3d", "final_iou_3d", "final_ssim_3d",
+                    "final_psnr_2d", "final_l1_2d", "final_iou_2d", "final_ssim_2d"]
+    bests = {}
+    for k in metrics_keys:
+        vals = [s.get(k) for s in sorted_s if s.get(k) is not None]
+        if vals:
+            higher = "psnr" in k or "ssim" in k or "iou" in k
+            bests[k] = max(vals) if higher else min(vals)
+
+    for s in sorted_s:
+        name = _escape_tex(s["name"])
+        gc = s.get("final_gaussian_count")
+        gc_str = f"{gc:,}" if isinstance(gc, int) else "---"
+
+        cells = [name, gc_str]
+        fmt_map = {"final_psnr_3d": 2, "final_l1_3d": 5, "final_iou_3d": 4,
+                   "final_ssim_3d": 4, "final_psnr_2d": 2, "final_l1_2d": 5,
+                   "final_iou_2d": 4, "final_ssim_2d": 4}
+        for k in metrics_keys:
+            v = s.get(k)
+            if v is None:
+                cells.append("---")
+            else:
+                d = fmt_map.get(k, 4)
+                txt = f"{v:.{d}f}"
+                if bests.get(k) is not None and v == bests[k]:
+                    txt = r"\textbf{" + txt + "}"
+                cells.append(txt)
+
+        lines.append("    " + " & ".join(cells) + r" \\")
+
+    lines += [
+        r"    \bottomrule",
+        r"  \end{tabular}",
+        r"\end{table}",
+    ]
+    (tex_dir / "results_table.tex").write_text("\n".join(lines), encoding="utf-8")
+
+    # --- Per-experiment checkpoint tables ---
+    for name, r in all_results.items():
+        cps = r.get("checkpoints", [])
+        if not cps:
+            continue
+        safe_name = name.replace(" ", "_").replace("-", "_")
+        elines = [
+            r"\begin{table}[htbp]",
+            r"  \centering",
+            f"  \\caption{{Checkpoint metrics for \\texttt{{{_escape_tex(name)}}}.}}",
+            f"  \\label{{tab:{safe_name}}}",
+            r"  \begin{tabular}{r r r r r r r r r r}",
+            r"    \toprule",
+            r"    Step & Gaussians & PSNR 3D & L1 3D & IoU 3D & SSIM 3D & PSNR 2D & L1 2D & IoU 2D & SSIM 2D \\",
+            r"    \midrule",
+        ]
+        for cp in cps:
+            m3 = cp.get("metrics_3d") or {}
+            m2 = cp.get("metrics_2d") or {}
+            row = [
+                str(cp.get("step", 0)),
+                f"{cp.get('gaussian_count', 0):,}",
+                _fmt(m3.get("psnr"), 2),
+                _fmt(m3.get("l1"), 5),
+                _fmt(m3.get("iou"), 4),
+                _fmt(m3.get("ssim_mean"), 4),
+                _fmt(m2.get("psnr"), 2),
+                _fmt(m2.get("l1"), 5),
+                _fmt(m2.get("iou"), 4),
+                _fmt(m2.get("ssim"), 4),
+            ]
+            elines.append("    " + " & ".join(row) + r" \\")
+        elines += [
+            r"    \bottomrule",
+            r"  \end{tabular}",
+            r"\end{table}",
+        ]
+        (tex_dir / f"{safe_name}_checkpoints.tex").write_text(
+            "\n".join(elines), encoding="utf-8"
+        )
+
+    print(f"[report] LaTeX tables saved to {tex_dir}")
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -667,6 +908,11 @@ def generate(base_dir, summaries):
     index_html = _index_page(summaries, all_results, base_dir)
     idx = base_dir/"report.html"
     idx.write_text(index_html, encoding="utf-8")
+
+    # Paper-ready exports
+    _export_matplotlib_plots(all_results, base_dir)
+    _export_latex_tables(summaries, all_results, base_dir)
+
     return idx
 
 
