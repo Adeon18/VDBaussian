@@ -18,11 +18,11 @@ cbuffer RasterParams
     uint3 volumeResolution;
     uint3 tileResolution;
     uint  tileSize;
+    uint  maxGaussiansPerTile;
     float3 volumeMinWorld;
     float3 volumeMaxWorld;
 };
 
-static const uint MAX_GAUSSIANS_PER_TILE = 256;
 static const float CUTOFF_RADIUS = 3.0;
 
 uint GetTileIndex(uint3 voxelID) {
@@ -83,14 +83,14 @@ void rasterize_tiled(uint3 tid : SV_DispatchThreadID)
     // Get tile index
     uint tileIdx = GetTileIndex(tid);
     uint count = gTileCounts[tileIdx];
-    count = min(count, MAX_GAUSSIANS_PER_TILE);
+    count = min(count, maxGaussiansPerTile);
 
     float density = 0.0;
 
     // ONLY loop through Gaussians in this tile!
     for (uint i = 0; i < count; ++i)
     {
-        uint gid = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + i];
+        uint gid = gTileContent[tileIdx * maxGaussiansPerTile + i];
         Gaussian g = gGaussians[gid];
 
         float3 d = worldPos - g.pos;

@@ -7,7 +7,6 @@ static const uint TRAIN_WG_Z = 4;
 static const uint TRAIN_WG_SIZE = TRAIN_WG_X * TRAIN_WG_Y * TRAIN_WG_Z;
 
 // DEFINITIONS
-static const uint MAX_GAUSSIANS_PER_TILE = 256;
 
 // PARAMETER LAYOUT CONFIGURATION
 static const uint PARAM_POS_X  = 0;
@@ -131,6 +130,9 @@ cbuffer TrainParams {
     uint  sgldEnabled;
     float sgldTemperature;
     float sgldK;  // controls how fast noise suppresses as weight increases, ~5-20
+
+    // Tile config
+    uint maxGaussiansPerTile;
 
     // Debug
     uint debugMode;
@@ -322,11 +324,11 @@ float3 divergingColor(float t) {
 float gsDebug_computeDensityTiled(float3 worldPos, uint3 tid)
 {
     uint tileIdx = GetTileIndex(tid);
-    uint count   = min(gTileCounts[tileIdx], MAX_GAUSSIANS_PER_TILE);
+    uint count   = min(gTileCounts[tileIdx], maxGaussiansPerTile);
     float density = 0.0;
     for (uint i = 0; i < count; ++i)
     {
-        uint gid = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + i];
+        uint gid = gTileContent[tileIdx * maxGaussiansPerTile + i];
         Gaussian g = Gaussian::load(gid);
         float3 d = worldPos - g.pos;
         float maxScale = max(g.scale.x, max(g.scale.y, g.scale.z));
@@ -363,11 +365,11 @@ void compute_debug(uint3 tid : SV_DispatchThreadID)
     {
         // Already tile-based — unchanged
         uint tileIdx = GetTileIndex(tid);
-        uint count   = min(gTileCounts[tileIdx], MAX_GAUSSIANS_PER_TILE);
+        uint count   = min(gTileCounts[tileIdx], maxGaussiansPerTile);
         float totalGradMag = 0.0;
         for (uint i = 0; i < count; ++i)
         {
-            uint gid = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + i];
+            uint gid = gTileContent[tileIdx * maxGaussiansPerTile + i];
             float gradMag = 0.0;
             for (uint p = 0; p < PARAMS_PER_GAUSSIAN; ++p) {
                 float g = gGradientsRaw[gid * PARAMS_PER_GAUSSIAN + p];
@@ -437,8 +439,8 @@ void bin_gaussians(uint3 tid : SV_DispatchThreadID) {
                 uint tileIdx = z * (tileResolution.x * tileResolution.y) + y * tileResolution.x + x;
                 uint slot;
                 InterlockedAdd(gTileCounts[tileIdx], 1, slot);
-                if (slot < MAX_GAUSSIANS_PER_TILE) {
-                    uint bufferIdx = tileIdx * MAX_GAUSSIANS_PER_TILE + slot;
+                if (slot < maxGaussiansPerTile) {
+                    uint bufferIdx = tileIdx * maxGaussiansPerTile + slot;
                     gTileContent[bufferIdx] = gid;
                 }
             }
@@ -458,7 +460,7 @@ void atomicAccumulate(uint idx, float val) {
 void gsBatch_prefetch(uint batchStart, uint tileIdx, uint batchCount, uint lane)
 {
     if (lane >= batchCount) return;
-    uint gid = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + batchStart + lane];
+    uint gid = gTileContent[tileIdx * maxGaussiansPerTile + batchStart + lane];
     gsBatchGaussianIDs[lane] = gid;
     gsBatchPos[lane]    = float4(asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_POS_X]),
                                  asfloat(gGaussianParamsRaw[gid * PARAMS_PER_GAUSSIAN + PARAM_POS_Y]),
@@ -603,7 +605,7 @@ void train_main(uint3 tid : SV_DispatchThreadID)
 {
     uint lane    = GetLocalThreadIndex(tid);
     uint tileIdx = GetTileIndex(tid);
-    uint totalCount = min(gTileCounts[tileIdx], MAX_GAUSSIANS_PER_TILE);
+    uint totalCount = min(gTileCounts[tileIdx], maxGaussiansPerTile);
 
     bool voxelActive = !any(tid >= volumeResolution);
     float3 worldPos = float3(0.0);

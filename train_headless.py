@@ -347,6 +347,7 @@ class HeadlessTrainer:
 
         vol = cfg["volume"]
         self.VOL_SIZE               = int(vol["vol_size"])
+        self.USE_NATIVE_VDB_SIZE    = bool(vol.get("use_native_size", False))
         self.TILE_SIZE              = int(vol["tile_size"])
         self.MAX_GAUSSIANS_PER_TILE = int(vol["max_gaussians_per_tile"])
 
@@ -359,6 +360,7 @@ class HeadlessTrainer:
         """
         import app as _app
         _app.VOL_SIZE               = self.VOL_SIZE
+        _app.USE_NATIVE_VDB_SIZE    = self.USE_NATIVE_VDB_SIZE
         _app.TILE_SIZE              = self.TILE_SIZE
         _app.MAX_GAUSSIANS_PER_TILE = self.MAX_GAUSSIANS_PER_TILE
 
@@ -418,9 +420,15 @@ class HeadlessTrainer:
 
         self.logger.info("Converting to dense volume...")
         up_axis = self.cfg.get("volume", {}).get("up_axis", "+Y")
-        self.vol_min, self.vol_max, vol_data, self.axis_remap = convert_grid_to_dense_volume(
-            self.grid, self.VOL_SIZE, up_axis_name=up_axis
+        self.vol_min, self.vol_max, vol_data, self.axis_remap, resolved_size = convert_grid_to_dense_volume(
+            self.grid, self.VOL_SIZE, up_axis_name=up_axis,
+            use_native_size=self.USE_NATIVE_VDB_SIZE,
         )
+        if resolved_size != self.VOL_SIZE:
+            self.VOL_SIZE = resolved_size
+            import app as _app
+            _app.VOL_SIZE = resolved_size
+            self.logger.info(f"Native VDB size resolved to {resolved_size}")
 
         # Aliases expected by ADCController
         self.vol_min_world = self.vol_min

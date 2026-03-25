@@ -159,6 +159,7 @@ class MetricsCollector:
             cursor["TrainParams"][
                 "tileSize"
             ] = r.tile_size  # expose as attribute if needed
+            cursor["TrainParams"]["maxGaussiansPerTile"] = r.max_gaussians_per_tile
             cp.dispatch(thread_count=(total_tiles, 1, 1))
 
         with cmd.begin_compute_pass() as cp:
@@ -172,6 +173,7 @@ class MetricsCollector:
             cursor["TrainParams"]["minWorld"] = tuple(vol_min)
             cursor["TrainParams"]["maxWorld"] = tuple(vol_max)
             cursor["TrainParams"]["tileSize"] = r.tile_size
+            cursor["TrainParams"]["maxGaussiansPerTile"] = r.max_gaussians_per_tile
             cp.dispatch(thread_count=(r.gaussian_count, 1, 1))
 
         self.device.submit_command_buffer(cmd.finish())
@@ -182,6 +184,7 @@ class MetricsCollector:
         cursor["MetricsParams"]["volumeResolution"] = self.vol_res
         cursor["MetricsParams"]["tileResolution"] = self.renderer.tile_res
         cursor["MetricsParams"]["tileSize"] = self.renderer.tile_size
+        cursor["MetricsParams"]["maxGaussiansPerTile"] = self.renderer.max_gaussians_per_tile
         cursor["MetricsParams"]["iouThreshold"] = self.config.iou_threshold
         cursor["MetricsParams"]["minWorld"] = tuple(vol_min)
         cursor["MetricsParams"]["maxWorld"] = tuple(vol_max)

@@ -41,6 +41,7 @@ PRINT_GRADIENT_STATS = True  # Print gradient statistics
 VDB_FILE = "cloud_01_variant_0000.vdb"
 # VDB_FILE = "C:\\Users\\ade0n\\Downloads\\TornadoLoopingVDB\\TornadoLooping\\TornadoVDB\\tornado_0109.vdb"
 VOL_SIZE = 196
+USE_NATIVE_VDB_SIZE = False  # When True, VOL_SIZE is ignored and the VDB's native resolution is used
 VDB_UP_AXIS = "-Z"  # Source VDB up axis: "+Y" (Houdini/Maya), "+Z" (Blender/3dsMax), etc.
 SHADER_FILE = "shaders/hybrid.slang"
 TILE_SIZE = 4
@@ -314,28 +315,43 @@ def _remap_bounds(world_min, world_max, perm, signs):
     return our_min, our_max
 
 
-def _inverse_remap_position(pos, perm, signs):
-    """Our coordinate system → VDB world position."""
-    vdb = np.zeros(3)
-    for i in range(3):
-        vdb[perm[i]] = signs[i] * pos[i]
-    return vdb
+
+def _get_native_vdb_size(grid, up_axis_name="+Y"):
+    """Compute the cubic resolution needed to represent the VDB at native resolution.
+
+    Returns the max dimension of the active voxel bounding box (after axis remap),
+    so the output cube matches the longest axis 1:1 with the VDB's own voxels.
+    """
+    bbox = grid.evalActiveVoxelBoundingBox()
+    min_i, max_i = np.array(bbox[0]), np.array(bbox[1])
+    vdb_dims = max_i - min_i + 1
+
+    up_axis, up_sign = VDB_UP_AXES[up_axis_name]
+    perm, _ = _build_axis_remap(up_axis, up_sign)
+    remapped_dims = np.array([vdb_dims[perm[i]] for i in range(3)])
+
+    return int(np.max(remapped_dims))
 
 
-def convert_grid_to_dense_volume(grid, size, up_axis_name="+Y"):
+def convert_grid_to_dense_volume(grid, size, up_axis_name="+Y", use_native_size=False):
     """Convert sparse VDB grid to dense 3D texture.
 
     Remaps the VDB so the specified source up axis becomes +Y in our
     coordinate system, then samples uniformly in world space.
 
     Args:
-        grid:          OpenVDB grid object.
-        size:          Voxels per axis for the output cube.
-        up_axis_name:  Source up axis — one of "+Y", "-Y", "+Z", "-Z",
-                       "+X", "-X".  Default "+Y" (Houdini/Maya).
+        grid:             OpenVDB grid object.
+        size:             Voxels per axis for the output cube (ignored when
+                          use_native_size is True).
+        up_axis_name:     Source up axis — one of "+Y", "-Y", "+Z", "-Z",
+                          "+X", "-X".  Default "+Y" (Houdini/Maya).
+        use_native_size:  When True, *size* is overridden by the VDB's native
+                          resolution (max active-bbox axis).
 
-    Returns (vol_min, vol_max, data, axis_remap) where axis_remap is a
-    (perm, signs) tuple needed by convert_grid_to_gaussians.
+    Returns (vol_min, vol_max, data, axis_remap, resolved_size) where
+    axis_remap is a (perm, signs) tuple needed by convert_grid_to_gaussians,
+    and resolved_size is the actual voxels-per-axis used (== size unless
+    use_native_size was True).
     """
     if grid is None:
         print("Error! Grid is None!")
@@ -345,11 +361,16 @@ def convert_grid_to_dense_volume(grid, size, up_axis_name="+Y"):
     min_i, max_i = np.array(bbox[0]), np.array(bbox[1])
 
     vdb_dims = max_i - min_i + 1
-    print(f"=== VDB Info ===")
+
+    if use_native_size:
+        size = _get_native_vdb_size(grid, up_axis_name)
+        print(f"=== VDB Info (native resolution) ===")
+    else:
+        print(f"=== VDB Info ===")
     print(f"  Active bbox (index): {tuple(min_i)} -> {tuple(max_i)}")
     print(f"  VDB dimensions: {vdb_dims[0]} x {vdb_dims[1]} x {vdb_dims[2]} voxels")
     print(f"  Total active voxels: ~{int(np.prod(vdb_dims)):,}")
-    print(f"  Resampling to: {size} x {size} x {size}")
+    print(f"  Output resolution: {size} x {size} x {size}")
 
     transform = grid.transform
 
@@ -390,18 +411,49 @@ def convert_grid_to_dense_volume(grid, size, up_axis_name="+Y"):
     min_world_bound = center - half
     max_world_bound = center + half
 
+    # Build a grid of sample positions (vectorized)
+    coords = np.arange(size, dtype=np.float64) + 0.5
+    xg, yg, zg = np.meshgrid(coords, coords, coords, indexing='ij')
+    # xg[x,y,z] = x+0.5, yg[x,y,z] = y+0.5, zg[x,y,z] = z+0.5
+    t_x = xg / size
+    t_y = yg / size
+    t_z = zg / size
+
+    extent = max_world_bound - min_world_bound
+    our_x = min_world_bound[0] + t_x * extent[0]
+    our_y = min_world_bound[1] + t_y * extent[1]
+    our_z = min_world_bound[2] + t_z * extent[2]
+
+    # Inverse remap: our coords → VDB world coords (vectorized)
+    signs_arr = np.array(signs, dtype=np.float64)
+    our_components = [our_x, our_y, our_z]
+    vdb_x = np.zeros_like(our_x)
+    vdb_y = np.zeros_like(our_y)
+    vdb_z = np.zeros_like(our_z)
+    vdb_components = [vdb_x, vdb_y, vdb_z]
+    for i in range(3):
+        vdb_components[perm[i]] = signs_arr[i] * our_components[i]
+    vdb_x, vdb_y, vdb_z = vdb_components
+
+    # Sample the VDB using the accessor (must loop — accessor is not vectorizable)
     accessor = grid.getAccessor()
     data = np.zeros((size, size, size), dtype=np.float32)
+    total_voxels = size * size * size
+    print(f"  Sampling {total_voxels:,} voxels...")
+    t_start = time.time()
 
-    for z in range(size):
+    for x in range(size):
         for y in range(size):
-            for x in range(size):
-                t = (np.array([x, y, z], dtype=np.float64) + 0.5) / size
-                our_pos = min_world_bound + t * (max_world_bound - min_world_bound)
-                vdb_pos = _inverse_remap_position(our_pos, perm, signs)
-                idx = np.array(transform.worldToIndex(tuple(vdb_pos)))
-                val = accessor.getValue(tuple(idx.astype(int)))
+            for z in range(size):
+                vdb_pos = (float(vdb_x[x, y, z]),
+                           float(vdb_y[x, y, z]),
+                           float(vdb_z[x, y, z]))
+                idx = transform.worldToIndex(vdb_pos)
+                val = accessor.getValue((int(idx[0]), int(idx[1]), int(idx[2])))
                 data[z, y, x] = val
+
+    elapsed = time.time() - t_start
+    print(f"  Sampling took {elapsed:.1f}s")
 
     m = np.max(data)
     if m > 0:
@@ -409,7 +461,7 @@ def convert_grid_to_dense_volume(grid, size, up_axis_name="+Y"):
     fill_ratio = np.count_nonzero(data) / data.size * 100
     print(f"  Fill ratio: {fill_ratio:.1f}% of voxels non-zero")
 
-    return min_world_bound, max_world_bound, np.ascontiguousarray(data, dtype=np.float32), axis_remap
+    return min_world_bound, max_world_bound, np.ascontiguousarray(data, dtype=np.float32), axis_remap, size
 
 
 def convert_grid_to_gaussians(grid, config, axis_remap=None):
@@ -654,6 +706,7 @@ class Renderer:
         self.last_mod_time = 0
         self.error_msg = ""
         self.tile_size = TILE_SIZE
+        self.max_gaussians_per_tile = MAX_GAUSSIANS_PER_TILE
 
         self.linear_sampler = device.create_sampler(
             min_filter=spy.TextureFilteringMode.linear,
@@ -796,7 +849,7 @@ class Renderer:
         )
 
         self.tile_content = self.device.create_buffer(
-            element_count=total_tiles * MAX_GAUSSIANS_PER_TILE,
+            element_count=total_tiles * self.max_gaussians_per_tile,
             struct_size=4,
             usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
             memory_type=spy.MemoryType.device_local,
@@ -911,6 +964,22 @@ class Renderer:
             cp.dispatch(thread_count=(threads, 1, 1))
 
         self.device.submit_command_buffer(cmd.finish())
+
+    def set_max_gaussians_per_tile(self, value):
+        """Change max gaussians per tile and recreate the tile content buffer."""
+        value = max(1, int(value))
+        if value == self.max_gaussians_per_tile:
+            return
+        self.max_gaussians_per_tile = value
+        total_tiles = self.tile_res[0] * self.tile_res[1] * self.tile_res[2]
+        self.tile_content = self.device.create_buffer(
+            element_count=total_tiles * self.max_gaussians_per_tile,
+            struct_size=4,
+            usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource,
+            memory_type=spy.MemoryType.device_local,
+        )
+        self._needs_rebinning = True
+        print(f"Tile content buffer resized: max_gaussians_per_tile={value}")
 
     def analyze_gradients(self):
         """Analyze gradient health - CALIBRATED FOR VOLUMETRIC FITTING. This function are just suggestions for me"""
@@ -1042,6 +1111,7 @@ class Renderer:
             cursor["TrainParams"]["minWorld"] = tuple(vol_min)
             cursor["TrainParams"]["maxWorld"] = tuple(vol_max)
             cursor["TrainParams"]["tileSize"] = TILE_SIZE
+            cursor["TrainParams"]["maxGaussiansPerTile"] = self.max_gaussians_per_tile
             cursor["TrainParams"]["debugMode"] = self.debug_mode
             cursor["TrainParams"]["debugScale"] = self.debug_scale
             cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
@@ -1066,6 +1136,7 @@ class Renderer:
             cursor["gGradientsRaw"] = self.grad_buffer
             cursor["TrainParams"]["gaussianCount"] = self.gaussian_count
             cursor["TrainParams"]["tileSize"] = TILE_SIZE
+            cursor["TrainParams"]["maxGaussiansPerTile"] = self.max_gaussians_per_tile
 
             threads = self.gaussian_count * PARAMS_PER_GAUSSIAN
             cp.dispatch(thread_count=(threads, 1, 1))
@@ -1079,6 +1150,7 @@ class Renderer:
                 cursor["TrainParams"]["tileResolution"] = self.tile_res
                 cursor["TrainParams"]["totalTiles"] = total_tiles
                 cursor["TrainParams"]["tileSize"] = TILE_SIZE
+                cursor["TrainParams"]["maxGaussiansPerTile"] = self.max_gaussians_per_tile
                 cp.dispatch(thread_count=(total_tiles, 1, 1))
 
             # 3. Bin Gaussians
@@ -1099,6 +1171,7 @@ class Renderer:
                 cursor["TrainParams"]["minWorld"] = tuple(vol_min)
                 cursor["TrainParams"]["maxWorld"] = tuple(vol_max)
                 cursor["TrainParams"]["tileSize"] = TILE_SIZE
+                cursor["TrainParams"]["maxGaussiansPerTile"] = self.max_gaussians_per_tile
                 cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
             self._needs_rebinning = False
 
@@ -1136,6 +1209,7 @@ class Renderer:
             cursor["TrainParams"]["minWorld"] = tuple(vol_min)
             cursor["TrainParams"]["maxWorld"] = tuple(vol_max)
             cursor["TrainParams"]["tileSize"] = TILE_SIZE
+            cursor["TrainParams"]["maxGaussiansPerTile"] = self.max_gaussians_per_tile
 
             cursor["TrainParams"]["lossMode"] = train_config.loss_mode
             cursor["TrainParams"]["huberDelta"] = train_config.huber_delta
@@ -1166,6 +1240,7 @@ class Renderer:
             ]
 
             cursor["TrainParams"]["tileSize"] = TILE_SIZE
+            cursor["TrainParams"]["maxGaussiansPerTile"] = self.max_gaussians_per_tile
             # Adam iter is not used as training iter because I said so
             cursor["TrainParams"]["adamIteration"] = self.adam_iteration
 
@@ -1409,6 +1484,7 @@ class Renderer:
                 cursor["TrainParams"]["tileResolution"] = self.tile_res
                 cursor["TrainParams"]["totalTiles"] = total_tiles
                 cursor["TrainParams"]["tileSize"] = TILE_SIZE
+                cursor["TrainParams"]["maxGaussiansPerTile"] = self.max_gaussians_per_tile
                 cp.dispatch(thread_count=(total_tiles, 1, 1))
 
             # 3. Bin Gaussians
@@ -1429,6 +1505,7 @@ class Renderer:
                 cursor["TrainParams"]["minWorld"] = tuple(vol_min)
                 cursor["TrainParams"]["maxWorld"] = tuple(vol_max)
                 cursor["TrainParams"]["tileSize"] = TILE_SIZE
+                cursor["TrainParams"]["maxGaussiansPerTile"] = self.max_gaussians_per_tile
                 cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
             self._needs_rebinning = False
 
@@ -1443,6 +1520,7 @@ class Renderer:
             cursor["RasterParams"]["volumeResolution"] = (VOL_SIZE, VOL_SIZE, VOL_SIZE)
             cursor["RasterParams"]["tileResolution"] = self.tile_res
             cursor["RasterParams"]["tileSize"] = TILE_SIZE
+            cursor["RasterParams"]["maxGaussiansPerTile"] = self.max_gaussians_per_tile
             cursor["RasterParams"]["volumeMinWorld"] = tuple(vol_min)
             cursor["RasterParams"]["volumeMaxWorld"] = tuple(vol_max)
 
@@ -1911,11 +1989,14 @@ class App:
             type=spy.DeviceType.vulkan,
         )
 
+        global VOL_SIZE
         self.grid = load_vdb_grid(VDB_FILE)
         self.vdb_up_axis = VDB_UP_AXIS
-        self.vol_min_world, self.vol_max_world, vol_data, self.axis_remap = convert_grid_to_dense_volume(
-            self.grid, VOL_SIZE, up_axis_name=self.vdb_up_axis
+        self.vol_min_world, self.vol_max_world, vol_data, self.axis_remap, resolved_size = convert_grid_to_dense_volume(
+            self.grid, VOL_SIZE, up_axis_name=self.vdb_up_axis,
+            use_native_size=USE_NATIVE_VDB_SIZE,
         )
+        VOL_SIZE = resolved_size
         self.gaussians = convert_grid_to_gaussians(self.grid, self.train_config, self.axis_remap)
 
         self.renderer = Renderer(self.device, vol_data)
@@ -2081,9 +2162,9 @@ class App:
                         print(f"[ALERT] Tiler works ({total_refs} refs) but ALL gradients are ZERO.")
                     else:
                         print(f"[OK] Training Running. Refs: {total_refs}, GradMax: {grad_max:.6f}, ActiveWeightGrads: {nonzero}/{len(weight_grads)}")
-                    maxed_tiles = np.sum(tile_debug >= MAX_GAUSSIANS_PER_TILE)
+                    maxed_tiles = np.sum(tile_debug >= self.renderer.max_gaussians_per_tile)
                     if maxed_tiles > 0:
-                        print(f"[WARN] {maxed_tiles} tiles at MAX_GAUSSIANS_PER_TILE cap!")
+                        print(f"[WARN] {maxed_tiles} tiles at max_gaussians_per_tile ({self.renderer.max_gaussians_per_tile}) cap!")
 
                 if self.train_step % 50 == 0:
                     self.renderer.analyze_gradients()
@@ -2539,7 +2620,7 @@ class App:
                 )
             imgui.same_line()
             if imgui.button("Reload VDB"):
-                self.vol_min_world, self.vol_max_world, vol_data, self.axis_remap = convert_grid_to_dense_volume(
+                self.vol_min_world, self.vol_max_world, vol_data, self.axis_remap, _ = convert_grid_to_dense_volume(
                     self.grid, VOL_SIZE, up_axis_name=self.vdb_up_axis
                 )
                 cmd = self.device.create_command_encoder()
@@ -2571,6 +2652,13 @@ class App:
                 self.device.submit_command_buffer(cmd.finish())
                 self.train_config.sgld.reset()
                 print("Gaussians regenerated!")
+
+            imgui.dummy((0, 5))
+            changed_mgpt, new_mgpt = imgui.slider_int(
+                "Max Gaussians/Tile", self.renderer.max_gaussians_per_tile, 32, 1024
+            )
+            if changed_mgpt:
+                self.renderer.set_max_gaussians_per_tile(new_mgpt)
 
             imgui.dummy((0, 10))
             if imgui.button(
@@ -2959,13 +3047,16 @@ class SlimApp(spy.AppWindow):
         # Use the device from AppWindow (created in entry point and passed via spy.App)
         self._device = self.device
 
+        global VOL_SIZE
         self.grid = load_vdb_grid(VDB_FILE)
         self.vdb_up_axis = VDB_UP_AXIS
-        self.vol_min_world, self.vol_max_world, vol_data, self.axis_remap = (
+        self.vol_min_world, self.vol_max_world, vol_data, self.axis_remap, resolved_size = (
             convert_grid_to_dense_volume(
-                self.grid, VOL_SIZE, up_axis_name=self.vdb_up_axis
+                self.grid, VOL_SIZE, up_axis_name=self.vdb_up_axis,
+                use_native_size=USE_NATIVE_VDB_SIZE,
             )
         )
+        VOL_SIZE = resolved_size
         self.gaussians = convert_grid_to_gaussians(
             self.grid, self.train_config, self.axis_remap
         )

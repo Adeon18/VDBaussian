@@ -23,7 +23,6 @@
 [[vk::binding(4)]] RWStructuredBuffer<float> gMetricsResult;
 
 // CONSTANTS
-static const uint MAX_GAUSSIANS_PER_TILE = 256;
 static const uint PARAMS_PER_GAUSSIAN    = 11;
 
 static const uint PARAM_POS_X   = 0;
@@ -55,6 +54,7 @@ cbuffer MetricsParams
     float3 minWorld;
     float3 maxWorld;
     uint   tileSize;
+    uint   maxGaussiansPerTile;
     float  iouThreshold;
     float  ssimC1;
     float  ssimC2;
@@ -107,12 +107,12 @@ uint getTileIndex(uint3 voxelID)
 float evaluateDensityTiled(float3 worldPos, uint3 voxelID)
 {
     uint tileIdx = getTileIndex(voxelID);
-    uint count   = min(gTileCounts[tileIdx], MAX_GAUSSIANS_PER_TILE);
+    uint count   = min(gTileCounts[tileIdx], maxGaussiansPerTile);
     float density = 0.0;
 
     for (uint i = 0; i < count; ++i)
     {
-        uint gid  = gTileContent[tileIdx * MAX_GAUSSIANS_PER_TILE + i];
+        uint gid  = gTileContent[tileIdx * maxGaussiansPerTile + i];
         uint base = gid * PARAMS_PER_GAUSSIAN;
 
         float3 pos   = float3(asfloat(gGaussianParamsRaw[base + PARAM_POS_X]),
