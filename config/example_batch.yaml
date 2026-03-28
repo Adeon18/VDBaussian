@@ -10,7 +10,7 @@ global_overrides:
     max_steps: 3000
   output:
     checkpoints: [0, 50, 200, 500, 1000, 2000, 3000, -1]
-    result_dir: "results/run_004"
+    result_dir: "results/run_005"
 
 experiments:
 

@@ -294,21 +294,30 @@ def save_checkpoint(
         renderer.device.submit_command_buffer(cmd.finish())
 
     snap_cams = cfg["output"].get("snapshot_cameras", [])
+    snap_radius = cfg["output"].get("snapshot_radius", None)
     for cam_def in snap_cams:
         cam_name = cam_def.get("name", "cam")
         cam_dict = {k: np.array(v, dtype=np.float32)
                     for k, v in cam_def.items() if k != "name"}
+        # Scale camera position to requested radius
+        if snap_radius is not None:
+            pos = cam_dict["pos"]
+            cur_r = float(np.linalg.norm(pos))
+            if cur_r > 0:
+                cam_dict["pos"] = pos * (snap_radius / cur_r)
 
-        name_ref = f"step_{step:06d}_{cam_name}_ref.png"
-        name_pred = f"step_{step:06d}_{cam_name}_pred.png"
-        # Reference (raw VDB)
-        renderer.use_gaussian_volume = False
-        pix_ref  = render_to_array(renderer, cam_dict, settings, snap_w, snap_h)
-        save_png(pix_ref, out_dir / name_ref)
+        # Reference only rendered once (step 0) — reuse for all checkpoints
+        name_ref = f"step_000000_{cam_name}_ref.png"
+        ref_path = out_dir / name_ref
+        if not ref_path.exists():
+            renderer.use_gaussian_volume = False
+            pix_ref = render_to_array(renderer, cam_dict, settings, snap_w, snap_h)
+            save_png(pix_ref, ref_path)
 
         # Prediction (Gaussian volume)
+        name_pred = f"step_{step:06d}_{cam_name}_pred.png"
         renderer.use_gaussian_volume = True
-        pix_pred = render_to_array(renderer, cam_dict, settings, snap_w, snap_h)       
+        pix_pred = render_to_array(renderer, cam_dict, settings, snap_w, snap_h)
         save_png(pix_pred, out_dir / name_pred)
 
         renderer.use_gaussian_volume = False

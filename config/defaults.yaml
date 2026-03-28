@@ -54,10 +54,10 @@ sgld:
 
 # --- Gaussian Initialisation -------------------------------------------------
 gaussian_init:
-  mode: "percentage"              # "percentage" or "count"
-  density_weighted: true          # true = acceptance scaled by voxel density, false = uniform
+  mode: "count"                   # "percentage" or "count"
+  density_weighted: false         # true = acceptance scaled by voxel density, false = uniform
   probability_scale: 0.02         # Used when mode: percentage
-  target_count: 8000              # Used when mode: count
+  target_count: 10000             # Used when mode: count
   min_count: 500                  # Floor — retry with higher prob if below this
   max_count: 50000                # Ceiling — randomly subsample if exceeded
   sigma_scale: 2.0
@@ -180,22 +180,22 @@ output:
       right: [-0.667, 0.0, 0.0]
       up:    [ 0.0,  0.5,  0.0]
     - name: "right"
-      pos:   [ 2.5,  0.0,  0.0]
+      pos:   [ 1.7,  0.0,  0.0]
       front: [-1.0,  0.0,  0.0]
       right: [ 0.0,  0.0, -0.667]
       up:    [ 0.0,  0.5,  0.0]
     - name: "left"
-      pos:   [-2.5,  0.0,  0.0]
+      pos:   [-1.7,  0.0,  0.0]
       front: [ 1.0,  0.0,  0.0]
       right: [ 0.0,  0.0,  0.667]
       up:    [ 0.0,  0.5,  0.0]
     - name: "top"
-      pos:   [ 0.0,  2.5,  0.0]
+      pos:   [ 0.0,  1.7,  0.0]
       front: [ 0.0, -1.0,  0.0]
       right: [ 0.667, 0.0, 0.0]
       up:    [ 0.0,  0.0, -0.5]
     - name: "bottom"
-      pos:   [ 0.0, -2.5,  0.0]
+      pos:   [ 0.0, -1.7,  0.0]
       front: [ 0.0,  1.0,  0.0]
       right: [ 0.667, 0.0, 0.0]
       up:    [ 0.0,  0.0,  0.5]

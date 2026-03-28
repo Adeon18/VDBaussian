@@ -40,9 +40,11 @@ PRINT_GRADIENT_STATS = True  # Print gradient statistics
 # VDB_FILE = "C:\\Users\\ade0n\\Downloads\\bunny_cloud.vdb"
 VDB_FILE = "cloud_01_variant_0000.vdb"
 # VDB_FILE = "C:\\Users\\ade0n\\Downloads\\TornadoLoopingVDB\\TornadoLooping\\TornadoVDB\\tornado_0109.vdb"
-VOL_SIZE = 196
+# VDB_FILE = "C:\\Users\\ade0n\\Downloads\\Smoke_Plume_01\\Smoke_Plume_01\\embergen_smoke_plume_a_140.vdb"
+# VDB_FILE = "C:\\Users\\ade0n\\Downloads\\SmallCampfireVDB\\smallCampfire\\smallCampfireVDB\\smallCampfire_0122.vdb"
+VOL_SIZE = 128
 USE_NATIVE_VDB_SIZE = False  # When True, VOL_SIZE is ignored and the VDB's native resolution is used
-VDB_UP_AXIS = "-Z"  # Source VDB up axis: "+Y" (Houdini/Maya), "+Z" (Blender/3dsMax), etc.
+VDB_UP_AXIS = "-Y"  # Source VDB up axis: "+Y" (Houdini/Maya), "+Z" (Blender/3dsMax), etc.
 SHADER_FILE = "shaders/hybrid.slang"
 TILE_SIZE = 4
 MAX_GAUSSIANS_PER_TILE = 256
@@ -675,10 +677,10 @@ class TrainingConfig:
         self.use_adam = True  # Toggle between SGD and Adam
 
         # Gaussian Generation
-        self.gaussian_mode = "percentage"  # "percentage" or "count"
-        self.density_weighted = True       # True = bias toward dense voxels, False = uniform
+        self.gaussian_mode = "count"        # "percentage" or "count"
+        self.density_weighted = False       # True = bias toward dense voxels, False = uniform
         self.probability_scale = 0.02
-        self.target_count = 8000
+        self.target_count = 10000
         self.min_count = 500
         self.max_count = 50000
         self.sigma_scale = 2.0
@@ -2651,6 +2653,10 @@ class App:
                 )
                 self.device.submit_command_buffer(cmd.finish())
                 self.train_config.sgld.reset()
+                # Compute initial metrics so UI shows baseline values
+                self.metrics.tick(0, self.vol_min_world, self.vol_max_world,
+                                  is_training=True, force=True)
+                self.screen_metrics.tick(0, is_training=True, force=True)
                 print("Gaussians regenerated!")
 
             imgui.dummy((0, 5))

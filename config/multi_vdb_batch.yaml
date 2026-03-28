@@ -9,10 +9,10 @@
 
 global_overrides:
   training:
-    max_steps: 3000
+    max_steps: 200
   output:
-    result_dir: "results/multi_vdb"
-    checkpoints: [0, 50, 200, 500, 1000, 2000, 3000, -1]
+    result_dir: "results/multi_vdb2"
+    checkpoints: [0, 50, 200, -1]
 
 experiments:
 
@@ -21,7 +21,7 @@ experiments:
     description: "Soft white cloud with gentle lighting."
     volume:
       vdb_file: "cloud_04_variant_0000.vdb"
-      up_axis: "+Y"
+      up_axis: "-Z"
     rendering:
       smoke_color: [0.95, 0.95, 0.97]
       density_scale: 35.0
@@ -29,29 +29,33 @@ experiments:
       light_penetration: 0.25
       phase_g: 0.3
       sun_color: [1.0, 0.95, 0.85]
-      sun_intensity: 6.0
+      sun_intensity: 4.0
       ambient_color: [0.7, 0.75, 0.85]
-      ambient_intensity: 0.8
+      ambient_intensity: 0.45
+    output:
+      snapshot_radius: 2.5
 
-  # ── Tornado (dark grey/brown, high density, dramatic) ───────────────────
+  # ── Tornado (grey-brown, high density, dramatic) ──────────────────────
   - name: "tornado"
     description: "Dark tornado with harsh directional light."
     volume:
       vdb_file: "C:\\Users\\ade0n\\Downloads\\TornadoLoopingVDB\\TornadoLooping\\TornadoVDB\\tornado_0109.vdb"
-      up_axis: "+Y"
+      up_axis: "-Z"
     rendering:
-      smoke_color: [0.45, 0.40, 0.35]
-      density_scale: 60.0
+      smoke_color: [0.55, 0.50, 0.45]
+      density_scale: 55.0
       density_curve: 1.2
-      light_penetration: 0.08
+      light_penetration: 0.10
       phase_g: 0.5
       sun_direction: [0.8, -0.5, 0.3]
       sun_color: [1.0, 0.85, 0.6]
-      sun_intensity: 12.0
-      ambient_color: [0.4, 0.45, 0.5]
-      ambient_intensity: 0.3
+      sun_intensity: 4.0
+      ambient_color: [0.5, 0.55, 0.6]
+      ambient_intensity: 0.45
       shadow_steps: 8
       shadow_step_mult: 3.0
+    output:
+      snapshot_radius: 2.5
 
   # ── Bunny Cloud (warm cream, medium density) ────────────────────────────
   - name: "bunny_cloud"
@@ -60,32 +64,55 @@ experiments:
       vdb_file: "C:\\Users\\ade0n\\Downloads\\bunny_cloud.vdb"
       up_axis: "+Y"
     rendering:
-      smoke_color: [1.0, 0.92, 0.82]
-      density_scale: 45.0
+      smoke_color: [1.0, 0.95, 0.88]
+      density_scale: 40.0
       density_curve: 1.0
       light_penetration: 0.20
       phase_g: 0.35
       sun_color: [1.0, 0.9, 0.75]
-      sun_intensity: 7.0
-      ambient_color: [0.65, 0.6, 0.55]
-      ambient_intensity: 0.7
+      sun_intensity: 4.0
+      ambient_color: [0.65, 0.65, 0.7]
+      ambient_intensity: 0.45
+    output:
+      snapshot_radius: 2.75
 
-  # ── Smoke Plume (dark grey, high density, moody) ────────────────────────
+  # ── Smoke Plume (grey, high density, moody) ─────────────────────────────
   - name: "smoke_plume"
     description: "Dark smoke plume with cool ambient."
     volume:
       vdb_file: "C:\\Users\\ade0n\\Downloads\\Smoke_Plume_01\\Smoke_Plume_01\\embergen_smoke_plume_a_80.vdb"
-      up_axis: "+Y"
+      up_axis: "-Y"
     rendering:
-      smoke_color: [0.3, 0.3, 0.32]
-      density_scale: 55.0
+      smoke_color: [0.4, 0.4, 0.42]
+      density_scale: 50.0
       density_curve: 1.3
-      light_penetration: 0.06
+      light_penetration: 0.08
       phase_g: 0.55
       sun_direction: [0.5, -1.0, 0.5]
       sun_color: [1.0, 0.8, 0.6]
-      sun_intensity: 10.0
+      sun_intensity: 4.0
       ambient_color: [0.5, 0.55, 0.65]
-      ambient_intensity: 0.4
+      ambient_intensity: 0.45
       shadow_steps: 8
+    output:
+      snapshot_radius: 2.6
 
+  # ── Campfire (warm orange/amber glow) ───────────────────────────────────
+  - name: "campfire"
+    description: "Small campfire with warm fiery tones."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\SmallCampfireVDB\\smallCampfire\\smallCampfireVDB\\smallCampfire_0122.vdb"
+      up_axis: "-Y"
+    rendering:
+      smoke_color: [1.0, 0.75, 0.45]
+      density_scale: 2.0
+      density_curve: 1.0
+      light_penetration: 0.15
+      phase_g: 0.4
+      sun_direction: [0.0, -1.0, 0.5]
+      sun_color: [1.0, 0.85, 0.5]
+      sun_intensity: 4.0
+      ambient_color: [0.7, 0.5, 0.3]
+      ambient_intensity: 0.45
+    output:
+      snapshot_radius: 2.8
