@@ -423,6 +423,7 @@ class HeadlessTrainer:
         # ---- VDB ----
         vdb_path = self.cfg["volume"]["vdb_file"]
         self.logger.info(f"Loading VDB: {vdb_path}")
+        self.vdb_file_size = os.path.getsize(vdb_path) if os.path.isfile(vdb_path) else 0
         self.grid = load_vdb_grid(vdb_path)
         if self.grid is None:
             raise RuntimeError(f"Failed to load VDB: {vdb_path}")
@@ -709,6 +710,18 @@ class HeadlessTrainer:
         results["wall_time_seconds"]    = time.time() - t_wall
         results["step_time_samples"]    = self.timer.samples
         results["step_time_summary"]    = self.timer.summary()
+
+        # Compression ratio
+        gc = self.renderer.gaussian_count
+        gauss_bytes = gc * self._PARAMS_PER_GAUSSIAN * 4
+        vol_bytes   = self.VOL_SIZE ** 3 * 4
+        results["compression"] = {
+            "gaussian_data_bytes": gauss_bytes,
+            "volume_texture_bytes": vol_bytes,
+            "vdb_file_bytes": self.vdb_file_size,
+            "ratio_vs_volume": round(vol_bytes / gauss_bytes, 2) if gauss_bytes > 0 else 0,
+            "ratio_vs_vdb": round(self.vdb_file_size / gauss_bytes, 2) if gauss_bytes > 0 else 0,
+        }
 
         _flush_json(results, self.out_dir / "results.json")
 

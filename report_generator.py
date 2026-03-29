@@ -335,6 +335,11 @@ def _exp_page(results, exp_dir):
         return (f'<div class="card"><div class="kv-val">{val}</div>'
                 f'<div class="kv-lbl">{lbl}</div></div>')
 
+    comp = results.get("compression", {})
+    cr_vol = comp.get("ratio_vs_volume")
+    cr_vdb = comp.get("ratio_vs_vdb")
+    g_kb   = comp.get("gaussian_data_bytes", 0) / 1024
+
     cards = "".join([
         _card(_fmt(_last("3d","psnr"),2),  "PSNR 3D (dB)"),
         _card(_fmt(_last("2d","psnr"),2),  "PSNR 2D (dB)"),
@@ -344,6 +349,9 @@ def _exp_page(results, exp_dir):
         _card(_fmt(_last("2d","iou")),      "IoU 2D"),
         _card(f"{final_g:,}",              "Final Gaussians"),
         _card(f"{st_sum.get('mean_ms','?')} ms","Avg Step"),
+        _card(f"{g_kb:.1f} KB",            "Gaussian Data"),
+        _card(f"{cr_vol:.1f}x" if cr_vol else "—", "Compr. vs Vol"),
+        _card(f"{cr_vdb:.1f}x" if cr_vdb else "—", "Compr. vs VDB"),
     ])
 
     # Filmstrip (ref + pred)
@@ -484,6 +492,10 @@ def _index_page(summaries, all_results, base_dir):
                     thumb = f'<img src="{b}" style="height:50px;border-radius:3px;vertical-align:middle;cursor:pointer" onclick="openLB(this.src)">'
                     break
 
+        comp = s.get("compression", {})
+        cr   = comp.get("ratio_vs_volume")
+        cr_s = f"{cr:.1f}x" if cr else "—"
+
         rows += (f'<tr>'
                  f'<td><a href="{name}/report.html">{name}</a></td>'
                  f'<td style="text-align:center">{thumb}</td>'
@@ -491,6 +503,7 @@ def _index_page(summaries, all_results, base_dir):
                  f'<td style="text-align:right">{wall}</td>'
                  f'<td style="text-align:right">{ms} ms</td>'
                  f'<td style="text-align:right">{f"{gc:,}" if isinstance(gc,int) else "—"}</td>'
+                 f'<td style="text-align:right">{cr_s}</td>'
                  + _cell(s,"final_psnr_3d",2) + _cell(s,"final_l1_3d",5)
                  + _cell(s,"final_iou_3d",4) + _cell(s,"final_ssim_3d",4)
                  + _cell(s,"final_psnr_2d",2) + _cell(s,"final_l1_2d",5)
@@ -499,7 +512,7 @@ def _index_page(summaries, all_results, base_dir):
 
     table = (f'<div class="scroll-x"><table>'
              f'<thead><tr><th>Name</th><th>Preview</th><th>Status</th>'
-             f'<th>Wall</th><th>Step</th><th>Gaussians</th>'
+             f'<th>Wall</th><th>Step</th><th>Gaussians</th><th>Compr.</th>'
              f'<th>PSNR3D↑</th><th>L1-3D↓</th><th>IoU3D↑</th><th>SSIM3D↑</th>'
              f'<th>PSNR2D↑</th><th>L1-2D↓</th><th>IoU2D↑</th><th>SSIM2D↑</th>'
              f'</tr></thead><tbody>{rows}</tbody></table></div>')
@@ -583,6 +596,10 @@ def _index_page(summaries, all_results, base_dir):
         strips = "".join(_pred_history_strip(cps, base_dir/name, c, 90)
                          for c in cam_names[:3])  # max 3 cams on index
 
+        comp_s = s.get("compression", {})
+        cr_s   = comp_s.get("ratio_vs_volume")
+        cr_txt = f"{cr_s:.1f}x" if cr_s else "—"
+
         exp_blocks += f"""
 <div class="exp-block">
   <div class="exp-header">
@@ -592,6 +609,7 @@ def _index_page(summaries, all_results, base_dir):
     <span style="margin-left:auto;color:#6c7086;font-size:12px">
       wall {wall} &nbsp;·&nbsp; {ms} ms/step &nbsp;·&nbsp;
       {f"{gc:,}" if isinstance(gc,int) else "—"} gaussians &nbsp;·&nbsp;
+      compr. {cr_txt} &nbsp;·&nbsp;
       PSNR3D <span style="color:{_psnr_color(p3)};font-weight:600">{_fmt(p3,2)}</span> dB &nbsp;·&nbsp;
       PSNR2D <span style="color:{_psnr_color(p2)};font-weight:600">{_fmt(p2,2)}</span> dB
     </span>
@@ -788,9 +806,9 @@ def _export_latex_tables(summaries: list[dict], all_results: dict, out_dir: Path
         r"  \centering",
         r"  \caption{Experiment results comparison.}",
         r"  \label{tab:results}",
-        r"  \begin{tabular}{l r r r r r r r r r}",
+        r"  \begin{tabular}{l r r r r r r r r r r}",
         r"    \toprule",
-        r"    Experiment & Gaussians & PSNR 3D$\uparrow$ & L1 3D$\downarrow$ & IoU 3D$\uparrow$ & SSIM 3D$\uparrow$ & PSNR 2D$\uparrow$ & L1 2D$\downarrow$ & IoU 2D$\uparrow$ & SSIM 2D$\uparrow$ \\",
+        r"    Experiment & Gaussians & Compr. & PSNR 3D$\uparrow$ & L1 3D$\downarrow$ & IoU 3D$\uparrow$ & SSIM 3D$\uparrow$ & PSNR 2D$\uparrow$ & L1 2D$\downarrow$ & IoU 2D$\uparrow$ & SSIM 2D$\uparrow$ \\",
         r"    \midrule",
     ]
 
@@ -809,7 +827,10 @@ def _export_latex_tables(summaries: list[dict], all_results: dict, out_dir: Path
         gc = s.get("final_gaussian_count")
         gc_str = f"{gc:,}" if isinstance(gc, int) else "---"
 
-        cells = [name, gc_str]
+        comp = s.get("compression", {})
+        cr = comp.get("ratio_vs_volume")
+        cr_str = f"{cr:.1f}$\\times$" if cr else "---"
+        cells = [name, gc_str, cr_str]
         fmt_map = {"final_psnr_3d": 2, "final_l1_3d": 5, "final_iou_3d": 4,
                    "final_ssim_3d": 4, "final_psnr_2d": 2, "final_l1_2d": 5,
                    "final_iou_2d": 4, "final_ssim_2d": 4}

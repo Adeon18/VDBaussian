@@ -2266,6 +2266,15 @@ class App:
             imgui.text(f"FPS: {1.0/(dt+0.0001):.1f}")
             if self.renderer.error_msg:
                 imgui.text_colored(imgui.ImVec4(1, 0, 0, 1), "SHADER ERROR")
+            imgui.separator()
+            gc = self.renderer.gaussian_count
+            gauss_bytes = gc * PARAMS_PER_GAUSSIAN * 4
+            vol_bytes = VOL_SIZE ** 3 * 4
+            ratio = vol_bytes / gauss_bytes if gauss_bytes > 0 else 0
+            imgui.text(f"Gaussians: {gc:,}")
+            imgui.text(f"Gaussian data: {gauss_bytes / 1024:.1f} KB")
+            imgui.text(f"Volume texture: {vol_bytes / 1024:.1f} KB")
+            imgui.text(f"Compression: {ratio:.2f}x")
         imgui.end()
 
         if imgui.begin("Rendering"):
