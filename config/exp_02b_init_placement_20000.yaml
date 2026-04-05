@@ -1,0 +1,54 @@
+# =============================================================================
+# exp_02b_init_placement.yaml  —  Placement strategy & initial scale
+#
+# Purpose: With the best count from exp_02a fixed, test whether density-weighted
+#          placement and different initial Gaussian sizes affect convergence.
+#
+# CASCADE: fill in best from exp_02a before running
+# Shape:   cloud_04_variant_0000
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_02b_init_placement.yaml
+# =============================================================================
+
+global_overrides:
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_02b_init_placement_20000"
+    snapshot_radius: 2.5
+
+  # ── CASCADE ────────────────────────────────────────────────────────────
+  gaussian_init:
+    target_count: 20000
+
+experiments:
+
+  - name: "baseline_uniform_sigma2"
+    description: "Best count from exp_02a, uniform random placement, default sigma_scale=2.0 — baseline for placement and scale comparison."
+
+  - name: "density_weighted"
+    description: "Density-weighted placement — more Gaussians seeded in high-density regions, tests whether biasing toward detail improves early convergence."
+    gaussian_init:
+      density_weighted: true
+
+  - name: "sigma_1"
+    description: "sigma_scale=1.0 (half default) — smaller, tighter initial Gaussians with less overlap, tests whether starting compact forces sharpening or causes gaps."
+    gaussian_init:
+      sigma_scale: 1.0
+
+  - name: "sigma_4" 
+    description: "sigma_scale=4.0 (double default) — broader initial Gaussians with heavy overlap, tests whether starting large lets the optimizer refine or causes persistent blur."
+    gaussian_init:
+      sigma_scale: 4.0

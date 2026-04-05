@@ -1,0 +1,101 @@
+# =============================================================================
+# exp_03b_adam_betas.yaml  —  Adam momentum & second-moment tuning
+#
+# Purpose: Test sensitivity to Adam's beta1 (momentum) and beta2 (RMSprop-like
+#          second-moment adaptation). Small changes to these can significantly
+#          affect convergence stability and speed.
+#
+# NOTE: Skip this batch entirely if SGD won in exp_03a.
+#
+# CASCADE: fill in best from exp_02a, exp_02b, exp_03a before running
+# Shape:   cloud_04_variant_0000
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_03b_adam_betas.yaml
+# =============================================================================
+
+global_overrides:
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_03b_adam_betas"
+    snapshot_radius: 2.5
+
+  # ── CASCADE ────────────────────────────────────────────────────────────
+  gaussian_init:
+    target_count: 15000
+    density_weighted: false
+    sigma_scale: 1.5
+  # From exp_03a (only needed if SGLD won — paste sgld block):
+  # sgld:
+  #   enabled: true
+  #   temperature_start: BEST_FROM_exp03a
+
+experiments:
+
+  - name: "baseline_betas"
+    description: "Adam with default betas (beta1=0.9, beta2=0.999) — baseline for beta tuning comparison."
+
+  - name: "beta1_08"
+    description: "Adam beta1=0.8 — less momentum, the optimizer reacts faster to gradient direction changes but updates are noisier."
+    training:
+      adam_beta1: 0.8
+  
+  - name: "beta1_085"
+    description: "Adam beta1=0.85"
+    training:
+      adam_beta1: 0.85
+
+  - name: "beta1_095"
+    description: "Adam beta1=0.95 — more momentum, smoother gradient estimates, but may overshoot when Gaussians need sharp corrections."
+    training:
+      adam_beta1: 0.95
+
+  - name: "beta1_099"
+    description: "Adam beta1=0.99 — very heavy momentum, tests whether the upward trend from 0.9 to 0.95 continues or peaks; may overshoot due to extreme inertia."
+    training:
+      adam_beta1: 0.99
+
+  - name: "beta2_09"
+    description: "Adam beta2=0.9"
+    training:
+      adam_beta2: 0.9
+
+  - name: "beta2_095"
+    description: "Adam beta2=0.95"
+    training:
+      adam_beta2: 0.95
+
+  - name: "beta2_099"
+    description: "Adam beta2=0.99 (default 0.999) — second-moment estimate adapts 10x faster to recent gradient magnitudes, giving more aggressive per-parameter LR scaling."
+    training:
+      adam_beta2: 0.99
+
+  - name: "beta1_095_beta2_09"
+    description: "Combined best individual winners (beta1=0.95, beta2=0.9) — tests whether the two improvements compound or interfere when applied together."
+    training:
+      adam_beta1: 0.95
+      adam_beta2: 0.9
+
+  - name: "beta1_095_beta2_095"
+    description: "beta1=0.95 + beta2=0.95 — pairs the best momentum with moderate second-moment adaptation, tests a middle ground between beta2=0.9 and default."
+    training:
+      adam_beta1: 0.95
+      adam_beta2: 0.95
+
+  - name: "beta1_095_beta2_099"
+    description: "beta1=0.95 + beta2=0.99 — pairs the best momentum with fast second-moment adaptation, tests if beta2=0.99 works better when paired with higher momentum."
+    training:
+      adam_beta1: 0.95
+      adam_beta2: 0.99

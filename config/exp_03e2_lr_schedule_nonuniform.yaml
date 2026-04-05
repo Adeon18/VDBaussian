@@ -1,0 +1,165 @@
+# =============================================================================
+# exp_03e2_lr_schedule_nonuniform.yaml  —  Non-uniform LR scheduling
+#
+# Purpose: Test whether different parameter groups benefit from different
+#          schedules. Motivated by exp_03d findings: pos and rot need aggressive
+#          LRs for early relocation/orientation but may benefit from settling
+#          later, while scale and weight are conservative and may need a boost
+#          once geometry is in place.
+#
+# CASCADE: best from exp_02a, exp_02b, exp_03a, exp_03b, exp_03c, exp_03d
+# Shape:   cloud_04_variant_0000
+#
+# Best LRs from exp_03d: pos=0.20, scale=0.005, rot=0.02, weight=0.025
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_03e2_lr_schedule_nonuniform.yaml
+# =============================================================================
+
+global_overrides:
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_03e2_lr_schedule_nonuniform"
+    snapshot_radius: 2.5
+
+  # -- CASCADE ----------------------------------------------------------------
+  gaussian_init:
+    target_count: 15000
+    density_weighted: false
+    sigma_scale: 1.5
+  training:
+    adam_beta2: 0.95
+    learning_rate_pos: 0.20
+    learning_rate_scale: 0.005
+    learning_rate_rotation: 0.02
+    learning_rate_weight: 0.025
+
+# LR multiplier reference:
+#   1x:    pos=0.200   scale=0.005    rot=0.020   weight=0.025
+#   0.5x:  pos=0.100   scale=0.0025   rot=0.010   weight=0.0125
+#   0.25x: pos=0.050   scale=0.00125  rot=0.005   weight=0.00625
+#   2x:    pos=0.400   scale=0.010    rot=0.040   weight=0.050
+
+experiments:
+
+  - name: "baseline_no_schedule"
+    description: "Fixed LRs for the full 3000 steps -- baseline for non-uniform scheduling comparison."
+
+  # ===== Decay geometric only (pos + rot) =====================================
+
+  - name: "decay_pos_only"
+    description: "Decay only position LR (0.5x at 1000, 0.25x at 2000), keep scale/rot/weight constant -- tests whether pos 4x is mainly needed for early relocation and should settle later."
+    training:
+      lr_schedule:
+        - at_step: 1000
+          learning_rate_pos: 0.100
+        - at_step: 2000
+          learning_rate_pos: 0.050
+
+  - name: "decay_pos_rot"
+    description: "Decay pos+rot together (0.5x at 1000, 0.25x at 2000), scale+weight constant -- geometric params settle first while magnitude params keep adapting."
+    training:
+      lr_schedule:
+        - at_step: 1000
+          learning_rate_pos: 0.100
+          learning_rate_rotation: 0.010
+        - at_step: 2000
+          learning_rate_pos: 0.050
+          learning_rate_rotation: 0.005
+
+  # ===== Position freeze ======================================================
+
+  - name: "pos_freeze_1500"
+    description: "Drop position LR to near-zero (0.005) at step 1500 while keeping others at full -- tests whether freezing Gaussian positions and only refining shape/weight improves late-stage quality."
+    training:
+      lr_schedule:
+        - at_step: 1500
+          learning_rate_pos: 0.005
+
+  - name: "pos_freeze_1000"
+    description: "Drop position LR to near-zero (0.005) at step 1000 -- earlier freeze, tests whether positions converge quickly and late movement is just noise."
+    training:
+      lr_schedule:
+        - at_step: 1000
+          learning_rate_pos: 0.005
+
+  # ===== Hot start for position ===============================================
+
+  - name: "pos_hot_start"
+    description: "Position starts at 8x (0.4) for fast initial relocation, drops to 4x (0.2) at step 500 -- tests whether even more aggressive early positioning helps before settling to the winning rate."
+    training:
+      learning_rate_pos: 0.400
+      lr_schedule:
+        - at_step: 500
+          learning_rate_pos: 0.200
+
+  - name: "pos_hot_start_decay"
+    description: "Position at 8x (0.4), drops to 4x (0.2) at step 500, then 2x (0.1) at step 1500 -- three-phase position schedule from aggressive relocation to fine positioning."
+    training:
+      learning_rate_pos: 0.400
+      lr_schedule:
+        - at_step: 500
+          learning_rate_pos: 0.200
+        - at_step: 1500
+          learning_rate_pos: 0.100
+
+  # ===== Boost magnitude params late ==========================================
+
+  - name: "boost_scale_late"
+    description: "Scale LR doubles to 0.01 at step 1500 after positions have settled -- tests whether Gaussians need faster size adaptation once geometry is locked in."
+    training:
+      lr_schedule:
+        - at_step: 1500
+          learning_rate_scale: 0.010
+
+  - name: "boost_weight_late"
+    description: "Weight LR doubles to 0.05 at step 1500 after positions have settled -- tests whether density contributions need faster adaptation once geometry is locked in."
+    training:
+      lr_schedule:
+        - at_step: 1500
+          learning_rate_weight: 0.050
+
+  # ===== Combined non-uniform strategies ======================================
+
+  - name: "decay_pos_boost_scale"
+    description: "Position decays (0.5x at 1000, 0.25x at 2000) while scale doubles at step 1500 -- geometry settles then Gaussians resize to fill gaps."
+    training:
+      lr_schedule:
+        - at_step: 1000
+          learning_rate_pos: 0.100
+        - at_step: 1500
+          learning_rate_scale: 0.010
+        - at_step: 2000
+          learning_rate_pos: 0.050
+
+  - name: "freeze_pos_boost_rot"
+    description: "Position freezes at step 1500, rotation doubles to 0.04 at step 1500 -- once positions lock, boost orientation refinement for anisotropic detail."
+    training:
+      lr_schedule:
+        - at_step: 1500
+          learning_rate_pos: 0.005
+          learning_rate_rotation: 0.040
+
+  - name: "full_nonuniform"
+    description: "Position decays 0.5x at 1000, rotation stays constant, scale and weight boost 2x at 1500, position decays 0.25x at 2000 -- full phase-aware schedule: relocate fast, then refine shape and density."
+    training:
+      lr_schedule:
+        - at_step: 1000
+          learning_rate_pos: 0.100
+        - at_step: 1500
+          learning_rate_scale: 0.010
+          learning_rate_weight: 0.050
+        - at_step: 2000
+          learning_rate_pos: 0.050

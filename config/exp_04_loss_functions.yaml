@@ -1,0 +1,118 @@
+# =============================================================================
+# exp_04_loss_functions.yaml  —  Pure loss function comparison (with LR comp.)
+#
+# Purpose: Compare L2, L1, and Huber loss functions with LR compensation.
+#          L1 and Huber produce constant-magnitude gradients unlike L2's
+#          error-scaled gradients, so they need reduced LRs for fair comparison.
+#          Without LR compensation, L1/Huber may appear worse simply due to
+#          instability from over-aggressive updates on small errors.
+#
+# CASCADE: best from exp_02a, exp_02b, exp_03a-d (scheduling shelved)
+# Shape:   cloud_04_variant_0000
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_04_loss_functions.yaml
+# =============================================================================
+
+global_overrides:
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_04_loss_functions"
+    snapshot_radius: 2.5
+
+  # -- CASCADE ----------------------------------------------------------------
+  gaussian_init:
+    target_count: 15000
+    density_weighted: false
+    sigma_scale: 1.5
+  training:
+    adam_beta2: 0.95
+    learning_rate_pos: 0.20
+    learning_rate_scale: 0.005
+    learning_rate_rotation: 0.02
+    learning_rate_weight: 0.025
+
+# LR reference (1x = L2-tuned from exp_03d):
+#   1x:    pos=0.200   scale=0.005   rot=0.020   weight=0.025
+#   0.5x:  pos=0.100   scale=0.0025  rot=0.010   weight=0.0125
+#   0.25x: pos=0.050   scale=0.00125 rot=0.005   weight=0.00625
+
+experiments:
+
+  # ===== L2 baseline ==========================================================
+
+  - name: "l2_baseline"
+    description: "L2 (MSE) loss at tuned LRs -- baseline; the default loss function all previous experiments used."
+    training:
+      loss_mode: 0
+
+  # ===== L1 with LR compensation =============================================
+
+  - name: "l1_1x_lr"
+    description: "L1 loss at 1x LR -- uncompensated, likely too aggressive; included as data point to show why LR compensation matters."
+    training:
+      loss_mode: 1
+
+  - name: "l1_05x_lr"
+    description: "L1 loss at 0.5x LR -- moderate compensation; L1's constant gradients need lower LR to avoid overshooting on small errors."
+    training:
+      loss_mode: 1
+      learning_rate_pos: 0.100
+      learning_rate_scale: 0.0025
+      learning_rate_rotation: 0.010
+      learning_rate_weight: 0.0125
+
+  - name: "l1_025x_lr"
+    description: "L1 loss at 0.25x LR -- aggressive compensation; tests whether L1 needs significantly lower LR to converge smoothly."
+    training:
+      loss_mode: 1
+      learning_rate_pos: 0.050
+      learning_rate_scale: 0.00125
+      learning_rate_rotation: 0.005
+      learning_rate_weight: 0.00625
+
+  # ===== Huber with LR compensation ==========================================
+
+  - name: "huber_d005_1x_lr"
+    description: "Huber delta=0.05 at 1x LR -- tight L2 zone (most errors in L1 regime), tests outlier robustness without LR adjustment."
+    training:
+      loss_mode: 2
+      huber_delta: 0.05
+
+  - name: "huber_d005_05x_lr"
+    description: "Huber delta=0.05 at 0.5x LR -- compensated for the L1-dominant gradient behavior with this tight delta."
+    training:
+      loss_mode: 2
+      huber_delta: 0.05
+      learning_rate_pos: 0.100
+      learning_rate_scale: 0.0025
+      learning_rate_rotation: 0.010
+      learning_rate_weight: 0.0125
+
+  - name: "huber_d01_1x_lr"
+    description: "Huber delta=0.1 at 1x LR -- wider L2 zone so moderate errors still get quadratic treatment, closer to pure L2 behavior."
+    training:
+      loss_mode: 2
+      huber_delta: 0.1
+
+  - name: "huber_d01_05x_lr"
+    description: "Huber delta=0.1 at 0.5x LR -- compensated variant; tests whether even the wider Huber benefits from reduced LR."
+    training:
+      loss_mode: 2
+      huber_delta: 0.1
+      learning_rate_pos: 0.100
+      learning_rate_scale: 0.0025
+      learning_rate_rotation: 0.010
+      learning_rate_weight: 0.0125

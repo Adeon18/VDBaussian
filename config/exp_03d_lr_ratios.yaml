@@ -1,0 +1,99 @@
+# =============================================================================
+# exp_03d_lr_ratios.yaml  —  Per-parameter LR ratios
+#
+# Purpose: With the best overall LR magnitude from exp_03c, test whether the
+#          default ratio between pos/scale/rotation/weight LRs is optimal.
+#          Default ratio is pos:scale:rot:weight = 5:1:0.5:5.
+#          Each experiment boosts one parameter's LR while keeping others at
+#          the winning magnitude, then combined experiments test interactions.
+#
+# CASCADE: fill in best from exp_02a, exp_02b, exp_03a, exp_03b, exp_03c
+# Shape:   cloud_04_variant_0000
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_03d_lr_ratios.yaml
+# =============================================================================
+
+global_overrides:
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_03d_lr_ratios"
+    snapshot_radius: 2.5
+
+  # -- CASCADE ----------------------------------------------------------------
+  gaussian_init:
+    target_count: 15000
+    density_weighted: false
+    sigma_scale: 1.5
+  training:
+    adam_beta2: 0.95
+
+
+# learning_rate_pos: BEST_FROM_exp03c    # <-- replace with winning magnitude
+# learning_rate_scale: BEST_FROM_exp03c
+# learning_rate_rotation: BEST_FROM_exp03c
+# learning_rate_weight: BEST_FROM_exp03c
+
+experiments:
+
+  # ===== Baseline (default ratios at best magnitude) ==========================
+
+  - name: "baseline_ratios"
+    description: "Default ratio (pos:scale:rot:weight = 5:1:0.5:5) at the winning magnitude from exp_03c -- baseline for ratio experiments."
+
+  # ===== Individual parameter boosts (4x one param, others unchanged) =========
+
+  - name: "high_pos"
+    description: "Position LR at 4x the winning magnitude, others unchanged -- tests whether Gaussians need to relocate faster since placement is the most spatially critical parameter."
+    training:
+      learning_rate_pos: 0.2
+
+  - name: "high_scale"
+    description: "Scale LR at 4x the winning magnitude, others unchanged -- tests whether Gaussian sizes need faster adaptation to match local density variation."
+    training:
+      learning_rate_scale: 0.04
+
+  - name: "high_rotation"
+    description: "Rotation LR at 4x the winning magnitude, others unchanged -- tests whether anisotropic orientation is bottlenecked by the default 10x-lower ratio."
+    training:
+      learning_rate_rotation: 0.02
+
+  - name: "high_weight"
+    description: "Weight LR at 4x the winning magnitude, others unchanged -- tests whether density contribution needs faster adaptation for convergence."
+    training:
+      learning_rate_weight: 0.2
+
+  # ===== Equal LRs (no ratio hierarchy) =======================================
+
+  - name: "equal_lrs"
+    description: "All four LRs set to the same value -- tests whether the default ratio hierarchy matters at all or if equal treatment works just as well."
+    training:
+      learning_rate_pos: 0.02
+      learning_rate_scale: 0.02
+      learning_rate_rotation: 0.02
+      learning_rate_weight: 0.02
+
+  # ===== Combined boosts (pair individually winning changes) ==================
+  #
+  # Fill these in AFTER running the individual boost experiments above.
+  # Only add combinations of parameters where the individual boost helped.
+  # Example: if high_pos and high_rotation both improved quality, test them
+  # together here.
+  #
+  # - name: "high_pos_and_rot"
+  #   description: "Position + rotation LR both at 4x -- tests whether two individual improvements compound."
+  #   training:
+  #     learning_rate_pos: <4x>
+  #     learning_rate_rotation: <4x>

@@ -1,0 +1,116 @@
+# =============================================================================
+# exp_03a_optimizer.yaml  —  Optimizer choice: Adam vs SGD vs SGLD
+#
+# Purpose: Compare optimiser families. SGD gets higher LRs to compensate for
+#          lack of adaptive scaling. SGLD adds Langevin noise on top of Adam.
+#
+# Notes:
+#   - Default LRs were tuned for Adam. SGD applies raw LRs without adaptive
+#     scaling, so 1x may already be too aggressive. We test 0.5x through 10x.
+#   - SGLD does NOT replace the optimizer; it adds stochastic noise to Adam.
+#   - If SGD wins here, skip exp_03b (Adam betas) and adjust exp_03c LRs.
+#
+# CASCADE: fill in best from exp_02a + exp_02b before running
+# Shape:   cloud_04_variant_0000
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_03a_optimizer.yaml
+# =============================================================================
+
+global_overrides:
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_03a_optimizer"
+    snapshot_radius: 2.5
+
+  # ── CASCADE ────────────────────────────────────────────────────────────
+  gaussian_init:
+    target_count: 15000
+    density_weighted: false
+    sigma_scale: 1.5
+
+experiments:
+
+  - name: "baseline_adam"
+    description: "Adam with default LRs and betas — the standard adaptive optimiser, baseline for all optimizer experiments."
+
+  - name: "sgd_05x"
+    description: "SGD with 0.5x default LRs — tests whether SGD actually needs lower LRs than Adam since it applies them raw without adaptive per-parameter scaling."
+    training:
+      use_adam: false
+      learning_rate_pos: 0.025
+      learning_rate_scale: 0.005
+      learning_rate_rotation: 0.0025
+      learning_rate_weight: 0.025
+
+  - name: "sgd_1x"
+    description: "SGD with the same LRs as Adam — direct comparison to see how much of Adam's advantage comes from adaptivity vs the LR values themselves."
+    training:
+      use_adam: false
+      learning_rate_pos: 0.05
+      learning_rate_scale: 0.01
+      learning_rate_rotation: 0.005
+      learning_rate_weight: 0.05
+
+  - name: "sgd_2x"
+    description: "SGD with 2x default LRs — fills the gap between 1x (Adam-tuned) and 5x, helps locate the actual sweet spot for SGD."
+    training:
+      use_adam: false
+      learning_rate_pos: 0.1
+      learning_rate_scale: 0.02
+      learning_rate_rotation: 0.01
+      learning_rate_weight: 0.1
+
+  - name: "sgd_5x"
+    description: "SGD with 5x default LRs — the conventional wisdom multiplier for switching from Adam to SGD; tests whether this rule of thumb holds for Gaussian fitting."
+    training:
+      use_adam: false
+      learning_rate_pos: 0.25
+      learning_rate_scale: 0.05
+      learning_rate_rotation: 0.025
+      learning_rate_weight: 0.25
+
+  - name: "sgd_10x"
+    description: "SGD with 10x default LRs — aggressive upper bound; if this diverges it confirms the LR ceiling for SGD on this problem."
+    training:
+      use_adam: false
+      learning_rate_pos: 0.5
+      learning_rate_scale: 0.1
+      learning_rate_rotation: 0.05
+      learning_rate_weight: 0.5
+
+  - name: "sgld_temp_1e4"
+    description: "Adam + Langevin noise at temperature 1e-4 — light stochastic perturbation, tests whether noise helps Gaussians escape local minima and explore better configurations."
+    sgld:
+      enabled: true
+      temperature_start: 1.0e-4
+      temperature_decay: 0.9999
+      temperature_min: 1.0e-7
+
+  - name: "sgld_temp_1e3"
+    description: "Adam + Langevin noise at temperature 1e-3 (10x stronger) — more aggressive exploration, tests whether heavier noise finds better global solutions or destabilises training."
+    sgld:
+      enabled: true
+      temperature_start: 1.0e-3
+      temperature_decay: 0.9999
+      temperature_min: 1.0e-7
+
+  - name: "sgld_fast_decay"
+    description: "SGLD with temp=1e-3 but fast decay (0.999 vs 0.9999) — noise anneals 10x faster, tests whether SGLD only needs to help early exploration and should then get out of the way."
+    sgld:
+      enabled: true
+      temperature_start: 1.0e-3
+      temperature_decay: 0.999
+      temperature_min: 1.0e-7

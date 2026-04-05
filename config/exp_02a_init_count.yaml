@@ -1,0 +1,72 @@
+# =============================================================================
+# exp_02a_init_count.yaml  —  Gaussian count ablation
+#
+# Purpose: Find the best initial Gaussian count. Tests whether starting with
+#          more or fewer Gaussians matters when ADC can adapt the population.
+#
+# CASCADE: none (first ablation batch)
+# Shape:   cloud_04_variant_0000
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_02a_init_count.yaml
+# =============================================================================
+
+global_overrides:
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_02a_init_count"
+    snapshot_radius: 2.5
+
+experiments:
+
+  - name: "init_1k"
+    description: "1000 initial Gaussians — very sparse, tests if ADC can grow the population from almost nothing and still reach full quality."
+    gaussian_init:
+      target_count: 1000
+
+  - name: "init_2500"
+    description: "2500 initial Gaussians — moderate undershoot, tests the quality gradient between sparse and default starts."
+    gaussian_init:
+      target_count: 2500
+
+  - name: "init_5k"
+    description: "5000 initial Gaussians — the default count, baseline for this comparison."
+    gaussian_init:
+      target_count: 5000
+
+  - name: "init_10k"
+    description: "10000 initial Gaussians — double the default, tests whether a denser start gives the optimizer a head start or adds redundant parameters."
+    gaussian_init:
+      target_count: 10000
+  
+  - name: "init_15k"
+    description: "10000 initial Gaussians — double the default, tests whether a denser start gives the optimizer a head start or adds redundant parameters."
+    gaussian_init:
+      target_count: 15000
+
+  - name: "init_20k"
+    description: "20000 initial Gaussians — near the ADC ceiling (50k), tests whether saturating the budget from the start helps or wastes ADC cycles pruning excess."
+    gaussian_init:
+      target_count: 20000
+
+  - name: "init_30k"
+    description: "30000 initial Gaussians — near the ADC ceiling (50k), tests whether saturating the budget from the start helps or wastes ADC cycles pruning excess."
+    gaussian_init:
+      target_count: 30000
+
+  - name: "init_40k"
+    description: "40000 initial Gaussians — near the ADC ceiling (50k), tests whether saturating the budget from the start helps or wastes ADC cycles pruning excess."
+    gaussian_init:
+      target_count: 40000

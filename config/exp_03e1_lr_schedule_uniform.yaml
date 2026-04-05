@@ -1,0 +1,160 @@
+# =============================================================================
+# exp_03e1_lr_schedule_uniform.yaml  —  Uniform LR scheduling
+#
+# Purpose: Test whether uniformly scaling all LRs over time improves
+#          convergence. All four parameter groups decay by the same factor
+#          at the same steps.
+#
+# CASCADE: best from exp_02a, exp_02b, exp_03a, exp_03b, exp_03c, exp_03d
+# Shape:   cloud_04_variant_0000
+#
+# Best LRs from exp_03d: pos=0.20, scale=0.005, rot=0.02, weight=0.025
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_03e1_lr_schedule_uniform.yaml
+# =============================================================================
+
+global_overrides:
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_03e1_lr_schedule_uniform"
+    snapshot_radius: 2.5
+
+  # -- CASCADE ----------------------------------------------------------------
+  gaussian_init:
+    target_count: 15000
+    density_weighted: false
+    sigma_scale: 1.5
+  training:
+    adam_beta2: 0.95
+    learning_rate_pos: 0.20
+    learning_rate_scale: 0.005
+    learning_rate_rotation: 0.02
+    learning_rate_weight: 0.025
+
+# LR multiplier reference:
+#   1x:    pos=0.200   scale=0.005    rot=0.020   weight=0.025
+#   0.5x:  pos=0.100   scale=0.0025   rot=0.010   weight=0.0125
+#   0.25x: pos=0.050   scale=0.00125  rot=0.005   weight=0.00625
+#   1/8x:  pos=0.025   scale=0.000625 rot=0.0025  weight=0.003125
+#   2x:    pos=0.400   scale=0.010    rot=0.040   weight=0.050
+
+experiments:
+
+  - name: "baseline_no_schedule"
+    description: "Fixed LRs for the full 3000 steps -- baseline; tests whether constant learning rate is sufficient with the optimized ratios."
+
+  # ===== Single decay =========================================================
+
+  - name: "decay_at_1500"
+    description: "Halve all LRs at step 1500 -- single midpoint decay, tests whether reducing LR helps fine-tune details after coarse structure is in place."
+    training:
+      lr_schedule:
+        - at_step: 1500
+          learning_rate_pos: 0.100
+          learning_rate_scale: 0.0025
+          learning_rate_rotation: 0.010
+          learning_rate_weight: 0.0125
+
+  - name: "decay_at_2000"
+    description: "Halve all LRs at step 2000 -- late decay, tests whether fine-tuning only in the final third yields better results than midpoint decay."
+    training:
+      lr_schedule:
+        - at_step: 2000
+          learning_rate_pos: 0.100
+          learning_rate_scale: 0.0025
+          learning_rate_rotation: 0.010
+          learning_rate_weight: 0.0125
+
+  # ===== Two-step decay =======================================================
+
+  - name: "decay_1000_2000"
+    description: "Halve at step 1000, halve again at step 2000 -- progressive two-stage decay, standard practice for gradual fine-tuning."
+    training:
+      lr_schedule:
+        - at_step: 1000
+          learning_rate_pos: 0.100
+          learning_rate_scale: 0.0025
+          learning_rate_rotation: 0.010
+          learning_rate_weight: 0.0125
+        - at_step: 2000
+          learning_rate_pos: 0.050
+          learning_rate_scale: 0.00125
+          learning_rate_rotation: 0.005
+          learning_rate_weight: 0.00625
+
+  # ===== Three-step decay =====================================================
+
+  - name: "decay_750_1500_2250"
+    description: "Halve at step 750, 1500, 2250 -- aggressive three-stage decay, ends at 1/8x of initial LR, tests whether frequent reduction yields smoother convergence."
+    training:
+      lr_schedule:
+        - at_step: 750
+          learning_rate_pos: 0.100
+          learning_rate_scale: 0.0025
+          learning_rate_rotation: 0.010
+          learning_rate_weight: 0.0125
+        - at_step: 1500
+          learning_rate_pos: 0.050
+          learning_rate_scale: 0.00125
+          learning_rate_rotation: 0.005
+          learning_rate_weight: 0.00625
+        - at_step: 2250
+          learning_rate_pos: 0.025
+          learning_rate_scale: 0.000625
+          learning_rate_rotation: 0.0025
+          learning_rate_weight: 0.003125
+
+  # ===== Hot start + decay ====================================================
+
+  - name: "hot_start_decay"
+    description: "Start at 2x LRs, decay to 1x at step 1000, then 0.5x at step 2000 -- aggressive early fitting followed by progressive refinement."
+    training:
+      learning_rate_pos: 0.400
+      learning_rate_scale: 0.010
+      learning_rate_rotation: 0.040
+      learning_rate_weight: 0.050
+      lr_schedule:
+        - at_step: 1000
+          learning_rate_pos: 0.200
+          learning_rate_scale: 0.005
+          learning_rate_rotation: 0.020
+          learning_rate_weight: 0.025
+        - at_step: 2000
+          learning_rate_pos: 0.100
+          learning_rate_scale: 0.0025
+          learning_rate_rotation: 0.010
+          learning_rate_weight: 0.0125
+
+  # ===== Warmup + decay ======================================================
+
+  - name: "warmup_decay"
+    description: "Start at 0.25x LRs, jump to full at step 300, halve at step 2000 -- cautious start avoids early divergence, full power in the middle, fine-tuning at the end."
+    training:
+      learning_rate_pos: 0.050
+      learning_rate_scale: 0.00125
+      learning_rate_rotation: 0.005
+      learning_rate_weight: 0.00625
+      lr_schedule:
+        - at_step: 300
+          learning_rate_pos: 0.200
+          learning_rate_scale: 0.005
+          learning_rate_rotation: 0.020
+          learning_rate_weight: 0.025
+        - at_step: 2000
+          learning_rate_pos: 0.100
+          learning_rate_scale: 0.0025
+          learning_rate_rotation: 0.010
+          learning_rate_weight: 0.0125

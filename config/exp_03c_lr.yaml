@@ -1,0 +1,76 @@
+# =============================================================================
+# exp_03c_lr.yaml  —  Learning rate magnitude (uniform scaling)
+#
+# Purpose: Find the optimal overall LR magnitude by uniformly scaling all four
+#          parameter LRs by the same factor. Establishes the right ballpark
+#          before tuning per-parameter ratios in exp_03d.
+#
+# CASCADE: fill in best from exp_02a, exp_02b, exp_03a, exp_03b before running
+# Shape:   cloud_04_variant_0000
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_03c_lr.yaml
+# =============================================================================
+
+global_overrides:
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_03c_lr"
+    snapshot_radius: 2.5
+
+  # -- CASCADE ----------------------------------------------------------------
+  gaussian_init:
+    target_count: 15000
+    density_weighted: false
+    sigma_scale: 1.5
+  training:
+    adam_beta2: 0.95
+
+experiments:
+
+  - name: "lr_025x"
+    description: "All LRs at 0.25x default -- very conservative, tests whether much slower steps improve final quality or just waste iterations."
+    training:
+      learning_rate_pos: 0.0125
+      learning_rate_scale: 0.0025
+      learning_rate_rotation: 0.00125
+      learning_rate_weight: 0.0125
+
+  - name: "lr_05x"
+    description: "All LRs at 0.5x default -- slower but potentially more stable convergence, tests whether defaults are too aggressive."
+    training:
+      learning_rate_pos: 0.025
+      learning_rate_scale: 0.005
+      learning_rate_rotation: 0.0025
+      learning_rate_weight: 0.025
+
+  - name: "baseline_lr_1x"
+    description: "Default LRs (pos=0.05, scale=0.01, rot=0.005, weight=0.05) -- baseline for magnitude comparison."
+
+  - name: "lr_2x"
+    description: "All LRs at 2x default -- faster convergence but risk of overshooting, tests whether defaults are too conservative."
+    training:
+      learning_rate_pos: 0.1
+      learning_rate_scale: 0.02
+      learning_rate_rotation: 0.01
+      learning_rate_weight: 0.1
+
+  - name: "lr_4x"
+    description: "All LRs at 4x default -- aggressive upper bound, likely to overshoot but tests the stability ceiling of the optimizer."
+    training:
+      learning_rate_pos: 0.2
+      learning_rate_scale: 0.04
+      learning_rate_rotation: 0.02
+      learning_rate_weight: 0.2

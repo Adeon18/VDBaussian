@@ -1,0 +1,136 @@
+# =============================================================================
+# exp_05d_adc_combined.yaml  —  Best ADC combos from exp_05b + exp_05c
+#
+# Purpose: Combine the two real ADC levers (frequency from 05b, clone
+#          targeting/weight from 05c) and test whether they compound.
+#
+# CASCADE: best from exp_02a, exp_02b, exp_03a-d, exp_04, exp_05a-c
+# Shape:   cloud_04_variant_0000
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_05d_adc_combined.yaml
+# =============================================================================
+
+global_overrides:
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_05d_adc_combined"
+    snapshot_radius: 2.5
+
+  # -- CASCADE ----------------------------------------------------------------
+  gaussian_init:
+    target_count: 15000
+    density_weighted: false
+    sigma_scale: 1.5
+  training:
+    adam_beta2: 0.95
+    learning_rate_pos: 0.20
+    learning_rate_scale: 0.005
+    learning_rate_rotation: 0.02
+    learning_rate_weight: 0.025
+    loss_mode: 0
+    ssim_weight: 0.2
+  adc:
+    max_gaussians: 50000
+    clone_n_dense: 1600
+    clone_n_sparse: 800
+    aniso_n_split: 120
+    grad_n_split: 120
+
+experiments:
+
+  # ===== References (single winners from 05b/05c) ============================
+
+  - name: "baseline"
+    description: "05a+05b+05c cascade baseline -- clone_4x_split_2x, default timing."
+
+  - name: "ref_freq_very_fast"
+    description: "05b winner: ADC every 100/50 steps -- +2.5 dB but 24.6x compression."
+    adc:
+      full_adc_every: 100
+      prune_only_every: 50
+
+  - name: "ref_freq_fast"
+    description: "05b runner-up: ADC every 200/75 steps -- +1.3 dB, 27.5x compression."
+    adc:
+      full_adc_every: 200
+      prune_only_every: 75
+
+  - name: "ref_clone_weight_high"
+    description: "05c winner: high clone init weight (frac=0.50) -- +0.16 dB."
+    adc:
+      clone_weight_init_frac: 0.50
+      clone_weight_min: 0.10
+      clone_weight_max: 0.50
+
+  # ===== freq_very_fast combos ===============================================
+
+  - name: "vfast_weight_high"
+    description: "freq_very_fast + clone_weight_high -- more spawns that start strong, should compound."
+    adc:
+      full_adc_every: 100
+      prune_only_every: 50
+      clone_weight_init_frac: 0.50
+      clone_weight_min: 0.10
+      clone_weight_max: 0.50
+
+  - name: "vfast_dense_focus"
+    description: "freq_very_fast + all-dense cloning (2400/0) -- high frequency concentrated on core volume."
+    adc:
+      full_adc_every: 100
+      prune_only_every: 50
+      clone_n_dense: 2400
+      clone_n_sparse: 0
+
+  - name: "vfast_weight_high_dense"
+    description: "freq_very_fast + clone_weight_high + all-dense -- triple combo, maximum investment in dense core."
+    adc:
+      full_adc_every: 100
+      prune_only_every: 50
+      clone_n_dense: 2400
+      clone_n_sparse: 0
+      clone_weight_init_frac: 0.50
+      clone_weight_min: 0.10
+      clone_weight_max: 0.50
+
+  # ===== freq_fast combos (compression-friendlier) ===========================
+
+  - name: "fast_weight_high"
+    description: "freq_fast + clone_weight_high -- moderate frequency with strong init, balances quality and compression."
+    adc:
+      full_adc_every: 200
+      prune_only_every: 75
+      clone_weight_init_frac: 0.50
+      clone_weight_min: 0.10
+      clone_weight_max: 0.50
+
+  - name: "fast_dense_focus"
+    description: "freq_fast + all-dense cloning (2400/0) -- moderate frequency, efficient per-Gaussian placement."
+    adc:
+      full_adc_every: 200
+      prune_only_every: 75
+      clone_n_dense: 2400
+      clone_n_sparse: 0
+
+  - name: "fast_weight_high_dense"
+    description: "freq_fast + clone_weight_high + all-dense -- triple combo at moderate frequency, compression-quality sweet spot."
+    adc:
+      full_adc_every: 200
+      prune_only_every: 75
+      clone_n_dense: 2400
+      clone_n_sparse: 0
+      clone_weight_init_frac: 0.50
+      clone_weight_min: 0.10
+      clone_weight_max: 0.50

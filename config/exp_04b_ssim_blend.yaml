@@ -1,0 +1,101 @@
+# =============================================================================
+# exp_04b_ssim_blend.yaml  —  D-SSIM auxiliary loss blending
+#
+# Purpose: Test adding D-SSIM as a structural similarity term on top of L2.
+#          L2 was the clear 3D winner from exp_04. Also includes one Huber+SSIM
+#          test since Huber d=0.1 showed strong 2D metrics in exp_04.
+#          Formula: L = (1 - ssim_weight) * L_pervoxel + ssim_weight * D-SSIM
+#
+# CASCADE: best from exp_02a, exp_02b, exp_03a-d, exp_04
+# Shape:   cloud_04_variant_0000
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_04b_ssim_blend.yaml
+# =============================================================================
+
+global_overrides:
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_04b_ssim_blend"
+    snapshot_radius: 2.5
+
+  # -- CASCADE ----------------------------------------------------------------
+  gaussian_init:
+    target_count: 15000
+    density_weighted: false
+    sigma_scale: 1.5
+  training:
+    adam_beta2: 0.95
+    learning_rate_pos: 0.20
+    learning_rate_scale: 0.005
+    learning_rate_rotation: 0.02
+    learning_rate_weight: 0.025
+
+experiments:
+
+  # ===== L2 baseline (no SSIM) ================================================
+
+  - name: "l2_no_ssim"
+    description: "L2 loss without SSIM -- baseline reference, the exp_04 winner."
+    training:
+      loss_mode: 0
+
+  # ===== L2 + SSIM blends ====================================================
+
+  - name: "l2_ssim_005"
+    description: "L2 + 5% D-SSIM -- minimal structural term, tests the threshold at which SSIM has any measurable effect."
+    training:
+      loss_mode: 0
+      ssim_weight: 0.05
+
+  - name: "l2_ssim_010"
+    description: "L2 + 10% D-SSIM -- light structural term, tests whether small SSIM improves perceptual quality without hurting PSNR."
+    training:
+      loss_mode: 0
+      ssim_weight: 0.1
+
+  - name: "l2_ssim_020"
+    description: "L2 + 20% D-SSIM -- standard blend from 3DGS literature; the commonly recommended ratio for scene reconstruction."
+    training:
+      loss_mode: 0
+      ssim_weight: 0.2
+
+  - name: "l2_ssim_035"
+    description: "L2 + 35% D-SSIM -- tests the midpoint between standard and heavy SSIM weighting."
+    training:
+      loss_mode: 0
+      ssim_weight: 0.35
+
+  - name: "l2_ssim_050"
+    description: "L2 + 50% D-SSIM -- heavy structural term; tests whether SSIM-dominant training boosts structural metrics at the cost of per-voxel accuracy."
+    training:
+      loss_mode: 0
+      ssim_weight: 0.5
+
+  # ===== Huber + SSIM (Huber d=0.1 had strong 2D in exp_04) ==================
+
+  - name: "huber_d01_ssim_010"
+    description: "Huber d=0.1 + 10% D-SSIM at 1x LR -- tests whether Huber's strong 2D performance from exp_04 compounds with SSIM's structural awareness."
+    training:
+      loss_mode: 2
+      huber_delta: 0.1
+      ssim_weight: 0.1
+
+  - name: "huber_d01_ssim_020"
+    description: "Huber d=0.1 + 20% D-SSIM at 1x LR -- standard SSIM blend with the best non-L2 loss function."
+    training:
+      loss_mode: 2
+      huber_delta: 0.1
+      ssim_weight: 0.2

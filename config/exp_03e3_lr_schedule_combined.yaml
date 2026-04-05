@@ -1,0 +1,122 @@
+# =============================================================================
+# exp_03e3_lr_schedule_combined.yaml  —  Combined LR scheduling (best of e1+e2)
+#
+# Purpose: Combine the best findings from e1 (single decay at 1500) and e2
+#          (boost scale late, boost weight late). Test whether combining
+#          scale+weight boosts compounds, and whether adding uniform decay
+#          on top of late boosts helps.
+#
+# CASCADE: best from exp_02a, exp_02b, exp_03a, exp_03b, exp_03c, exp_03d
+# Shape:   cloud_04_variant_0000
+#
+# Best LRs from exp_03d: pos=0.20, scale=0.005, rot=0.02, weight=0.025
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_03e3_lr_schedule_combined.yaml
+# =============================================================================
+
+global_overrides:
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_03e3_lr_schedule_combined"
+    snapshot_radius: 2.5
+
+  # -- CASCADE ----------------------------------------------------------------
+  gaussian_init:
+    target_count: 15000
+    density_weighted: false
+    sigma_scale: 1.5
+  training:
+    adam_beta2: 0.95
+    learning_rate_pos: 0.20
+    learning_rate_scale: 0.005
+    learning_rate_rotation: 0.02
+    learning_rate_weight: 0.025
+
+# LR reference:
+#   1x:   pos=0.200  scale=0.005   rot=0.020  weight=0.025
+#   0.5x: pos=0.100  scale=0.0025  rot=0.010  weight=0.0125
+#   2x:   pos=0.400  scale=0.010   rot=0.040  weight=0.050
+
+experiments:
+
+  # ===== References from e1+e2 ================================================
+
+  - name: "baseline_no_schedule"
+    description: "Fixed LRs for the full 3000 steps -- baseline reference."
+
+  - name: "ref_boost_scale_late"
+    description: "Scale LR doubles to 0.01 at step 1500 -- best 3D from e2 (PSNR3D 46.03), reference."
+    training:
+      lr_schedule:
+        - at_step: 1500
+          learning_rate_scale: 0.010
+
+  - name: "ref_boost_weight_late"
+    description: "Weight LR doubles to 0.05 at step 1500 -- best 2D from e2 (PSNR2D 49.06), reference."
+    training:
+      lr_schedule:
+        - at_step: 1500
+          learning_rate_weight: 0.050
+
+  - name: "ref_uniform_decay_1500"
+    description: "Halve all LRs at step 1500 -- best from e1 (PSNR2D 49.07), reference."
+    training:
+      lr_schedule:
+        - at_step: 1500
+          learning_rate_pos: 0.100
+          learning_rate_scale: 0.0025
+          learning_rate_rotation: 0.010
+          learning_rate_weight: 0.0125
+
+  # ===== Combined boost experiments ===========================================
+
+  - name: "boost_scale_weight_late"
+    description: "Scale 2x (0.01) + weight 2x (0.05) both at step 1500 -- combines the two individual e2 winners to test if they compound."
+    training:
+      lr_schedule:
+        - at_step: 1500
+          learning_rate_scale: 0.010
+          learning_rate_weight: 0.050
+
+  - name: "boost_scale_weight_at_1000"
+    description: "Scale 2x (0.01) + weight 2x (0.05) both at step 1000 -- earlier boost, tests whether geometry settles enough by step 1000 for magnitude boost."
+    training:
+      lr_schedule:
+        - at_step: 1000
+          learning_rate_scale: 0.010
+          learning_rate_weight: 0.050
+
+  # ===== Boost + decay combos =================================================
+
+  - name: "boost_scale_late_decay_pos"
+    description: "Scale 2x at 1500, pos 0.5x at 2000 -- boost magnitude then settle geometry in the final phase."
+    training:
+      lr_schedule:
+        - at_step: 1500
+          learning_rate_scale: 0.010
+        - at_step: 2000
+          learning_rate_pos: 0.100
+
+  - name: "boost_both_decay_pos_rot"
+    description: "Scale+weight 2x at 1500, pos+rot 0.5x at 2000 -- boost magnitude params, then settle all geometric params for fine-tuning."
+    training:
+      lr_schedule:
+        - at_step: 1500
+          learning_rate_scale: 0.010
+          learning_rate_weight: 0.050
+        - at_step: 2000
+          learning_rate_pos: 0.100
+          learning_rate_rotation: 0.010

@@ -1,0 +1,32 @@
+# =============================================================================
+# saved_adc_presets.yaml  —  ADC presets from exp_05a-05d cascade
+#
+# Two presets for use in downstream experiments (exp_06, exp_07, etc.)
+#
+# calm:       Best quality at ~31x compression (baseline from 05d)
+# aggressive: Best absolute quality at ~23x compression (05d winner)
+# =============================================================================
+
+# CALM PRESET
+# Source: exp_05d baseline (= exp_05a clone_4x_split_2x + 05b/05c defaults)
+# Result: 47.90 dB PSNR3D, 21,795 Gaussians, 31.4x compression
+calm:
+  clone_n_dense: 1600
+  clone_n_sparse: 800
+  aniso_n_split: 120
+  grad_n_split: 120
+  # Timing: all defaults (start=300, full_adc_every=400, prune_only_every=150, backoff=1.05)
+
+# AGGRESSIVE PRESET
+# Source: exp_05d vfast_weight_high
+# Result: 50.88 dB PSNR3D, 29,303 Gaussians, 23.4x compression
+aggressive:
+  clone_n_dense: 1600
+  clone_n_sparse: 800
+  aniso_n_split: 120
+  grad_n_split: 120
+  full_adc_every: 100
+  prune_only_every: 50
+  clone_weight_init_frac: 0.50
+  clone_weight_min: 0.10
+  clone_weight_max: 0.50

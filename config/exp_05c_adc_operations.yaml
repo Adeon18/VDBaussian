@@ -1,0 +1,162 @@
+# =============================================================================
+# exp_05c_adc_operations.yaml  —  ADC split/clone fine-tuning
+#
+# Purpose: With spawn rate, timing, and pruning locked from exp_05a+05b,
+#          fine-tune split thresholds, clone targeting, and test combined
+#          strategies.
+#
+# CASCADE: best from exp_02a, exp_02b, exp_03a-d, exp_04, exp_05a, exp_05b
+# Shape:   cloud_04_variant_0000
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_05c_adc_operations.yaml
+# =============================================================================
+
+global_overrides:
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_05c_adc_operations"
+    snapshot_radius: 2.5
+
+  # -- CASCADE ----------------------------------------------------------------
+  gaussian_init:
+    target_count: 15000           # <-- replace with exp_05a winner if changed
+    density_weighted: false
+    sigma_scale: 1.5
+  training:
+    adam_beta2: 0.95
+    learning_rate_pos: 0.20
+    learning_rate_scale: 0.005
+    learning_rate_rotation: 0.02
+    learning_rate_weight: 0.025
+    loss_mode: 0
+    ssim_weight: 0.2
+  adc:
+    max_gaussians: 50000
+    clone_n_dense: 1600
+    clone_n_sparse: 800
+    aniso_n_split: 120
+    grad_n_split: 120
+    # 05b: defaults won (start=300, full_adc_every=400, prune_only_every=150, backoff=1.05)
+
+experiments:
+
+  # ===== Baseline =============================================================
+
+  - name: "baseline"
+    description: "Best ADC config from exp_05a+05b -- baseline for operation fine-tuning."
+
+  # ===== Anisotropy split thresholds ==========================================
+
+  - name: "aniso_sensitive"
+    description: "Low aniso split threshold (2.0 vs default 4.0) -- splits mildly elongated Gaussians, strongly encourages isotropy."
+    adc:
+      aniso_thresh: 2.0
+
+  - name: "aniso_moderate"
+    description: "Moderate aniso split threshold (3.0) -- slightly more sensitive than default."
+    adc:
+      aniso_thresh: 3.0
+
+  - name: "aniso_relaxed"
+    description: "High aniso split threshold (8.0) -- tolerates significant elongation, only splits extreme needles."
+    adc:
+      aniso_thresh: 8.0
+
+  # ===== Gradient split tuning ================================================
+
+  - name: "grad_eager"
+    description: "Lower gradient percentile (60 vs 80) + lower size threshold (0.02 vs 0.04) -- splits more Gaussians based on weaker gradient signals."
+    adc:
+      grad_percentile: 60
+      grad_size_thresh_frac: 0.02
+
+  - name: "grad_strict"
+    description: "Higher gradient percentile (95) + higher size threshold (0.08) -- only splits the largest Gaussians with strongest gradients."
+    adc:
+      grad_percentile: 95
+      grad_size_thresh_frac: 0.08
+
+  # ===== Clone targeting ======================================================
+
+  - name: "clone_sparse_focus"
+    description: "Flip clone ratio to sparse-heavy (dense=400, sparse=2000) -- prioritizes filling wispy/thin regions over reinforcing dense cores."
+    adc:
+      clone_n_dense: 400
+      clone_n_sparse: 2000
+
+  - name: "clone_dense_focus"
+    description: "All clone budget into dense regions (dense=2400, sparse=0) -- ignores wispy areas, concentrates on core volume accuracy."
+    adc:
+      clone_n_dense: 2400
+      clone_n_sparse: 0
+
+  - name: "clone_error_wide"
+    description: "Clone into top 50% error voxels (vs default 30%) -- wider error targeting, spawns into moderately wrong regions too."
+    adc:
+      clone_error_percentile: 50
+
+  - name: "clone_error_strict"
+    description: "Clone into top 10% error voxels only -- strict targeting, concentrates all new Gaussians on the worst errors."
+    adc:
+      clone_error_percentile: 10
+
+  # ===== Child overlap (split weight sharing) =================================
+
+  - name: "split_overlap_low"
+    description: "Lower child overlap (0.35 vs default 0.55) -- split children inherit less weight, forces them to earn their contribution through optimization."
+    adc:
+      aniso_child_overlap: 0.35
+
+  - name: "split_overlap_high"
+    description: "Higher child overlap (0.75 vs default 0.55) -- split children start with more weight, maintains density continuity during splits."
+    adc:
+      aniso_child_overlap: 0.75
+
+  # ===== Clone init weight ====================================================
+
+  - name: "clone_weight_low"
+    description: "Lower clone init weight (frac=0.10, min=0.01, max=0.15) -- new Gaussians start very weak, must prove themselves through optimization."
+    adc:
+      clone_weight_init_frac: 0.10
+      clone_weight_min: 0.01
+      clone_weight_max: 0.15
+
+  - name: "clone_weight_high"
+    description: "Higher clone init weight (frac=0.50, min=0.10, max=0.50) -- new Gaussians start strong, immediately contribute to density."
+    adc:
+      clone_weight_init_frac: 0.50
+      clone_weight_min: 0.10
+      clone_weight_max: 0.50
+
+  # ===== Combined strategies ==================================================
+
+  - name: "aggressive_all"
+    description: "Sensitive aniso (2.0), eager grad split, wide error cloning, high overlap -- maximum restructuring, tests if aggressive ADC operations compound."
+    adc:
+      aniso_thresh: 2.0
+      grad_percentile: 60
+      grad_size_thresh_frac: 0.02
+      clone_error_percentile: 50
+      aniso_child_overlap: 0.75
+
+  - name: "conservative_all"
+    description: "Relaxed aniso (8.0), strict grad split, strict error cloning, low overlap -- minimal restructuring, tests if hands-off ADC is better."
+    adc:
+      aniso_thresh: 8.0
+      grad_percentile: 95
+      grad_size_thresh_frac: 0.08
+      clone_error_percentile: 10
+      aniso_child_overlap: 0.35

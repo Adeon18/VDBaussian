@@ -1,0 +1,127 @@
+# =============================================================================
+# exp_05a_adc_budget.yaml  —  ADC on/off + spawn rate + init count interaction
+#
+# Purpose: Test whether ADC helps, how aggressively it should spawn new
+#          Gaussians, and how starting count interacts with ADC growth.
+#          Budget ceiling is NOT the bottleneck (15k->17k in 3000 steps),
+#          so we focus on clone/split rates instead.
+#
+# CASCADE: best from exp_02a, exp_02b, exp_03a-d, exp_04
+# Shape:   cloud_04_variant_0000
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_05a_adc_budget.yaml
+# =============================================================================
+
+global_overrides:
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_05a_adc_budget"
+    snapshot_radius: 2.5
+
+  # -- CASCADE ----------------------------------------------------------------
+  gaussian_init:
+    target_count: 15000
+    density_weighted: false
+    sigma_scale: 1.5
+  training:
+    adam_beta2: 0.95
+    learning_rate_pos: 0.20
+    learning_rate_scale: 0.005
+    learning_rate_rotation: 0.02
+    learning_rate_weight: 0.025
+    loss_mode: 0
+    ssim_weight: 0.2
+
+# Default clone: dense=400, sparse=200. Default splits: aniso=60, grad=60.
+
+experiments:
+
+  # ===== Fundamental: does ADC help? ==========================================
+
+  - name: "adc_off"
+    description: "ADC completely disabled -- fixed 15k Gaussians; measures pure optimizer quality without any population restructuring."
+    adc:
+      enabled: false
+
+  - name: "adc_default"
+    description: "Default ADC (clone 400+200, split 60+60) -- baseline; the current behavior that grows ~2k Gaussians over 3000 steps."
+
+  # ===== Clone rate sweep (how fast do we add?) ===============================
+
+  - name: "clone_2x"
+    description: "Double clone budget (dense=800, sparse=400) -- tests whether faster Gaussian spawning improves coverage and quality."
+    adc:
+      clone_n_dense: 800
+      clone_n_sparse: 400
+
+  - name: "clone_4x"
+    description: "Quadruple clone budget (dense=1600, sparse=800) -- aggressive spawning, should push Gaussian count significantly higher than default."
+    adc:
+      clone_n_dense: 1600
+      clone_n_sparse: 800
+
+  # ===== Split rate sweep (how fast do we refine?) ============================
+
+  - name: "split_2x"
+    description: "Double split budget (aniso=120, grad=120) -- tests whether faster refinement of existing Gaussians improves detail."
+    adc:
+      aniso_n_split: 120
+      grad_n_split: 120
+
+  # ===== Combined spawn rates =================================================
+
+  - name: "clone_2x_split_2x"
+    description: "Double both clone (800+400) and split (120+120) -- tests whether faster adding AND refining compounds."
+    adc:
+      clone_n_dense: 800
+      clone_n_sparse: 400
+      aniso_n_split: 120
+      grad_n_split: 120
+
+  - name: "clone_4x_split_2x"
+    description: "Quadruple clone (1600+800) + double split (120+120) -- maximum spawn rate; tests the upper limit of ADC aggressiveness."
+    adc:
+      clone_n_dense: 1600
+      clone_n_sparse: 800
+      aniso_n_split: 120
+      grad_n_split: 120
+
+  # ===== Init count × ADC interaction =========================================
+
+  - name: "init_5k_adc_4x"
+    description: "Start with only 5k Gaussians + 4x clone rate -- tests whether ADC can build a good population from a small seed (high growth potential)."
+    gaussian_init:
+      target_count: 5000
+    adc:
+      clone_n_dense: 1600
+      clone_n_sparse: 800
+
+  - name: "init_5k_adc_default"
+    description: "Start with 5k Gaussians + default ADC -- tests whether default ADC can compensate for a much smaller starting population."
+    gaussian_init:
+      target_count: 5000
+
+  - name: "init_25k_adc_off"
+    description: "Start with 25k Gaussians, ADC disabled -- tests whether a bigger starting population without ADC beats fewer Gaussians with ADC."
+    gaussian_init:
+      target_count: 25000
+    adc:
+      enabled: false
+
+  - name: "init_25k_adc_default"
+    description: "Start with 25k Gaussians + default ADC -- tests whether ADC still helps when you already start with a large population."
+    gaussian_init:
+      target_count: 25000

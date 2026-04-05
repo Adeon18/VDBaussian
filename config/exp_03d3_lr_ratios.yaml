@@ -1,0 +1,70 @@
+# =============================================================================
+# exp_03d3_lr_ratios.yaml  —  Per-parameter LR ratios (iteration 3)
+#
+# Purpose: Test weight reduction combined with the winning pos/rot boosts
+#          from v1/v2. Checks whether halving weight LR compounds with the
+#          position and rotation winners.
+#
+# CASCADE: fill in best from exp_02a, exp_02b, exp_03a, exp_03b, exp_03c
+# Shape:   cloud_04_variant_0000
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_03d3_lr_ratios.yaml
+# =============================================================================
+
+global_overrides:
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_03d3_lr_ratios"
+    snapshot_radius: 2.5
+
+  # -- CASCADE ----------------------------------------------------------------
+  gaussian_init:
+    target_count: 15000
+    density_weighted: false
+    sigma_scale: 1.5
+  training:
+    adam_beta2: 0.95
+
+# Default LRs: pos=0.05, scale=0.01, rot=0.005, weight=0.05
+
+experiments:
+
+  - name: "baseline_1x"
+    description: "All LRs at 1x default (pos=0.05, scale=0.01, rot=0.005, weight=0.05) -- baseline reference."
+
+  - name: "ref_pos_4x"
+    description: "Position LR at 4x (0.2), others default -- best individual winner from v1."
+    training:
+      learning_rate_pos: 0.2
+
+  - name: "combo_pos4x_rot4x"
+    description: "Position 4x (0.2) + rotation 4x (0.02) -- pairs the two best individual winners."
+    training:
+      learning_rate_pos: 0.2
+      learning_rate_rotation: 0.02
+
+  - name: "combo_pos4x_weight05x"
+    description: "Position 4x (0.2) + weight 0.5x (0.025) -- tests whether slower weight adaptation improves the position winner."
+    training:
+      learning_rate_pos: 0.2
+      learning_rate_weight: 0.025
+
+  - name: "combo_pos4x_rot4x_weight05x"
+    description: "Position 4x (0.2) + rotation 4x (0.02) + weight 0.5x (0.025) -- triple combo of both winners plus weight reduction."
+    training:
+      learning_rate_pos: 0.2
+      learning_rate_rotation: 0.02
+      learning_rate_weight: 0.025

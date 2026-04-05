@@ -1,0 +1,120 @@
+# =============================================================================
+# exp_01_baselines.yaml  —  Baseline quality across 5 VDB shapes
+#
+# Purpose: Establish per-shape baseline quality with default training settings.
+#          All experiments use identical training/ADC/init parameters; only the
+#          VDB file and per-shape rendering settings differ.
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_01_baselines.yaml
+#   python experiment_runner.py --batch config/exp_01_baselines.yaml --dry-run
+# =============================================================================
+
+global_overrides:
+  training:
+    max_steps: 3000
+  output:
+    result_dir: "results/exp_01_baselines"
+
+experiments:
+
+  # ── Cloud (soft white, low density) ─────────────────────────────────────
+  - name: "cloud_white"
+    description: "Soft white cloud — low density, gentle lighting."
+    volume:
+      vdb_file: "cloud_04_variant_0000.vdb"
+      up_axis: "-Z"
+    rendering:
+      smoke_color: [0.95, 0.95, 0.97]
+      density_scale: 35.0
+      density_curve: 0.8
+      light_penetration: 0.25
+      phase_g: 0.3
+      sun_color: [1.0, 0.95, 0.85]
+      sun_intensity: 4.0
+      ambient_color: [0.7, 0.75, 0.85]
+      ambient_intensity: 0.45
+    output:
+      snapshot_radius: 2.5
+
+  # ── Tornado (grey-brown, high density, dramatic) ────────────────────────
+  - name: "tornado"
+    description: "Dark tornado — high density, harsh directional light."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\TornadoLoopingVDB\\TornadoLooping\\TornadoVDB\\tornado_0109.vdb"
+      up_axis: "-Z"
+    rendering:
+      smoke_color: [0.55, 0.50, 0.45]
+      density_scale: 55.0
+      density_curve: 1.2
+      light_penetration: 0.10
+      phase_g: 0.5
+      sun_direction: [0.8, -0.5, 0.3]
+      sun_color: [1.0, 0.85, 0.6]
+      sun_intensity: 4.0
+      ambient_color: [0.5, 0.55, 0.6]
+      ambient_intensity: 0.45
+      shadow_steps: 8
+      shadow_step_mult: 3.0
+    output:
+      snapshot_radius: 2.5
+
+  # ── Bunny Cloud (warm cream, medium density) ────────────────────────────
+  - name: "bunny_cloud"
+    description: "Stanford bunny cloud — warm tones, medium density."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\bunny_cloud.vdb"
+      up_axis: "+Y"
+    rendering:
+      smoke_color: [1.0, 0.95, 0.88]
+      density_scale: 40.0
+      density_curve: 1.0
+      light_penetration: 0.20
+      phase_g: 0.35
+      sun_color: [1.0, 0.9, 0.75]
+      sun_intensity: 4.0
+      ambient_color: [0.65, 0.65, 0.7]
+      ambient_intensity: 0.45
+    output:
+      snapshot_radius: 2.75
+
+  # ── Smoke Plume (grey, high density, moody) ─────────────────────────────
+  - name: "smoke_plume"
+    description: "Dark smoke plume — high density, cool ambient."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\Smoke_Plume_01\\Smoke_Plume_01\\embergen_smoke_plume_a_80.vdb"
+      up_axis: "-Y"
+    rendering:
+      smoke_color: [0.4, 0.4, 0.42]
+      density_scale: 50.0
+      density_curve: 1.3
+      light_penetration: 0.08
+      phase_g: 0.55
+      sun_direction: [0.5, -1.0, 0.5]
+      sun_color: [1.0, 0.8, 0.6]
+      sun_intensity: 4.0
+      ambient_color: [0.5, 0.55, 0.65]
+      ambient_intensity: 0.45
+      shadow_steps: 8
+    output:
+      snapshot_radius: 2.6
+
+  # ── Campfire (warm orange/amber glow) ───────────────────────────────────
+  - name: "campfire"
+    description: "Small campfire — warm fiery tones, low density."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\SmallCampfireVDB\\smallCampfire\\smallCampfireVDB\\smallCampfire_0122.vdb"
+      up_axis: "-Y"
+    rendering:
+      smoke_color: [1.0, 0.75, 0.45]
+      density_scale: 2.0
+      density_curve: 1.0
+      light_penetration: 0.15
+      phase_g: 0.4
+      sun_direction: [0.0, -1.0, 0.5]
+      sun_color: [1.0, 0.85, 0.5]
+      sun_intensity: 4.0
+      ambient_color: [0.7, 0.5, 0.3]
+      ambient_intensity: 0.45
+    output:
+      snapshot_radius: 2.8

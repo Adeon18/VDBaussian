@@ -1,0 +1,519 @@
+# =============================================================================
+# exp_07c_capstone_large.yaml  —  All 5 shapes at 460³
+#
+# Purpose: Run all capstone shapes at 460³ with tile_size=8.
+#          Cloud/tornado/campfire already succeeded at native in exp_07b,
+#          but re-running at uniform 460³ for consistent comparison.
+#          Bunny and smoke crash at native (577³/495³) due to GPU limits.
+#
+# CASCADE: full best config from exp_02–06
+# Resolution: 460³, tile_size=8, max_gaussians_per_tile=512
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_07c_capstone_large.yaml
+# =============================================================================
+
+global_overrides:
+  training:
+    max_steps: 3000
+  volume:
+    vol_size: 460
+    tile_size: 8
+    max_gaussians_per_tile: 512
+  output:
+    result_dir: "results/exp_07c_capstone_large"
+
+experiments:
+
+  # ===== Cloud ================================================================
+
+  - name: "baseline_cloud"
+    description: "Cloud at 460³ with default config."
+    volume:
+      vdb_file: "cloud_04_variant_0000.vdb"
+      up_axis: "-Z"
+    rendering:
+      smoke_color: [0.95, 0.95, 0.97]
+      density_scale: 35.0
+      density_curve: 0.8
+      light_penetration: 0.25
+      phase_g: 0.3
+      sun_color: [1.0, 0.95, 0.85]
+      sun_intensity: 4.0
+      ambient_color: [0.7, 0.75, 0.85]
+      ambient_intensity: 0.45
+    output:
+      snapshot_radius: 2.5
+
+  - name: "calm_cloud"
+    description: "Cloud at 460³ with full cascade + calm ADC."
+    volume:
+      vdb_file: "cloud_04_variant_0000.vdb"
+      up_axis: "-Z"
+    rendering:
+      smoke_color: [0.95, 0.95, 0.97]
+      density_scale: 35.0
+      density_curve: 0.8
+      light_penetration: 0.25
+      phase_g: 0.3
+      sun_color: [1.0, 0.95, 0.85]
+      sun_intensity: 4.0
+      ambient_color: [0.7, 0.75, 0.85]
+      ambient_intensity: 0.45
+    output:
+      snapshot_radius: 2.5
+    gaussian_init:
+      target_count: 15000
+      density_weighted: false
+      sigma_scale: 1.5
+    training:
+      adam_beta2: 0.95
+      learning_rate_pos: 0.20
+      learning_rate_scale: 0.005
+      learning_rate_rotation: 0.02
+      learning_rate_weight: 0.025
+      loss_mode: 0
+      ssim_weight: 0.2
+    adc:
+      clone_n_dense: 1600
+      clone_n_sparse: 800
+      aniso_n_split: 120
+      grad_n_split: 120
+
+  - name: "aggressive_cloud"
+    description: "Cloud at 460³ with full cascade + aggressive ADC."
+    volume:
+      vdb_file: "cloud_04_variant_0000.vdb"
+      up_axis: "-Z"
+    rendering:
+      smoke_color: [0.95, 0.95, 0.97]
+      density_scale: 35.0
+      density_curve: 0.8
+      light_penetration: 0.25
+      phase_g: 0.3
+      sun_color: [1.0, 0.95, 0.85]
+      sun_intensity: 4.0
+      ambient_color: [0.7, 0.75, 0.85]
+      ambient_intensity: 0.45
+    output:
+      snapshot_radius: 2.5
+    gaussian_init:
+      target_count: 15000
+      density_weighted: false
+      sigma_scale: 1.5
+    training:
+      adam_beta2: 0.95
+      learning_rate_pos: 0.20
+      learning_rate_scale: 0.005
+      learning_rate_rotation: 0.02
+      learning_rate_weight: 0.025
+      loss_mode: 0
+      ssim_weight: 0.2
+    adc:
+      clone_n_dense: 1600
+      clone_n_sparse: 800
+      aniso_n_split: 120
+      grad_n_split: 120
+      full_adc_every: 100
+      prune_only_every: 50
+      clone_weight_init_frac: 0.50
+      clone_weight_min: 0.10
+      clone_weight_max: 0.50
+
+  # ===== Tornado ==============================================================
+
+  - name: "baseline_tornado"
+    description: "Tornado at 460³ with default config."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\TornadoLoopingVDB\\TornadoLooping\\TornadoVDB\\tornado_0109.vdb"
+      up_axis: "-Z"
+    rendering:
+      smoke_color: [0.55, 0.50, 0.45]
+      density_scale: 55.0
+      density_curve: 1.2
+      light_penetration: 0.10
+      phase_g: 0.5
+      sun_direction: [0.8, -0.5, 0.3]
+      sun_color: [1.0, 0.85, 0.6]
+      sun_intensity: 4.0
+      ambient_color: [0.5, 0.55, 0.6]
+      ambient_intensity: 0.45
+      shadow_steps: 8
+      shadow_step_mult: 3.0
+    output:
+      snapshot_radius: 2.5
+
+  - name: "calm_tornado"
+    description: "Tornado at 460³ with full cascade + calm ADC."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\TornadoLoopingVDB\\TornadoLooping\\TornadoVDB\\tornado_0109.vdb"
+      up_axis: "-Z"
+    rendering:
+      smoke_color: [0.55, 0.50, 0.45]
+      density_scale: 55.0
+      density_curve: 1.2
+      light_penetration: 0.10
+      phase_g: 0.5
+      sun_direction: [0.8, -0.5, 0.3]
+      sun_color: [1.0, 0.85, 0.6]
+      sun_intensity: 4.0
+      ambient_color: [0.5, 0.55, 0.6]
+      ambient_intensity: 0.45
+      shadow_steps: 8
+      shadow_step_mult: 3.0
+    output:
+      snapshot_radius: 2.5
+    gaussian_init:
+      target_count: 15000
+      density_weighted: false
+      sigma_scale: 1.5
+    training:
+      adam_beta2: 0.95
+      learning_rate_pos: 0.20
+      learning_rate_scale: 0.005
+      learning_rate_rotation: 0.02
+      learning_rate_weight: 0.025
+      loss_mode: 0
+      ssim_weight: 0.2
+    adc:
+      clone_n_dense: 1600
+      clone_n_sparse: 800
+      aniso_n_split: 120
+      grad_n_split: 120
+
+  - name: "aggressive_tornado"
+    description: "Tornado at 460³ with full cascade + aggressive ADC."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\TornadoLoopingVDB\\TornadoLooping\\TornadoVDB\\tornado_0109.vdb"
+      up_axis: "-Z"
+    rendering:
+      smoke_color: [0.55, 0.50, 0.45]
+      density_scale: 55.0
+      density_curve: 1.2
+      light_penetration: 0.10
+      phase_g: 0.5
+      sun_direction: [0.8, -0.5, 0.3]
+      sun_color: [1.0, 0.85, 0.6]
+      sun_intensity: 4.0
+      ambient_color: [0.5, 0.55, 0.6]
+      ambient_intensity: 0.45
+      shadow_steps: 8
+      shadow_step_mult: 3.0
+    output:
+      snapshot_radius: 2.5
+    gaussian_init:
+      target_count: 15000
+      density_weighted: false
+      sigma_scale: 1.5
+    training:
+      adam_beta2: 0.95
+      learning_rate_pos: 0.20
+      learning_rate_scale: 0.005
+      learning_rate_rotation: 0.02
+      learning_rate_weight: 0.025
+      loss_mode: 0
+      ssim_weight: 0.2
+    adc:
+      clone_n_dense: 1600
+      clone_n_sparse: 800
+      aniso_n_split: 120
+      grad_n_split: 120
+      full_adc_every: 100
+      prune_only_every: 50
+      clone_weight_init_frac: 0.50
+      clone_weight_min: 0.10
+      clone_weight_max: 0.50
+
+  # ===== Bunny Cloud ==========================================================
+
+  - name: "baseline_bunny"
+    description: "Bunny cloud at 460³ with default config."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\bunny_cloud.vdb"
+      up_axis: "+Y"
+    rendering:
+      smoke_color: [1.0, 0.95, 0.88]
+      density_scale: 40.0
+      density_curve: 1.0
+      light_penetration: 0.20
+      phase_g: 0.35
+      sun_color: [1.0, 0.9, 0.75]
+      sun_intensity: 4.0
+      ambient_color: [0.65, 0.65, 0.7]
+      ambient_intensity: 0.45
+    output:
+      snapshot_radius: 2.75
+
+  - name: "calm_bunny"
+    description: "Bunny cloud at 460³ with full cascade + calm ADC."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\bunny_cloud.vdb"
+      up_axis: "+Y"
+    rendering:
+      smoke_color: [1.0, 0.95, 0.88]
+      density_scale: 40.0
+      density_curve: 1.0
+      light_penetration: 0.20
+      phase_g: 0.35
+      sun_color: [1.0, 0.9, 0.75]
+      sun_intensity: 4.0
+      ambient_color: [0.65, 0.65, 0.7]
+      ambient_intensity: 0.45
+    output:
+      snapshot_radius: 2.75
+    gaussian_init:
+      target_count: 15000
+      density_weighted: false
+      sigma_scale: 1.5
+    training:
+      adam_beta2: 0.95
+      learning_rate_pos: 0.20
+      learning_rate_scale: 0.005
+      learning_rate_rotation: 0.02
+      learning_rate_weight: 0.025
+      loss_mode: 0
+      ssim_weight: 0.2
+    adc:
+      clone_n_dense: 1600
+      clone_n_sparse: 800
+      aniso_n_split: 120
+      grad_n_split: 120
+
+  - name: "aggressive_bunny"
+    description: "Bunny cloud at 460³ with full cascade + aggressive ADC."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\bunny_cloud.vdb"
+      up_axis: "+Y"
+    rendering:
+      smoke_color: [1.0, 0.95, 0.88]
+      density_scale: 40.0
+      density_curve: 1.0
+      light_penetration: 0.20
+      phase_g: 0.35
+      sun_color: [1.0, 0.9, 0.75]
+      sun_intensity: 4.0
+      ambient_color: [0.65, 0.65, 0.7]
+      ambient_intensity: 0.45
+    output:
+      snapshot_radius: 2.75
+    gaussian_init:
+      target_count: 15000
+      density_weighted: false
+      sigma_scale: 1.5
+    training:
+      adam_beta2: 0.95
+      learning_rate_pos: 0.20
+      learning_rate_scale: 0.005
+      learning_rate_rotation: 0.02
+      learning_rate_weight: 0.025
+      loss_mode: 0
+      ssim_weight: 0.2
+    adc:
+      clone_n_dense: 1600
+      clone_n_sparse: 800
+      aniso_n_split: 120
+      grad_n_split: 120
+      full_adc_every: 100
+      prune_only_every: 50
+      clone_weight_init_frac: 0.50
+      clone_weight_min: 0.10
+      clone_weight_max: 0.50
+
+  # ===== Smoke Plume ==========================================================
+
+  - name: "baseline_smoke"
+    description: "Smoke plume at 460³ with default config."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\Smoke_Plume_01\\Smoke_Plume_01\\embergen_smoke_plume_a_80.vdb"
+      up_axis: "-Y"
+    rendering:
+      smoke_color: [0.4, 0.4, 0.42]
+      density_scale: 50.0
+      density_curve: 1.3
+      light_penetration: 0.08
+      phase_g: 0.55
+      sun_direction: [0.5, -1.0, 0.5]
+      sun_color: [1.0, 0.8, 0.6]
+      sun_intensity: 4.0
+      ambient_color: [0.5, 0.55, 0.65]
+      ambient_intensity: 0.45
+      shadow_steps: 8
+    output:
+      snapshot_radius: 2.6
+
+  - name: "calm_smoke"
+    description: "Smoke plume at 460³ with full cascade + calm ADC."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\Smoke_Plume_01\\Smoke_Plume_01\\embergen_smoke_plume_a_80.vdb"
+      up_axis: "-Y"
+    rendering:
+      smoke_color: [0.4, 0.4, 0.42]
+      density_scale: 50.0
+      density_curve: 1.3
+      light_penetration: 0.08
+      phase_g: 0.55
+      sun_direction: [0.5, -1.0, 0.5]
+      sun_color: [1.0, 0.8, 0.6]
+      sun_intensity: 4.0
+      ambient_color: [0.5, 0.55, 0.65]
+      ambient_intensity: 0.45
+      shadow_steps: 8
+    output:
+      snapshot_radius: 2.6
+    gaussian_init:
+      target_count: 15000
+      density_weighted: false
+      sigma_scale: 1.5
+    training:
+      adam_beta2: 0.95
+      learning_rate_pos: 0.20
+      learning_rate_scale: 0.005
+      learning_rate_rotation: 0.02
+      learning_rate_weight: 0.025
+      loss_mode: 0
+      ssim_weight: 0.2
+    adc:
+      clone_n_dense: 1600
+      clone_n_sparse: 800
+      aniso_n_split: 120
+      grad_n_split: 120
+
+  - name: "aggressive_smoke"
+    description: "Smoke plume at 460³ with full cascade + aggressive ADC."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\Smoke_Plume_01\\Smoke_Plume_01\\embergen_smoke_plume_a_80.vdb"
+      up_axis: "-Y"
+    rendering:
+      smoke_color: [0.4, 0.4, 0.42]
+      density_scale: 50.0
+      density_curve: 1.3
+      light_penetration: 0.08
+      phase_g: 0.55
+      sun_direction: [0.5, -1.0, 0.5]
+      sun_color: [1.0, 0.8, 0.6]
+      sun_intensity: 4.0
+      ambient_color: [0.5, 0.55, 0.65]
+      ambient_intensity: 0.45
+      shadow_steps: 8
+    output:
+      snapshot_radius: 2.6
+    gaussian_init:
+      target_count: 15000
+      density_weighted: false
+      sigma_scale: 1.5
+    training:
+      adam_beta2: 0.95
+      learning_rate_pos: 0.20
+      learning_rate_scale: 0.005
+      learning_rate_rotation: 0.02
+      learning_rate_weight: 0.025
+      loss_mode: 0
+      ssim_weight: 0.2
+    adc:
+      clone_n_dense: 1600
+      clone_n_sparse: 800
+      aniso_n_split: 120
+      grad_n_split: 120
+      full_adc_every: 100
+      prune_only_every: 50
+      clone_weight_init_frac: 0.50
+      clone_weight_min: 0.10
+      clone_weight_max: 0.50
+
+  # ===== Campfire =============================================================
+
+  - name: "baseline_campfire"
+    description: "Campfire at 460³ with default config."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\SmallCampfireVDB\\smallCampfire\\smallCampfireVDB\\smallCampfire_0122.vdb"
+      up_axis: "-Y"
+    rendering:
+      smoke_color: [1.0, 0.75, 0.45]
+      density_scale: 2.0
+      density_curve: 1.0
+      light_penetration: 0.15
+      phase_g: 0.4
+      sun_direction: [0.0, -1.0, 0.5]
+      sun_color: [1.0, 0.85, 0.5]
+      sun_intensity: 4.0
+      ambient_color: [0.7, 0.5, 0.3]
+      ambient_intensity: 0.45
+    output:
+      snapshot_radius: 2.8
+
+  - name: "calm_campfire"
+    description: "Campfire at 460³ with full cascade + calm ADC."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\SmallCampfireVDB\\smallCampfire\\smallCampfireVDB\\smallCampfire_0122.vdb"
+      up_axis: "-Y"
+    rendering:
+      smoke_color: [1.0, 0.75, 0.45]
+      density_scale: 2.0
+      density_curve: 1.0
+      light_penetration: 0.15
+      phase_g: 0.4
+      sun_direction: [0.0, -1.0, 0.5]
+      sun_color: [1.0, 0.85, 0.5]
+      sun_intensity: 4.0
+      ambient_color: [0.7, 0.5, 0.3]
+      ambient_intensity: 0.45
+    output:
+      snapshot_radius: 2.8
+    gaussian_init:
+      target_count: 15000
+      density_weighted: false
+      sigma_scale: 1.5
+    training:
+      adam_beta2: 0.95
+      learning_rate_pos: 0.20
+      learning_rate_scale: 0.005
+      learning_rate_rotation: 0.02
+      learning_rate_weight: 0.025
+      loss_mode: 0
+      ssim_weight: 0.2
+    adc:
+      clone_n_dense: 1600
+      clone_n_sparse: 800
+      aniso_n_split: 120
+      grad_n_split: 120
+
+  - name: "aggressive_campfire"
+    description: "Campfire at 460³ with full cascade + aggressive ADC."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\SmallCampfireVDB\\smallCampfire\\smallCampfireVDB\\smallCampfire_0122.vdb"
+      up_axis: "-Y"
+    rendering:
+      smoke_color: [1.0, 0.75, 0.45]
+      density_scale: 2.0
+      density_curve: 1.0
+      light_penetration: 0.15
+      phase_g: 0.4
+      sun_direction: [0.0, -1.0, 0.5]
+      sun_color: [1.0, 0.85, 0.5]
+      sun_intensity: 4.0
+      ambient_color: [0.7, 0.5, 0.3]
+      ambient_intensity: 0.45
+    output:
+      snapshot_radius: 2.8
+    gaussian_init:
+      target_count: 15000
+      density_weighted: false
+      sigma_scale: 1.5
+    training:
+      adam_beta2: 0.95
+      learning_rate_pos: 0.20
+      learning_rate_scale: 0.005
+      learning_rate_rotation: 0.02
+      learning_rate_weight: 0.025
+      loss_mode: 0
+      ssim_weight: 0.2
+    adc:
+      clone_n_dense: 1600
+      clone_n_sparse: 800
+      aniso_n_split: 120
+      grad_n_split: 120
+      full_adc_every: 100
+      prune_only_every: 50
+      clone_weight_init_frac: 0.50
+      clone_weight_min: 0.10
+      clone_weight_max: 0.50

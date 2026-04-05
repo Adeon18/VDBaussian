@@ -1,0 +1,132 @@
+# =============================================================================
+# exp_05b_adc_params.yaml  —  ADC timing, frequency, pruning & backoff
+#
+# Purpose: With the best spawn rate from exp_05a, test WHEN and HOW OFTEN
+#          ADC runs, and how aggressively it prunes.
+#
+# CASCADE: best from exp_02a, exp_02b, exp_03a-d, exp_04, exp_05a
+# Shape:   cloud_04_variant_0000
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_05b_adc_params.yaml
+# =============================================================================
+
+global_overrides:
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_05b_adc_params"
+    snapshot_radius: 2.5
+
+  # -- CASCADE ----------------------------------------------------------------
+  gaussian_init:
+    target_count: 15000           # <-- replace with exp_05a winner if init count changed
+    density_weighted: false
+    sigma_scale: 1.5
+  training:
+    adam_beta2: 0.95
+    learning_rate_pos: 0.20
+    learning_rate_scale: 0.005
+    learning_rate_rotation: 0.02
+    learning_rate_weight: 0.025
+    loss_mode: 0
+    ssim_weight: 0.2
+  adc:
+    max_gaussians: 50000
+    clone_n_dense: 1600
+    clone_n_sparse: 800
+    aniso_n_split: 120
+    grad_n_split: 120
+
+experiments:
+
+  # ===== Baseline =============================================================
+
+  - name: "baseline_default"
+    description: "Default ADC timing (start=300, full every 400, prune every 150, backoff=1.05) -- baseline with exp_05a winning spawn rates."
+
+  # ===== Start timing =========================================================
+
+  - name: "start_50"
+    description: "ADC starts at step 50 -- very early, Gaussians barely fitted; tests if early restructuring helps or causes chaos."
+    adc:
+      start_frame: 50
+
+  - name: "start_100"
+    description: "ADC starts at step 100 -- early intervention; tests whether 300 is unnecessarily conservative."
+    adc:
+      start_frame: 100
+
+  - name: "start_500"
+    description: "ADC starts at step 500 -- late start; tests whether ADC benefits from a well-fitted starting population."
+    adc:
+      start_frame: 500
+
+  - name: "start_1000"
+    description: "ADC starts at step 1000 -- very late; tests whether ADC is only useful for late refinement."
+    adc:
+      start_frame: 1000
+
+  # ===== Frequency ============================================================
+
+  - name: "freq_fast"
+    description: "Full ADC every 200 steps, prune every 75 -- twice default frequency; tighter feedback loop."
+    adc:
+      full_adc_every: 200
+      prune_only_every: 75
+
+  - name: "freq_very_fast"
+    description: "Full ADC every 100 steps, prune every 50 -- four times default; maximum churn, tests if constant restructuring helps."
+    adc:
+      full_adc_every: 100
+      prune_only_every: 50
+
+  - name: "freq_slow"
+    description: "Full ADC every 800 steps, prune every 300 -- half default; more optimizer time between restructuring."
+    adc:
+      full_adc_every: 800
+      prune_only_every: 300
+
+  # ===== Backoff ==============================================================
+
+  - name: "backoff_none"
+    description: "No backoff (factor=1.0) -- ADC runs at constant frequency throughout; tests whether late-stage ADC at full rate helps."
+    adc:
+      backoff_factor: 1.0
+
+  - name: "backoff_aggressive"
+    description: "Aggressive backoff (factor=1.20) -- ADC rapidly slows down, effectively stops in the last third; tests whether late ADC is counterproductive."
+    adc:
+      backoff_factor: 1.20
+
+  # ===== Pruning thresholds ===================================================
+
+  - name: "prune_aggressive"
+    description: "High pruning thresholds (weight=0.02, scale_min=0.005, contribution=1e-4) -- kills weak Gaussians fast, favors fewer stronger primitives."
+    adc:
+      prune_weight_min: 0.02
+      prune_scale_min_frac: 0.005
+      prune_contribution_min: 1.0e-4
+
+  - name: "prune_conservative"
+    description: "Low pruning thresholds (weight=0.001, scale_min=0.0005, contribution=1e-6) -- keeps marginal Gaussians alive longer."
+    adc:
+      prune_weight_min: 0.001
+      prune_scale_min_frac: 0.0005
+      prune_contribution_min: 1.0e-6
+
+  - name: "prune_aniso_strict"
+    description: "Strict anisotropy pruning (max=10 vs default 50) -- aggressively kills needles instead of waiting for splits to fix them."
+    adc:
+      prune_aniso_max: 10.0
