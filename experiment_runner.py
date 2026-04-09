@@ -172,8 +172,8 @@ def print_batch_summary(summaries: list[dict]) -> None:
 
 def _parse_args():
     p = argparse.ArgumentParser(description="Batch experiment orchestrator")
-    p.add_argument("--batch",      required=True,
-                   help="Batch YAML file (must contain an 'experiments' list)")
+    p.add_argument("--batch",      required=True, nargs="+",
+                   help="One or more batch YAML files, run sequentially")
     p.add_argument("--output-dir", default=None,
                    help="Override base results directory")
     p.add_argument("--only",       nargs="*", default=None,
@@ -185,14 +185,14 @@ def _parse_args():
     return p.parse_args()
 
 
-def main():
-    args       = _parse_args()
-    batch_path = Path(args.batch).resolve()
+def _run_batch(batch_path: Path, args, global_summaries: list[dict]):
+    """Run all experiments from a single batch YAML file."""
+    global _STOP_AFTER_CURRENT
 
     all_cfgs = load_batch(batch_path)
     if not all_cfgs:
-        print("[Runner] No experiments found in batch file.")
-        sys.exit(0)
+        print(f"[Runner] No experiments found in {batch_path.name}.")
+        return
 
     # Filter by --only
     if args.only:
@@ -205,8 +205,8 @@ def main():
         cfgs = all_cfgs
 
     if not cfgs:
-        print("[Runner] No matching experiments.")
-        sys.exit(0)
+        print(f"[Runner] No matching experiments in {batch_path.name}.")
+        return
 
     # Determine output dir from first config
     base_out = (
@@ -237,10 +237,11 @@ def main():
 
     for i, cfg in enumerate(cfgs, 1):
         name = cfg.get("_name", f"exp_{i}")
-        print(f"\n[Runner] ({i}/{len(cfgs)}) Starting: {name}")
+        print(f"\n[Runner] ({i}/{len(cfgs)}) Starting: {name}  [batch: {batch_path.name}]")
 
         summary = run_one(name, batch_path, base_out)
         summaries.append(summary)
+        global_summaries.append(summary)
 
         # Flush manifest after each experiment so Ctrl+C doesn't lose results
         manifest["experiments"] = summaries
@@ -257,7 +258,7 @@ def main():
         json.dump(manifest, f, indent=2, default=str)
 
     print_batch_summary(summaries)
-    print(f"[Runner] Total wall time: {timedelta(seconds=int(time.time()-t_batch))}")
+    print(f"[Runner] Batch wall time: {timedelta(seconds=int(time.time()-t_batch))}")
     print(f"[Runner] Results directory: {base_out}")
 
     # HTML report
@@ -272,6 +273,34 @@ def main():
             import traceback
             print(f"[Runner] Report generation failed (non-fatal): {e}")
             traceback.print_exc()
+
+
+def main():
+    args = _parse_args()
+    batch_paths = [Path(b).resolve() for b in args.batch]
+
+    if len(batch_paths) > 1:
+        print(f"[Runner] Queued {len(batch_paths)} batch files:")
+        for i, bp in enumerate(batch_paths, 1):
+            print(f"  {i}. {bp.name}")
+        print()
+
+    global_summaries: list[dict] = []
+    t_global = time.time()
+
+    for bi, batch_path in enumerate(batch_paths, 1):
+        if _STOP_AFTER_CURRENT:
+            print(f"\n[Runner] Skipping remaining batches after interrupt.")
+            break
+        if len(batch_paths) > 1:
+            print(f"\n{'#'*72}")
+            print(f"  BATCH {bi}/{len(batch_paths)}: {batch_path.name}")
+            print(f"{'#'*72}")
+        _run_batch(batch_path, args, global_summaries)
+
+    if len(batch_paths) > 1:
+        print(f"\n[Runner] All batches done. Total: {len(global_summaries)} experiments "
+              f"in {timedelta(seconds=int(time.time()-t_global))}")
 
 
 if __name__ == "__main__":
