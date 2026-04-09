@@ -289,6 +289,7 @@ def save_checkpoint(
     # Rasterize once for renders
     if force_rasterize:
         import slangpy as spy
+        renderer._ensure_gaussian_volume_tex()
         cmd = renderer.device.create_command_encoder()
         renderer.rasterize_gaussians(cmd, vol_min, vol_max)
         renderer.device.submit_command_buffer(cmd.finish())
@@ -598,6 +599,11 @@ class HeadlessTrainer:
 
         # ---- step-0 checkpoint (pre-training) ----
         if 0 in cp_set:
+            # Force metrics computation before first checkpoint
+            if cfg["metrics_3d"]["enabled"]:
+                self.metrics_3d.tick(0, self.vol_min, self.vol_max, True, force=True)
+            if cfg["metrics_2d"]["enabled"]:
+                self.metrics_2d.tick(0, True, force=True)
             snap = save_checkpoint(
                 0, self.renderer, self.settings,
                 self.vol_min, self.vol_max,
@@ -700,6 +706,19 @@ class HeadlessTrainer:
                 shadow_warmth    = float(out_c.get("ply_shadow_warmth",     0.10)),
             )
             save_gaussians_to_ply(gpu_params, ply_path, lighting)
+
+        # ---- DGS export (native format) ----
+        if cfg["output"].get("save_dgs_at_end", True):
+            from save_load_gaussians import save_gaussians
+            dgs_path = self.out_dir / "final_gaussians.dgs"
+            self.logger.info(f"Saving DGS → {dgs_path}")
+            gpu_params = (
+                self.renderer.gaussian_buffer.to_numpy()
+                .view(np.float32)
+                .reshape(-1, self._PARAMS_PER_GAUSSIAN)
+                .copy()
+            )
+            save_gaussians(gpu_params, str(dgs_path))
 
         # ---- Finalise ----
         if results["status"] == "running":

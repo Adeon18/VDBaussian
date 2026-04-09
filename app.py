@@ -3,6 +3,7 @@ import numpy as np
 from pathlib import Path
 import math
 import random
+import gc
 import openvdb as vdb
 import itertools
 import time
@@ -18,6 +19,7 @@ if EXTENDED_UI:
     import ctypes
     from imgui_bundle import imgui
     from save_ply import save_gaussians_dialog, CloudLightingConfig
+    from save_load_gaussians import save_gaussians, load_gaussians
     from metrics import MetricsCollector
     from adc import ADCConfig, ADCController
     from screen_metrics import ScreenMetricsCollector
@@ -754,25 +756,19 @@ class Renderer:
         self.display_gl_tex = None
         self.width, self.height = 0, 0
 
-        self.gaussian_volume_tex = device.create_texture(
+        # Lazy allocation — full-size textures only created when SSIM or Gaussian volume
+        # rendering is active. Saves ~1.5 GB VRAM at 577³ in headless mode with ssim_weight=0.
+        # Tiny 1x1x1 dummies satisfy shader bindings when unused.
+        self._gauss_vol_allocated = False
+        self._ssim_grad_allocated = False
+        dummy_tex_args = dict(
             type=spy.TextureType.texture_3d,
             format=spy.Format.r32_float,
-            width=VOL_SIZE,
-            height=VOL_SIZE,
-            depth=VOL_SIZE,
+            width=1, height=1, depth=1,
             usage=spy.TextureUsage.unordered_access | spy.TextureUsage.shader_resource,
-            label="GaussianVolume",
         )
-
-        self.ssim_gradient_tex = device.create_texture(
-            type=spy.TextureType.texture_3d,
-            format=spy.Format.r32_float,
-            width=VOL_SIZE,
-            height=VOL_SIZE,
-            depth=VOL_SIZE,
-            usage=spy.TextureUsage.unordered_access | spy.TextureUsage.shader_resource,
-            label="SSIMGradient",
-        )
+        self.gaussian_volume_tex = device.create_texture(**dummy_tex_args, label="GaussianVolume")
+        self.ssim_gradient_tex = device.create_texture(**dummy_tex_args, label="SSIMGradient")
 
         self._needs_rebinning = True
         self._needs_rasterization = True
@@ -801,17 +797,8 @@ class Renderer:
 
         self.check_hot_reload()
 
-        # Debug
-        self.debug_tex = device.create_texture(
-            type=spy.TextureType.texture_3d,
-            format=spy.Format.rgba8_unorm,
-            width=VOL_SIZE,
-            height=VOL_SIZE,
-            depth=VOL_SIZE,
-            usage=spy.TextureUsage.unordered_access | spy.TextureUsage.shader_resource,
-            label="DebugVolume",
-        )
-
+        # Debug – allocated lazily to save VRAM in headless mode
+        self.debug_tex = None
         self.debug_mode = 0
         self.debug_scale = 1.0
 
@@ -842,6 +829,14 @@ class Renderer:
     def init_training(self):
 
         total_tiles = self.tile_res[0] * self.tile_res[1] * self.tile_res[2]
+
+        # Free old buffers before reallocating to avoid transient VRAM spike
+        self.grad_buffer = None
+        self.tile_content = None
+        self.tile_counts = None
+        self.adam_first_moment = None
+        self.adam_second_moment = None
+        gc.collect()
 
         self.grad_buffer = self.device.create_buffer(
             element_count=self.gaussian_count * PARAMS_PER_GAUSSIAN,
@@ -1088,6 +1083,46 @@ class Renderer:
             "recommendation": recommendation,
         }
 
+    def _ensure_debug_tex(self):
+        """Allocate debug texture on first use (saves VRAM in headless mode)."""
+        if self.debug_tex is None:
+            self.debug_tex = self.device.create_texture(
+                type=spy.TextureType.texture_3d,
+                format=spy.Format.rgba8_unorm,
+                width=VOL_SIZE,
+                height=VOL_SIZE,
+                depth=VOL_SIZE,
+                usage=spy.TextureUsage.unordered_access | spy.TextureUsage.shader_resource,
+                label="DebugVolume",
+            )
+
+    def _ensure_gaussian_volume_tex(self):
+        """Allocate full-size gaussian volume texture on first use."""
+        if self._gauss_vol_allocated:
+            return
+        self._gauss_vol_allocated = True
+        self.gaussian_volume_tex = self.device.create_texture(
+            type=spy.TextureType.texture_3d,
+            format=spy.Format.r32_float,
+            width=VOL_SIZE, height=VOL_SIZE, depth=VOL_SIZE,
+            usage=spy.TextureUsage.unordered_access | spy.TextureUsage.shader_resource,
+            label="GaussianVolume",
+        )
+
+    def _ensure_ssim_textures(self):
+        """Allocate full-size SSIM gradient texture (and gaussian volume if needed)."""
+        self._ensure_gaussian_volume_tex()
+        if self._ssim_grad_allocated:
+            return
+        self._ssim_grad_allocated = True
+        self.ssim_gradient_tex = self.device.create_texture(
+            type=spy.TextureType.texture_3d,
+            format=spy.Format.r32_float,
+            width=VOL_SIZE, height=VOL_SIZE, depth=VOL_SIZE,
+            usage=spy.TextureUsage.unordered_access | spy.TextureUsage.shader_resource,
+            label="SSIMGradient",
+        )
+
     def update_debug_visualization(self, cmd, vol_min, vol_max):
         """
         Update debug visualization WITHOUT running training.
@@ -1095,6 +1130,7 @@ class Renderer:
         """
         if self.debug_mode == 0:
             return
+        self._ensure_debug_tex()
 
         # Just run the debug computation kernel (no training)
         with cmd.begin_compute_pass() as cp:
@@ -1180,6 +1216,7 @@ class Renderer:
         # 3.5. SSIM gradient precomputation (uses predicted volume from previous step)
         ssim_active = train_config.ssim_weight > 0.0 and self.adam_iteration > 1
         if ssim_active:
+            self._ensure_ssim_textures()
             with cmd.begin_compute_pass() as cp:
                 root_object = cp.bind_pipeline(self.pipe_ssim_gradient)
                 cursor = spy.ShaderCursor(root_object)
@@ -1258,6 +1295,7 @@ class Renderer:
             cp.dispatch(thread_count=(self.gaussian_count, 1, 1))
 
         if self.use_gaussian_volume or train_config.ssim_weight > 0.0:
+            self._ensure_ssim_textures()
             self.rasterize_gaussians(cmd, vol_min, vol_max)
 
         # Pass 7: Debug visualization
@@ -2015,6 +2053,7 @@ class App:
         self.renderer._vol_max = self.vol_max_world
         self.renderer.init_training()
 
+        self.renderer._ensure_gaussian_volume_tex()
         cmd = self.device.create_command_encoder()
         self.renderer.rasterize_gaussians(cmd, self.vol_min_world, self.vol_max_world)
         self.device.submit_command_buffer(cmd.finish())
@@ -2365,9 +2404,11 @@ class App:
                 "Smoke Albedo", self.settings.smoke_color
             )
 
-            _, self.renderer.use_gaussian_volume = imgui.checkbox(
+            changed, self.renderer.use_gaussian_volume = imgui.checkbox(
                 "Render Gaussian Volume", self.renderer.use_gaussian_volume
             )
+            if changed and self.renderer.use_gaussian_volume:
+                self.renderer._ensure_gaussian_volume_tex()
             _, self.renderer.use_splatting = imgui.checkbox(
                 "Splatting Mode (3DGS)", self.renderer.use_splatting
             )
@@ -2740,6 +2781,56 @@ class App:
                     "Check console for opacity stats after saving."
                 )
 
+            imgui.dummy((0, 10))
+            imgui.separator()
+            imgui.text("Native Gaussian Format")
+
+            if imgui.button("Save .dgs"):
+                from tkinter import Tk, filedialog
+                Tk().withdraw()
+                path = filedialog.asksaveasfilename(
+                    title="Save Gaussians as DGS",
+                    defaultextension=".dgs",
+                    filetypes=[("DGS files", "*.dgs"), ("All files", "*.*")],
+                )
+                if path:
+                    gpu_params = (
+                        self.renderer.gaussian_buffer.to_numpy()
+                        .view(np.float32)
+                        .reshape(-1, PARAMS_PER_GAUSSIAN)
+                        .copy()
+                    )
+                    save_gaussians(gpu_params, path)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Save raw Gaussian parameters (pos, scale, quat, weight)")
+
+            imgui.same_line()
+
+            if imgui.button("Load .dgs"):
+                from tkinter import Tk, filedialog
+                Tk().withdraw()
+                path = filedialog.askopenfilename(
+                    title="Load Gaussians from DGS",
+                    filetypes=[("DGS files", "*.dgs"), ("All files", "*.*")],
+                )
+                if path:
+                    loaded = load_gaussians(path)
+                    self.renderer.gaussian_count = len(loaded)
+                    self.renderer.gaussian_buffer = self.device.create_buffer(
+                        element_count=len(loaded),
+                        struct_size=PARAMS_PER_GAUSSIAN * 4,
+                        usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+                        memory_type=spy.MemoryType.device_local,
+                        data=loaded,
+                    )
+                    self.renderer.init_training()
+                    self.renderer._needs_rebinning = True
+                    self.renderer._ensure_gaussian_volume_tex()
+                    cmd = self.device.create_command_encoder()
+                    self.renderer.rasterize_gaussians(cmd, self.vol_min_world, self.vol_max_world)
+                    self.device.submit_command_buffer(cmd.finish())
+                    print(f"[DGS] Loaded {len(loaded):,} Gaussians, training state reset.")
+
             # Debug
             imgui.dummy((0, 10))
         imgui.end()
@@ -3016,6 +3107,7 @@ class App:
 
     def compute_current_loss(self):
         """Compute MSE loss between Gaussian volume and reference"""
+        self.renderer._ensure_gaussian_volume_tex()
         # Only rasterize if we're using Gaussian volume
         if self.renderer.use_gaussian_volume:
             vol = self.renderer.gaussian_volume_tex.to_numpy()
@@ -3225,6 +3317,9 @@ class SlimApp(spy.AppWindow):
         sui.Button(
             win, label="Regenerate Gaussians", callback=self._on_regenerate
         )
+        sui.Button(
+            win, label="Load .dgs", callback=self._on_load_dgs
+        )
 
     # ---- UI callbacks ----
 
@@ -3286,6 +3381,43 @@ class SlimApp(spy.AppWindow):
         self._ui_gauss_count.text = f"Gaussians: {self.renderer.gaussian_count:,}"
         self._ui_train_step.text = "Step: 0"
         print(f"[SlimApp] Regenerated {self.renderer.gaussian_count:,} gaussians")
+
+        if was_training:
+            self.is_training = True
+
+    def _on_load_dgs(self):
+        from tkinter import Tk, filedialog
+        from save_load_gaussians import load_gaussians
+        Tk().withdraw()
+        path = filedialog.askopenfilename(
+            title="Load Gaussians from DGS",
+            filetypes=[("DGS files", "*.dgs"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        was_training = self.is_training
+        self.is_training = False
+
+        loaded = load_gaussians(path)
+        self.renderer.gaussian_count = len(loaded)
+        self.renderer.gaussian_buffer = self._device.create_buffer(
+            element_count=len(loaded),
+            struct_size=PARAMS_PER_GAUSSIAN * 4,
+            usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+            memory_type=spy.MemoryType.device_local,
+            data=loaded,
+        )
+        self.renderer.init_training()
+        self.renderer._needs_rebinning = True
+        self.renderer._ensure_gaussian_volume_tex()
+        cmd = self._device.create_command_encoder()
+        self.renderer.rasterize_gaussians(cmd, self.vol_min_world, self.vol_max_world)
+        self._device.submit_command_buffer(cmd.finish())
+
+        self._ui_gauss_count.text = f"Gaussians: {self.renderer.gaussian_count:,}"
+        self._ui_train_step.text = "Step: 0"
+        self.train_step = 0
+        print(f"[DGS] Loaded {len(loaded):,} Gaussians, training state reset.")
 
         if was_training:
             self.is_training = True
@@ -3355,6 +3487,7 @@ class SlimApp(spy.AppWindow):
         print(f"[ADC] Buffer rebuilt: {len(new_params):,} Gaussians")
 
     def compute_current_loss(self):
+        self.renderer._ensure_gaussian_volume_tex()
         if self.renderer.use_gaussian_volume:
             vol = self.renderer.gaussian_volume_tex.to_numpy()
         else:

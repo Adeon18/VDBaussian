@@ -503,6 +503,7 @@ class ScreenMetricsCollector:
 
     def _run(self, frame: int):
         # Gaussian volume must be current — rasterize if needed
+        self.renderer._ensure_gaussian_volume_tex()
         if not self.renderer.use_gaussian_volume or self.renderer._needs_rasterization:
             cmd = self.device.create_command_encoder()
             self.renderer.rasterize_gaussians(

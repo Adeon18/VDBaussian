@@ -103,6 +103,7 @@ def run_one(name: str, batch_path: Path, out_dir: Path) -> dict:
                 r = json.load(f)
             summary["final_gaussian_count"] = r.get("final_gaussian_count", 0)
             summary["step_time_summary"]    = r.get("step_time_summary", {})
+            summary["compression"]          = r.get("compression", {})
 
             cps = r.get("checkpoints", [])
             if cps:
