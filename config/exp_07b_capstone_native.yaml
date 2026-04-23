@@ -72,7 +72,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800
@@ -107,7 +107,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800
@@ -173,7 +173,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800
@@ -211,7 +211,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800
@@ -226,10 +226,12 @@ experiments:
   # ===== Bunny Cloud ==========================================================
 
   - name: "baseline_bunny"
-    description: "Bunny cloud at native resolution with default config."
+    description: "Bunny cloud at 460³ (crashes at native 577³)."
     volume:
       vdb_file: "C:\\Users\\ade0n\\Downloads\\bunny_cloud.vdb"
       up_axis: "+Y"
+      use_native_size: false
+      vol_size: 460
     rendering:
       smoke_color: [1.0, 0.95, 0.88]
       density_scale: 40.0
@@ -244,10 +246,12 @@ experiments:
       snapshot_radius: 2.75
 
   - name: "calm_bunny"
-    description: "Bunny cloud at native resolution with full cascade + calm ADC."
+    description: "Bunny cloud at 460³ with full cascade + calm ADC."
     volume:
       vdb_file: "C:\\Users\\ade0n\\Downloads\\bunny_cloud.vdb"
       up_axis: "+Y"
+      use_native_size: false
+      vol_size: 460
     rendering:
       smoke_color: [1.0, 0.95, 0.88]
       density_scale: 40.0
@@ -271,7 +275,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800
@@ -279,10 +283,12 @@ experiments:
       grad_n_split: 120
 
   - name: "aggressive_bunny"
-    description: "Bunny cloud at native resolution with full cascade + aggressive ADC."
+    description: "Bunny cloud at 460³ with full cascade + aggressive ADC."
     volume:
       vdb_file: "C:\\Users\\ade0n\\Downloads\\bunny_cloud.vdb"
       up_axis: "+Y"
+      use_native_size: false
+      vol_size: 460
     rendering:
       smoke_color: [1.0, 0.95, 0.88]
       density_scale: 40.0
@@ -306,7 +312,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800
@@ -321,10 +327,12 @@ experiments:
   # ===== Smoke Plume ==========================================================
 
   - name: "baseline_smoke"
-    description: "Smoke plume at native resolution with default config."
+    description: "Smoke plume at 460³ (crashes at native 495³)."
     volume:
       vdb_file: "C:\\Users\\ade0n\\Downloads\\Smoke_Plume_01\\Smoke_Plume_01\\embergen_smoke_plume_a_80.vdb"
       up_axis: "-Y"
+      use_native_size: false
+      vol_size: 460
     rendering:
       smoke_color: [0.4, 0.4, 0.42]
       density_scale: 50.0
@@ -341,10 +349,12 @@ experiments:
       snapshot_radius: 2.6
 
   - name: "calm_smoke"
-    description: "Smoke plume at native resolution with full cascade + calm ADC."
+    description: "Smoke plume at 460³ with full cascade + calm ADC."
     volume:
       vdb_file: "C:\\Users\\ade0n\\Downloads\\Smoke_Plume_01\\Smoke_Plume_01\\embergen_smoke_plume_a_80.vdb"
       up_axis: "-Y"
+      use_native_size: false
+      vol_size: 460
     rendering:
       smoke_color: [0.4, 0.4, 0.42]
       density_scale: 50.0
@@ -370,7 +380,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800
@@ -378,10 +388,12 @@ experiments:
       grad_n_split: 120
 
   - name: "aggressive_smoke"
-    description: "Smoke plume at native resolution with full cascade + aggressive ADC."
+    description: "Smoke plume at 460³ with full cascade + aggressive ADC."
     volume:
       vdb_file: "C:\\Users\\ade0n\\Downloads\\Smoke_Plume_01\\Smoke_Plume_01\\embergen_smoke_plume_a_80.vdb"
       up_axis: "-Y"
+      use_native_size: false
+      vol_size: 460
     rendering:
       smoke_color: [0.4, 0.4, 0.42]
       density_scale: 50.0
@@ -407,7 +419,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800
@@ -469,7 +481,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800
@@ -505,7 +517,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800

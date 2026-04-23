@@ -1,0 +1,94 @@
+# =============================================================================
+# exp_08c_init_native_tornado.yaml  —  Init-count sweep on tornado at native,
+#                                       with the AGGRESSIVE ADC preset.
+#
+# Purpose: exp_08 showed that init count barely matters on cloud_white at
+#          native with aggressive ADC (1.6 dB span across 1k-30k). exp_08b
+#          confirmed this requires aggressive ADC (calm ADC spans 3.04 dB).
+#
+#          This experiment tests whether the finding generalises to a
+#          morphologically different shape (tornado = thin elongated
+#          filaments vs cloud = blobby isotropic). If tornado also
+#          flattens, the thesis claim is safe to generalise across shapes.
+#          If it doesn't, the effect is shape-dependent and the chapter
+#          needs that caveat.
+#
+#          Trimmed to 4 init counts (1k / 5k / 15k / 30k) for speed.
+#          15k is the reference matching aggressive_tornado in exp_07c.
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_08c_init_native_tornado.yaml
+# =============================================================================
+
+global_overrides:
+  training:
+    max_steps: 3000
+  volume:
+    vdb_file: "C:\\Users\\ade0n\\Downloads\\TornadoLoopingVDB\\TornadoLooping\\TornadoVDB\\tornado_0109.vdb"
+    up_axis: "-Z"
+    use_native_size: true
+    tile_size: 8
+    max_gaussians_per_tile: 512
+  rendering:
+    smoke_color: [0.55, 0.50, 0.45]
+    density_scale: 55.0
+    density_curve: 1.2
+    light_penetration: 0.10
+    phase_g: 0.5
+    sun_direction: [0.8, -0.5, 0.3]
+    sun_color: [1.0, 0.85, 0.6]
+    sun_intensity: 4.0
+    ambient_color: [0.5, 0.55, 0.6]
+    ambient_intensity: 0.45
+    shadow_steps: 8
+    shadow_step_mult: 3.0
+  output:
+    result_dir: "results/exp_08c_init_native_tornado"
+    snapshot_radius: 2.5
+  gaussian_init:
+    target_count: 15000
+    density_weighted: false
+    sigma_scale: 1.5
+    max_count: 60000
+  training:
+    adam_beta2: 0.95
+    learning_rate_pos: 0.20
+    learning_rate_scale: 0.005
+    learning_rate_rotation: 0.02
+    learning_rate_weight: 0.025
+    loss_mode: 0
+    ssim_weight: 0.5
+  adc:
+    max_gaussians: 60000
+    clone_n_dense: 1600
+    clone_n_sparse: 800
+    aniso_n_split: 120
+    grad_n_split: 120
+    full_adc_every: 100
+    prune_only_every: 50
+    clone_weight_init_frac: 0.50
+    clone_weight_min: 0.10
+    clone_weight_max: 0.50
+
+
+experiments:
+
+  - name: "init_1k_tornado_aggressive"
+    description: "Tornado native, aggressive ADC, init 1k — max compression attempt."
+    gaussian_init:
+      target_count: 1000
+
+  - name: "init_5k_tornado_aggressive"
+    description: "Tornado native, aggressive ADC, init 5k."
+    gaussian_init:
+      target_count: 5000
+
+  - name: "init_15k_tornado_aggressive"
+    description: "Tornado native, aggressive ADC, init 15k — reference."
+    gaussian_init:
+      target_count: 15000
+
+  - name: "init_30k_tornado_aggressive"
+    description: "Tornado native, aggressive ADC, init 30k."
+    gaussian_init:
+      target_count: 30000

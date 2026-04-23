@@ -1,0 +1,96 @@
+# =============================================================================
+# exp_10b_steps_native_calm.yaml -- Step-count sweep, calm ADC
+#
+# Purpose: companion to exp_10. The Gaussian-count-over-time plot shows the
+#          calm trajectory still climbing near-linearly at step 3000, so calm
+#          is the regime most likely to benefit from more training. This sweep
+#          tests whether calm's compression-mode quality keeps improving with
+#          more steps, and where it eventually flattens.
+#
+#          Grid concentrated in the high-step region where calm is expected
+#          to keep gaining: {1500, 3000, 5000, 8000} -- four rows. The 3000
+#          row reproduces init_15k_native_calm from exp_08b and acts as the
+#          chapter-default reference; 1500 anchors the lower side; 5000/8000
+#          probe how much further calm can go.
+#
+# Cascade: identical to exp_08b init_15k_native_calm, only training.max_steps
+#          varies.
+#
+# Note:    max_count / max_gaussians raised to 75000 for headroom (calm grows
+#          ~2.2 Gaussians/step from init, so by 8000 steps we expect ~32-35k --
+#          well under cap, but matched to exp_10 for consistency).
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_10b_steps_native_calm.yaml
+# =============================================================================
+
+global_overrides:
+  training:
+    max_steps: 3000
+    adam_beta2: 0.95
+    learning_rate_pos: 0.20
+    learning_rate_scale: 0.005
+    learning_rate_rotation: 0.02
+    learning_rate_weight: 0.025
+    loss_mode: 0
+    ssim_weight: 0.5
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+    use_native_size: true
+    tile_size: 8
+    max_gaussians_per_tile: 512
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_10b_steps_native_calm"
+    snapshot_radius: 2.5
+    # Dense checkpoints for convergence trajectory across the long-step rows.
+    # Entries past max_steps are silently ignored by the training loop; -1 = final.
+    checkpoints: [0, 100, 300, 500, 1000, 1500, 2000, 2500, 3000, 4000, 5000, 6000, 7000, -1]
+  gaussian_init:
+    target_count: 15000
+    density_weighted: false
+    sigma_scale: 1.5
+    max_count: 75000
+  adc:
+    max_gaussians: 75000
+    clone_n_dense: 1600
+    clone_n_sparse: 800
+    aniso_n_split: 120
+    grad_n_split: 120
+
+
+experiments:
+
+  - name: "steps_500"
+    description: "Calm ADC, 500 steps -- mirrors aggressive 500, lowest anchor."
+    training: { max_steps: 500 }
+
+  - name: "steps_1000"
+    description: "Calm ADC, 1000 steps -- mirrors aggressive 1000."
+    training: { max_steps: 1000 }
+
+  - name: "steps_1500"
+    description: "Calm ADC, 1500 steps -- low anchor."
+    training: { max_steps: 1500 }
+
+  - name: "steps_3000"
+    description: "Calm ADC, 3000 steps -- chapter default, matches init_15k_native_calm in exp_08b."
+    training: { max_steps: 3000 }
+
+  - name: "steps_5000"
+    description: "Calm ADC, 5000 steps -- probes whether calm keeps gaining past the chapter default."
+    training: { max_steps: 5000 }
+
+  - name: "steps_8000"
+    description: "Calm ADC, 8000 steps -- tests where calm's near-linear count growth finally saturates."
+    training: { max_steps: 8000 }

@@ -1,0 +1,68 @@
+# =============================================================================
+# exp_04bv2_ssim_huber05.yaml  —  D-SSIM + Huber delta=0.05 (missing from 04b)
+#
+# Purpose: Huber d=0.05 was the better Huber variant in exp_04 (higher IoU,
+#          stronger 2D metrics than d=0.1). exp_04b tested SSIM blends only
+#          with d=0.1. This fills the gap with matching d=0.05 runs.
+#
+# CASCADE: same as exp_04b
+# Shape:   cloud_04_variant_0000
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_04bv2_ssim_huber05.yaml
+# =============================================================================
+
+global_overrides:
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_04bv2_ssim_huber05"
+    snapshot_radius: 2.5
+
+  # -- CASCADE ----------------------------------------------------------------
+  gaussian_init:
+    target_count: 15000
+    density_weighted: false
+    sigma_scale: 1.5
+  training:
+    adam_beta2: 0.95
+    learning_rate_pos: 0.20
+    learning_rate_scale: 0.005
+    learning_rate_rotation: 0.02
+    learning_rate_weight: 0.025
+
+experiments:
+
+  # ===== Huber d=0.05 + SSIM (mirrors the d=0.1 runs from exp_04b) ===========
+
+  - name: "huber_d005_ssim_010"
+    description: "Huber d=0.05 + 10% D-SSIM -- mirrors huber_d01_ssim_010 from exp_04b but with the better Huber delta."
+    training:
+      loss_mode: 2
+      huber_delta: 0.05
+      ssim_weight: 0.1
+
+  - name: "huber_d005_ssim_020"
+    description: "Huber d=0.05 + 20% D-SSIM -- mirrors huber_d01_ssim_020 from exp_04b but with the better Huber delta."
+    training:
+      loss_mode: 2
+      huber_delta: 0.05
+      ssim_weight: 0.2
+
+  - name: "huber_d005_ssim_050"
+    description: "Huber d=0.05 + 50% D-SSIM -- matches the L2 adopted weight to see if Huber's 2D advantage compounds further."
+    training:
+      loss_mode: 2
+      huber_delta: 0.05
+      ssim_weight: 0.5

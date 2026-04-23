@@ -11,7 +11,7 @@ Usage:
     python experiment_runner.py --batch config/example_batch.yaml --no-report
 
 Ctrl+C after the current experiment finishes gracefully.
-Ctrl+C twice → hard kill.
+Ctrl+C twice -> hard kill.
 
 After all experiments complete, generates results/report.html automatically.
 """
@@ -127,7 +127,7 @@ def run_one(name: str, batch_path: Path, out_dir: Path) -> dict:
 
 def _print_exp_result(s: dict) -> None:
     ok   = s["status"] == "completed"
-    icon = "✓" if ok else "✗"
+    icon = "[OK]" if ok else "[FAIL]"
     ms   = s.get("step_time_summary", {}).get("mean_ms", "?")
     p3   = s.get("final_psnr_3d")
     p3s  = f"{p3:.2f} dB" if p3 is not None else "—"
@@ -217,7 +217,7 @@ def _run_batch(batch_path: Path, args, global_summaries: list[dict]):
 
     # Dry run
     if args.dry_run:
-        print(f"[Dry run] {len(cfgs)} experiments → {base_out}")
+        print(f"[Dry run] {len(cfgs)} experiments -> {base_out}")
         for c in cfgs:
             print(f"  - {c.get('_name','?'):<35} {c.get('_description','')}")
         return
@@ -267,7 +267,7 @@ def _run_batch(batch_path: Path, args, global_summaries: list[dict]):
         try:
             import report_generator
             index_path = report_generator.generate(base_out, summaries)
-            print(f"[Runner] Report ready → {index_path}")
+            print(f"[Runner] Report ready -> {index_path}")
             print(f"[Runner] Open in browser: file://{index_path.resolve()}")
         except Exception as e:
             import traceback

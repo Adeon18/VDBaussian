@@ -34,7 +34,7 @@ class MetricsConfig:
         self.slow_interval: int = 50  # Tier-2 every N frames
         self.history_length: int = 500  # entries kept in RAM
         self.iou_threshold: float = 0.05  # density threshold for binary IoU
-        self.ssim_window_half: int = 5  # box window half-size → 11x11
+        self.ssim_window_half: int = 5  # box window half-size -> 11x11
         self.ssim_c1: float = 0.0001
         self.ssim_c2: float = 0.0009
         self.ssim_slices_per_axis: int = 16  # slices sampled per axis
@@ -212,7 +212,7 @@ class MetricsCollector:
 
     def _dispatch_ssim(self, cmd, vol_min, vol_max):
         wh = self.config.ssim_window_half
-        # axis → (slice_depth_dim, sliceW, sliceH)
+        # axis -> (slice_depth_dim, sliceW, sliceH)
         axes = [
             (
                 0,
@@ -346,7 +346,7 @@ class MetricsCollector:
                         for v in row
                     ]
                 )
-        print(f"[Metrics] {len(self._frames)} rows → {path}")
+        print(f"[Metrics] {len(self._frames)} rows -> {path}")
 
     # ImGui — inline, no begin/end
     def draw_ui_inline(self):
@@ -402,7 +402,7 @@ class MetricsCollector:
 
         imgui.separator()
 
-        # Current values with red→green colouring
+        # Current values with red->green colouring
         def metric_row(label, val, good_dir, green_t, red_t):
             imgui.text(f"{label:<13}")
             imgui.same_line(150)

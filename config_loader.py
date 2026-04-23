@@ -2,7 +2,7 @@
 config_loader.py  —  Config loading, deep-merging, validation, LR scheduling.
 
 Merge order (each layer deep-merges on top of the previous):
-    defaults.yaml → global_overrides → per-experiment overrides
+    defaults.yaml -> global_overrides -> per-experiment overrides
 
 Lists are REPLACED not extended — intentional for lr_schedule, checkpoints,
 snapshot_cameras, etc.  If you want to extend, copy the full list into your
@@ -68,7 +68,7 @@ def build_experiment_config(
     defaults: dict | None = None,
 ) -> dict:
     """
-    Merge: defaults → global_overrides → experiment_dict.
+    Merge: defaults -> global_overrides -> experiment_dict.
     'name' and 'description' keys are preserved as _name/_description
     but not merged into the config tree.
     """
@@ -91,7 +91,7 @@ def build_experiment_config(
 
 
 def load_batch(batch_path: str | Path) -> list[dict]:
-    """Load a batch YAML → list of fully-resolved experiment configs."""
+    """Load a batch YAML -> list of fully-resolved experiment configs."""
     raw = _load_yaml(batch_path)
     defaults = load_defaults()
     global_overrides = raw.get("global_overrides", {})
@@ -116,7 +116,7 @@ def load_single(config_path: str | Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Apply config → domain objects
+# Apply config -> domain objects
 # ---------------------------------------------------------------------------
 
 def apply_config_to_settings(cfg: dict, settings) -> None:

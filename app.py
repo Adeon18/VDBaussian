@@ -11,7 +11,7 @@ import time
 # ==========================================
 # UI MODE: Set to False for slim slangpy-native window (no OpenGL/imgui)
 # ==========================================
-EXTENDED_UI = True
+EXTENDED_UI = False
 
 if EXTENDED_UI:
     import glfw
@@ -40,13 +40,14 @@ PRINT_TILE_STATS = True  # Print tiling statistics
 PRINT_GRADIENT_STATS = True  # Print gradient statistics
 
 # VDB_FILE = "C:\\Users\\ade0n\\Downloads\\bunny_cloud.vdb"
-VDB_FILE = "cloud_01_variant_0000.vdb"
-# VDB_FILE = "C:\\Users\\ade0n\\Downloads\\TornadoLoopingVDB\\TornadoLooping\\TornadoVDB\\tornado_0109.vdb"
+VDB_FILE = "cloud_04_variant_0000.vdb"
+# VDB_FILE = "C:\\Users\\ade0n\\Downloads\\smoke2.vdb"
 # VDB_FILE = "C:\\Users\\ade0n\\Downloads\\Smoke_Plume_01\\Smoke_Plume_01\\embergen_smoke_plume_a_140.vdb"
 # VDB_FILE = "C:\\Users\\ade0n\\Downloads\\SmallCampfireVDB\\smallCampfire\\smallCampfireVDB\\smallCampfire_0122.vdb"
+# VDB_FILE = "C:\\Users\\ade0n\\Downloads\\TornadoLoopingVDB\\TornadoLooping\\TornadoVDB\\tornado_0109.vdb"
 VOL_SIZE = 128
-USE_NATIVE_VDB_SIZE = False  # When True, VOL_SIZE is ignored and the VDB's native resolution is used
-VDB_UP_AXIS = "-Y"  # Source VDB up axis: "+Y" (Houdini/Maya), "+Z" (Blender/3dsMax), etc.
+USE_NATIVE_VDB_SIZE = True  # When True, VOL_SIZE is ignored and the VDB's native resolution is used
+VDB_UP_AXIS = "-Z"  # Source VDB up axis: "+Y" (Houdini/Maya), "+Z" (Blender/3dsMax), etc.
 SHADER_FILE = "shaders/hybrid.slang"
 TILE_SIZE = 4
 MAX_GAUSSIANS_PER_TILE = 256
@@ -266,9 +267,9 @@ def load_vdb_grid(vdb_path):
 
 # VDB files do not store an up-axis convention.  Different DCC tools
 # bake data in their own coordinate system:
-#   Houdini / Maya  → +Y up   (most common for VDB content)
-#   Blender / 3ds Max → +Z up
-#   EmberGen        → configurable at export
+#   Houdini / Maya  -> +Y up   (most common for VDB content)
+#   Blender / 3ds Max -> +Z up
+#   EmberGen        -> configurable at export
 # Real engines (UE, Unity) let the user pick — we do the same.
 VDB_UP_AXES = {
     "+Y": (1,  1),   # Houdini / Maya (default)
@@ -289,11 +290,11 @@ def _build_axis_remap(up_axis, up_sign):
         our_pos[i] = signs[i] * vdb_pos[perm[i]]
         vdb_pos[perm[i]] = signs[i] * our_pos[i]   (inverse)
     """
-    if up_axis == 0:       # VDB X is up → swap X↔Y
+    if up_axis == 0:       # VDB X is up -> swap X↔Y
         perm = [1, 0, 2]
-    elif up_axis == 2:     # VDB Z is up → swap Y↔Z
+    elif up_axis == 2:     # VDB Z is up -> swap Y↔Z
         perm = [0, 2, 1]
-    else:                  # VDB Y is up → identity
+    else:                  # VDB Y is up -> identity
         perm = [0, 1, 2]
 
     signs = [1, up_sign, 1]
@@ -301,7 +302,7 @@ def _build_axis_remap(up_axis, up_sign):
 
 
 def _remap_position(pos, perm, signs):
-    """VDB world position → our coordinate system."""
+    """VDB world position -> our coordinate system."""
     return np.array([signs[i] * pos[perm[i]] for i in range(3)])
 
 
@@ -400,7 +401,7 @@ def convert_grid_to_dense_volume(grid, size, up_axis_name="+Y", use_native_size=
     perm, signs = _build_axis_remap(up_axis, up_sign)
     axis_remap = (perm, signs)
 
-    print(f"  Source up axis: {up_axis_name} → remap to +Y")
+    print(f"  Source up axis: {up_axis_name} -> remap to +Y")
 
     # Remap bounds to our coordinate system (Y-up)
     our_min, our_max = _remap_bounds(vdb_world_min, vdb_world_max, perm, signs)
@@ -428,7 +429,7 @@ def convert_grid_to_dense_volume(grid, size, up_axis_name="+Y", use_native_size=
     our_y = min_world_bound[1] + t_y * extent[1]
     our_z = min_world_bound[2] + t_z * extent[2]
 
-    # Inverse remap: our coords → VDB world coords (vectorized)
+    # Inverse remap: our coords -> VDB world coords (vectorized)
     signs_arr = np.array(signs, dtype=np.float64)
     our_components = [our_x, our_y, our_z]
     vdb_x = np.zeros_like(our_x)
@@ -649,7 +650,7 @@ class SGLDDiagnostics:
             if trend > 0:
                 print(f"[SGLD Diag]   ↑ Coverage growing (+{trend} tiles) — Gaussians migrating")
             elif trend == 0:
-                print(f"[SGLD Diag]   → Coverage static — Gaussians not migrating")
+                print(f"[SGLD Diag]   -> Coverage static — Gaussians not migrating")
             else:
                 print(f"[SGLD Diag]   ↓ Coverage shrinking — ADC pruning faster than migration")
 
@@ -2013,6 +2014,16 @@ class App:
         imgui.create_context()
         self.io = imgui.get_io()
         self.io.config_flags |= imgui.ConfigFlags_.docking_enable
+
+        # Scale UI font with monitor DPI
+        x_scale, _ = glfw.get_window_content_scale(self.window)
+        font_size = 13.0 * max(x_scale, 1.0)
+        self.io.fonts.clear()
+        font_cfg = imgui.ImFontConfig()
+        font_cfg.size_pixels = font_size
+        self.io.fonts.add_font_default(font_cfg)
+        imgui.get_style().scale_all_sizes(max(x_scale, 1.0))
+
         window_address = ctypes.cast(self.window, ctypes.c_void_p).value
         imgui.backends.glfw_init_for_opengl(window_address, True)
         imgui.backends.opengl3_init("#version 330")
@@ -3075,7 +3086,7 @@ class App:
                             (1, 0, 0, 1), f"↑ Worsening ({-improvement:.6f}/10 iter)"
                         )
                     else:
-                        imgui.text_colored((1, 1, 0, 1), "→ Plateaued")
+                        imgui.text_colored((1, 1, 0, 1), "-> Plateaued")
 
             # Gradient magnitude trend
             imgui.dummy((0, 10))

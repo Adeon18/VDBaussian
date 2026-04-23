@@ -349,8 +349,11 @@ void init_sort_keys_light(uint3 tid : SV_DispatchThreadID)
         Gaussian g = gGaussians[idx];
         float3 volExtent = volumeMax - volumeMin;
         float3 pos = (g.pos - volumeMin) / volExtent * 2.0 - 1.0;
+        // sun_direction convention is "from volume to sun" (matches the raymarcher),
+        // so the gaussian with the LARGEST dot(pos, sunDir) is closest to the sun and
+        // must be scanned first. Negate the key to flip the ascending sort.
         float3 ld = float3(lightDirX, lightDirY, lightDirZ);
-        float lightDepth = dot(pos, ld);
+        float lightDepth = -dot(pos, ld);
         gSortKeys[idx] = floatToSortKey(lightDepth);
     } else {
         gSortKeys[idx] = 0xFFFFFFFFu;
@@ -670,9 +673,10 @@ void render_splats(uint3 tid : SV_DispatchThreadID, uint3 groupID : SV_GroupID, 
     // lightPenetration now controls shadow density in the sweep, not sun brightness
     float3 sunLight = sunColorBase * phase;
 
-    // Background
+    // Background: gray at image-bottom (scene-ground), black at image-top (scene-sky).
+    // Matches the raymarcher's look relative to the scene.
     float bgT = float(pixel.y) / float(screenHeight);
-    float3 bg = lerp(float3(0.1, 0.1, 0.1), float3(0.0, 0.0, 0.0), bgT);
+    float3 bg = lerp(float3(0.0, 0.0, 0.0), float3(0.1, 0.1, 0.1), bgT);
 
     // Front-to-back compositing
     float3 accColor = float3(0.0);

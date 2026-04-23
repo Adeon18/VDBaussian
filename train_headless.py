@@ -93,7 +93,7 @@ def _json_default(obj):
 
 
 def _flush_json(data: dict, path: Path) -> None:
-    """Atomic write: .tmp → rename."""
+    """Atomic write: .tmp -> rename."""
     tmp = path.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, default=_json_default)
@@ -690,7 +690,7 @@ class HeadlessTrainer:
         if cfg["output"].get("save_ply_at_end", True):
             from save_ply import CloudLightingConfig, save_gaussians_to_ply
             ply_path = self.out_dir / "final_gaussians.ply"
-            self.logger.info(f"Saving PLY → {ply_path}")
+            self.logger.info(f"Saving PLY -> {ply_path}")
             gpu_params = (
                 self.renderer.gaussian_buffer.to_numpy()
                 .view(np.float32)
@@ -711,7 +711,7 @@ class HeadlessTrainer:
         if cfg["output"].get("save_dgs_at_end", True):
             from save_load_gaussians import save_gaussians
             dgs_path = self.out_dir / "final_gaussians.dgs"
-            self.logger.info(f"Saving DGS → {dgs_path}")
+            self.logger.info(f"Saving DGS -> {dgs_path}")
             gpu_params = (
                 self.renderer.gaussian_buffer.to_numpy()
                 .view(np.float32)
@@ -741,6 +741,83 @@ class HeadlessTrainer:
             "ratio_vs_volume": round(vol_bytes / gauss_bytes, 2) if gauss_bytes > 0 else 0,
             "ratio_vs_vdb": round(self.vdb_file_size / gauss_bytes, 2) if gauss_bytes > 0 else 0,
         }
+
+        # Honest compression ratio: against a Blosc-compressed sparse VDB at
+        # the same resolution as training. Cache lives at
+        # results/_meta/resampled_vdb_bytes.json. On a miss, we measure inline
+        # by reusing tools/measure_resampled_vdb.py's helpers (bit-identical
+        # to the historical cache) and persist the result back. Best-effort:
+        # failures leave the ratio absent rather than failing the run.
+        try:
+            from pathlib import Path as _P
+            import sys as _sys
+            _tools_dir = _P(__file__).resolve().parent / "tools"
+            if str(_tools_dir) not in _sys.path:
+                _sys.path.insert(0, str(_tools_dir))
+            from measure_resampled_vdb import (
+                dense_native_array as _mrv_dense,
+                resample_cubic_nearest as _mrv_resample,
+                normalise as _mrv_normalise,
+                save_sparse_and_measure as _mrv_measure,
+            )
+
+            _meta_path = _P(__file__).resolve().parent / "results" / "_meta" / "resampled_vdb_bytes.json"
+            # Canonical names for the shapes that appear in the thesis cache;
+            # anything else falls back to the VDB basename as its key.
+            _shape_map = {
+                "cloud_04_variant_0000.vdb":    "cloud_white",
+                "tornado_0109.vdb":             "tornado",
+                "bunny_cloud.vdb":              "bunny_cloud",
+                "embergen_smoke_plume_a_80.vdb":"smoke_plume",
+                "smallCampfire_0122.vdb":       "campfire",
+                "smoke2.vdb":                   "smoke2",
+                "explosion.vdb":                "explosion",
+            }
+            _basename = os.path.basename(self.cfg["volume"]["vdb_file"])
+            _shape = _shape_map.get(_basename, _basename)
+            _res_key = str(int(self.VOL_SIZE))
+
+            _cache = {}
+            if _meta_path.exists():
+                with open(_meta_path) as _f:
+                    _cache = json.load(_f)
+            _shape_meta = _cache.get(_shape, {}) or {}
+            _entry = _shape_meta.get(_res_key)
+            if _entry is None:
+                _nat = _shape_meta.get("native") or {}
+                if int(_nat.get("size", -1)) == int(self.VOL_SIZE):
+                    _entry = _nat
+
+            if _entry is None:
+                self.logger.info(
+                    f"Measuring resampled VDB baseline for {_shape}@{self.VOL_SIZE}..."
+                )
+                _native_arr, _ = _mrv_dense(self.grid)
+                _native_arr = _mrv_normalise(_native_arr)
+                _resampled = _mrv_resample(_native_arr, int(self.VOL_SIZE))
+                _rb, _av = _mrv_measure(_resampled, f"{_shape}_{self.VOL_SIZE}")
+                _entry = {
+                    "size":          int(self.VOL_SIZE),
+                    "bytes":         int(_rb),
+                    "active_voxels": int(_av),
+                    "fill_percent":  round(100.0 * _av / (int(self.VOL_SIZE) ** 3), 4),
+                }
+                _cache.setdefault(_shape, {})[_res_key] = _entry
+                _meta_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(_meta_path, "w") as _f:
+                    json.dump(_cache, _f, indent=2)
+
+            _rb = int(_entry["bytes"])
+            results["compression"]["shape"] = _shape
+            results["compression"]["training_resolution"] = int(self.VOL_SIZE)
+            results["compression"]["resampled_vdb_bytes"] = _rb
+            results["compression"]["ratio_vs_resampled_vdb"] = (
+                round(_rb / gauss_bytes, 3) if gauss_bytes > 0 else 0.0
+            )
+            results["shape"] = _shape
+            results["training_resolution"] = int(self.VOL_SIZE)
+        except Exception as _e:
+            self.logger.warning(f"Could not compute resampled-VDB compression: {_e}")
 
         _flush_json(results, self.out_dir / "results.json")
 

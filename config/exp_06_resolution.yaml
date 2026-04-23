@@ -42,7 +42,7 @@ global_overrides:
     learning_rate_rotation: 0.02
     learning_rate_weight: 0.025
     loss_mode: 0
-    ssim_weight: 0.2
+    ssim_weight: 0.5
 
 experiments:
 

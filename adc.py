@@ -76,8 +76,8 @@ class ADCBackend:
     @property
     def runs_async(self) -> bool:
         """
-        True  → controller spawns a daemon thread and calls run() on it.
-        False → controller calls run() inline on the main thread (GPU path,
+        True  -> controller spawns a daemon thread and calls run() on it.
+        False -> controller calls run() inline on the main thread (GPU path,
                 which must own the Vulkan context).
         """
         raise NotImplementedError
@@ -121,7 +121,7 @@ class GPUADCBackend(ADCBackend):
 
 
 class CPUADCBackend(ADCBackend):
-    """Pure-numpy backend. Releases GIL during heavy operations → safe on a thread."""
+    """Pure-numpy backend. Releases GIL during heavy operations -> safe on a thread."""
 
     @property
     def runs_async(self) -> bool:
@@ -140,7 +140,7 @@ class CPUADCBackend(ADCBackend):
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Returns (new_params, surviving_indices).
-        surviving_indices maps new_params[:len(survivors)] → original param rows,
+        surviving_indices maps new_params[:len(survivors)] -> original param rows,
         so the caller can transplant Adam moments correctly.
         """
         vol_min = np.asarray(vol_min, dtype=np.float32)
@@ -271,7 +271,7 @@ class CPUADCBackend(ADCBackend):
         if new_rows:
             result = np.vstack([result, np.array(new_rows, dtype=np.float32)])
             print(
-                f"[ADC] Aniso-split {len(to_split)} → +{len(to_split)} children "
+                f"[ADC] Aniso-split {len(to_split)} -> +{len(to_split)} children "
                 f"(aniso thresh {config.aniso_thresh:.1f}x)"
             )
 
@@ -349,7 +349,7 @@ class CPUADCBackend(ADCBackend):
         result = params[keep_mask]
         if new_rows:
             result = np.vstack([result, np.array(new_rows, dtype=np.float32)])
-            print(f"[ADC] Grad-split {len(to_split)} → +{len(to_split)} children")
+            print(f"[ADC] Grad-split {len(to_split)} -> +{len(to_split)} children")
 
         new_grads = np.zeros((len(new_rows), PARAMS_PER_GAUSSIAN), dtype=np.float32)
         result_grads = (
@@ -920,7 +920,7 @@ class ADCController:
 
 
 def _quat_to_matrix(q: np.ndarray) -> np.ndarray:
-    """q = [x, y, z, w]  →  3×3 rotation matrix  (column-major matches shader)"""
+    """q = [x, y, z, w]  ->  3×3 rotation matrix  (column-major matches shader)"""
     x, y, z, w = q[0], q[1], q[2], q[3]
     return np.array(
         [

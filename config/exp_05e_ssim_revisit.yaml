@@ -1,0 +1,131 @@
+# =============================================================================
+# exp_05e_ssim_revisit.yaml  —  Re-test SSIM blend on top 05d ADC configs
+#
+# Purpose: exp_04b found ssim=0.20 was the 3D-PSNR winner but ssim=0.50 won
+#          decisively on 2D rendered metrics (+0.42 dB 2D PSNR vs only -0.19 dB
+#          3D PSNR). At the time the cascade locked at 0.20. Now we revisit the
+#          decision on top of the much more aggressive 05d ADC configs (29k+
+#          Gaussians vs 15k from 04b's context) where the SSIM term has more
+#          structure to work with.
+#
+# CASCADE: best from exp_02–05d
+# Shape:   cloud_04_variant_0000
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_05e_ssim_revisit.yaml
+# =============================================================================
+
+global_overrides:
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_05e_ssim_revisit"
+    snapshot_radius: 2.5
+
+  # -- CASCADE ----------------------------------------------------------------
+  gaussian_init:
+    target_count: 15000
+    density_weighted: false
+    sigma_scale: 1.5
+  training:
+    adam_beta2: 0.95
+    learning_rate_pos: 0.20
+    learning_rate_scale: 0.005
+    learning_rate_rotation: 0.02
+    learning_rate_weight: 0.025
+    loss_mode: 0
+  adc:
+    max_gaussians: 50000
+    clone_n_dense: 1600
+    clone_n_sparse: 800
+    aniso_n_split: 120
+    grad_n_split: 120
+
+experiments:
+
+  # ===== vfast_weight_high (05d absolute winner) =============================
+
+  - name: "vfast_weight_high_ssim020"
+    description: "05d winner @ ssim=0.20 -- baseline reference matching exp_05d cascade choice."
+    training:
+      ssim_weight: 0.20
+    adc:
+      full_adc_every: 100
+      prune_only_every: 50
+      clone_weight_init_frac: 0.50
+      clone_weight_min: 0.10
+      clone_weight_max: 0.50
+
+  - name: "vfast_weight_high_ssim050"
+    description: "05d winner @ ssim=0.50 -- tests whether the heavier SSIM blend (favored in 04b 2D metrics) compounds with the high-Gaussian-count aggressive ADC."
+    training:
+      ssim_weight: 0.50
+    adc:
+      full_adc_every: 100
+      prune_only_every: 50
+      clone_weight_init_frac: 0.50
+      clone_weight_min: 0.10
+      clone_weight_max: 0.50
+
+  # ===== ref_freq_very_fast (05d 2nd place) ==================================
+
+  - name: "ref_vfast_ssim020"
+    description: "freq_very_fast (05b/05d 2nd place) @ ssim=0.20 -- tests SSIM impact on lighter ADC variant."
+    training:
+      ssim_weight: 0.20
+    adc:
+      full_adc_every: 100
+      prune_only_every: 50
+
+  - name: "ref_vfast_ssim050"
+    description: "freq_very_fast @ ssim=0.50 -- the same ADC at heavier SSIM."
+    training:
+      ssim_weight: 0.50
+    adc:
+      full_adc_every: 100
+      prune_only_every: 50
+
+  # ===== vfast_dense_focus (05d 4th place, fewer Gaussians) ==================
+
+  - name: "vfast_dense_ssim020"
+    description: "vfast_dense_focus @ ssim=0.20 -- compression-friendlier variant baseline."
+    training:
+      ssim_weight: 0.20
+    adc:
+      full_adc_every: 100
+      prune_only_every: 50
+      clone_n_dense: 2400
+      clone_n_sparse: 0
+
+  - name: "vfast_dense_ssim050"
+    description: "vfast_dense_focus @ ssim=0.50 -- tests whether the dense-only clone strategy benefits from heavier structural loss."
+    training:
+      ssim_weight: 0.50
+    adc:
+      full_adc_every: 100
+      prune_only_every: 50
+      clone_n_dense: 2400
+      clone_n_sparse: 0
+
+  # ===== Calm baseline (clone_4x_split_2x) for completeness ==================
+
+  - name: "calm_ssim020"
+    description: "Calm preset (05d baseline) @ ssim=0.20 -- the lower-Gaussian cascade variant baseline."
+    training:
+      ssim_weight: 0.20
+
+  - name: "calm_ssim050"
+    description: "Calm preset @ ssim=0.50 -- tests SSIM impact on the calm ADC variant."
+    training:
+      ssim_weight: 0.50

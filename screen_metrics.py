@@ -389,7 +389,7 @@ class ScreenMetricsCollector:
                     "" if isinstance(v, float) and math.isnan(v) else v
                     for v in row
                 ])
-        print(f"[ScreenMetrics] {len(self._frames)} rows → {path}")
+        print(f"[ScreenMetrics] {len(self._frames)} rows -> {path}")
 
     # -----------------------------------------------------------------------
     # Main loop entry point

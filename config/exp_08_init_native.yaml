@@ -1,0 +1,117 @@
+# =============================================================================
+# exp_08_init_native.yaml  —  Init-count sweep on cloud_white at 460³
+#
+# Purpose: exp_02a showed an init-count / compression tradeoff on cloud_white
+#          at 196³, but at that resolution the sparse-VDB baseline is ~1.4 MB,
+#          so every treatment lands near break-even. exp_05a further showed
+#          that on 196³ a low init + aggressive ADC cannot recover the
+#          quality of a high-init run, because ADC cannot reconstruct spatial
+#          coverage the initialiser missed.
+#
+#          At native resolution (460³) the sparse-VDB baseline is ~16 MB,
+#          leaving much more compression headroom. This experiment tests
+#          whether the 15k sweet spot from exp_02a still holds at native
+#          resolution, or whether a lower init with aggressive ADC wins the
+#          quality-vs-compression tradeoff when the VDB baseline is 10x larger.
+#
+#          Only cloud_white, only the aggressive ADC preset (the one that
+#          grows fastest). 5 rows: 1k / 2.5k / 5k / 10k / 15k (reference).
+#          The 15k row should reproduce `aggressive_cloud` from exp_07c
+#          (41.21 dB, 9.0x compression, 40850 final gaussians).
+#
+# Cascade: identical to exp_07c aggressive_cloud, only
+#          gaussian_init.target_count varies between rows.
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_08_init_native.yaml
+# =============================================================================
+
+global_overrides:
+  training:
+    max_steps: 3000
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+    use_native_size: true
+    tile_size: 8
+    max_gaussians_per_tile: 512
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_08_init_native"
+    snapshot_radius: 2.5
+  gaussian_init:
+    target_count: 15000
+    density_weighted: false
+    sigma_scale: 1.5
+    max_count: 60000          # raised from 50000; init_40k was hitting the cap
+  training:
+    adam_beta2: 0.95
+    learning_rate_pos: 0.20
+    learning_rate_scale: 0.005
+    learning_rate_rotation: 0.02
+    learning_rate_weight: 0.025
+    loss_mode: 0
+    ssim_weight: 0.5
+  adc:
+    max_gaussians: 60000      # raised from 50000; ADC growth ceiling
+    clone_n_dense: 1600
+    clone_n_sparse: 800
+    aniso_n_split: 120
+    grad_n_split: 120
+    full_adc_every: 100
+    prune_only_every: 50
+    clone_weight_init_frac: 0.50
+    clone_weight_min: 0.10
+    clone_weight_max: 0.50
+
+
+experiments:
+
+  - name: "init_1k_native"
+    description: "Cloud 460^3, aggressive ADC, init 1k — max compression attempt."
+    gaussian_init:
+      target_count: 1000
+
+  - name: "init_2500_native"
+    description: "Cloud 460^3, aggressive ADC, init 2.5k."
+    gaussian_init:
+      target_count: 2500
+
+  - name: "init_5k_native"
+    description: "Cloud 460^3, aggressive ADC, init 5k."
+    gaussian_init:
+      target_count: 5000
+
+  - name: "init_10k_native"
+    description: "Cloud 460^3, aggressive ADC, init 10k."
+    gaussian_init:
+      target_count: 10000
+
+  - name: "init_15k_native"
+    description: "Cloud 460^3, aggressive ADC, init 15k — reference, matches aggressive_cloud in exp_07c."
+    gaussian_init:
+      target_count: 15000
+
+  - name: "init_20k_native"
+    description: "Cloud 460^3, aggressive ADC, init 15k — reference, matches aggressive_cloud in exp_07c."
+    gaussian_init:
+      target_count: 20000
+
+  - name: "init_30k_native"
+    description: "Cloud 460^3, aggressive ADC, init 15k — reference, matches aggressive_cloud in exp_07c."
+    gaussian_init:
+      target_count: 30000
+
+  - name: "init_40k_native"
+    description: "Cloud 460^3, aggressive ADC, init 15k — reference, matches aggressive_cloud in exp_07c."
+    gaussian_init:
+      target_count: 40000

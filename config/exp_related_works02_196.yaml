@@ -1,0 +1,119 @@
+# =============================================================================
+# exp_related_works02_196.yaml  —  Capstone cascade on explosion.vdb at 196³
+#
+# Purpose: Default-resolution ($196^3$) variant of exp_related_works02 for
+#          the related-work comparison — matches exp_07 setup (tile_size=4,
+#          max_gaussians_per_tile=256, no native_size override).
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_related_works02_196.yaml
+# =============================================================================
+
+global_overrides:
+  training:
+    max_steps: 3000
+  output:
+    result_dir: "results/exp_related_works02_196"
+
+experiments:
+
+  # ===== explosion ===========================================================
+
+  - name: "baseline_explosion"
+    description: "explosion at 196³ with default config."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\explosion.vdb"
+      up_axis: "-Y"
+    rendering:
+      smoke_color: [0.80, 0.60, 0.45]
+      density_scale: 50.0
+      density_curve: 1.2
+      light_penetration: 0.12
+      phase_g: 0.45
+      sun_direction: [0.5, -1.0, 0.5]
+      sun_color: [1.0, 0.85, 0.6]
+      sun_intensity: 4.0
+      ambient_color: [0.7, 0.5, 0.35]
+      ambient_intensity: 0.45
+      shadow_steps: 8
+    output:
+      snapshot_radius: 2.6
+
+  - name: "calm_explosion"
+    description: "explosion at 196³ with full cascade + calm ADC."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\explosion.vdb"
+      up_axis: "-Y"
+    rendering:
+      smoke_color: [0.80, 0.60, 0.45]
+      density_scale: 50.0
+      density_curve: 1.2
+      light_penetration: 0.12
+      phase_g: 0.45
+      sun_direction: [0.5, -1.0, 0.5]
+      sun_color: [1.0, 0.85, 0.6]
+      sun_intensity: 4.0
+      ambient_color: [0.7, 0.5, 0.35]
+      ambient_intensity: 0.45
+      shadow_steps: 8
+    output:
+      snapshot_radius: 2.6
+    gaussian_init:
+      target_count: 15000
+      density_weighted: false
+      sigma_scale: 1.5
+    training:
+      adam_beta2: 0.95
+      learning_rate_pos: 0.20
+      learning_rate_scale: 0.005
+      learning_rate_rotation: 0.02
+      learning_rate_weight: 0.025
+      loss_mode: 0
+      ssim_weight: 0.5
+    adc:
+      clone_n_dense: 1600
+      clone_n_sparse: 800
+      aniso_n_split: 120
+      grad_n_split: 120
+
+  - name: "aggressive_explosion"
+    description: "explosion at 196³ with full cascade + aggressive ADC."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\explosion.vdb"
+      up_axis: "-Y"
+    rendering:
+      smoke_color: [0.80, 0.60, 0.45]
+      density_scale: 50.0
+      density_curve: 1.2
+      light_penetration: 0.12
+      phase_g: 0.45
+      sun_direction: [0.5, -1.0, 0.5]
+      sun_color: [1.0, 0.85, 0.6]
+      sun_intensity: 4.0
+      ambient_color: [0.7, 0.5, 0.35]
+      ambient_intensity: 0.45
+      shadow_steps: 8
+    output:
+      snapshot_radius: 2.6
+    gaussian_init:
+      target_count: 15000
+      density_weighted: false
+      sigma_scale: 1.5
+    training:
+      adam_beta2: 0.95
+      learning_rate_pos: 0.20
+      learning_rate_scale: 0.005
+      learning_rate_rotation: 0.02
+      learning_rate_weight: 0.025
+      loss_mode: 0
+      ssim_weight: 0.5
+    adc:
+      clone_n_dense: 1600
+      clone_n_sparse: 800
+      aniso_n_split: 120
+      grad_n_split: 120
+      full_adc_every: 100
+      prune_only_every: 50
+      clone_weight_init_frac: 0.50
+      clone_weight_min: 0.10
+      clone_weight_max: 0.50

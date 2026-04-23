@@ -73,7 +73,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800
@@ -108,7 +108,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800
@@ -174,7 +174,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800
@@ -212,7 +212,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800
@@ -272,7 +272,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800
@@ -307,7 +307,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800
@@ -371,7 +371,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800
@@ -408,7 +408,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800
@@ -470,7 +470,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800
@@ -506,7 +506,7 @@ experiments:
       learning_rate_rotation: 0.02
       learning_rate_weight: 0.025
       loss_mode: 0
-      ssim_weight: 0.2
+      ssim_weight: 0.5
     adc:
       clone_n_dense: 1600
       clone_n_sparse: 800

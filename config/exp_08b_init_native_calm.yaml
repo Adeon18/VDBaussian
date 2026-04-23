@@ -1,0 +1,110 @@
+# =============================================================================
+# exp_08b_init_native_calm.yaml  —  Init-count sweep on cloud_white at native,
+#                                   with the CALM ADC preset.
+#
+# Purpose: exp_08 (aggressive ADC at native) showed that init count barely
+#          matters: 1k -> 30k init spans only 1.6 dB PSNR and hands lower
+#          inits a strictly better compression ratio. This companion sweep
+#          disambiguates whether the effect is driven by
+#            (H1) the large voxel field giving ADC room to spread, or
+#            (H2) the fast/aggressive ADC growth budget alone.
+#
+#          Calm ADC grows ~2-3x slower than aggressive (see exp_07c); if the
+#          calm sweep flattens in the same way, H1 is the correct reading
+#          and the default init can be dropped to ~1k. If calm + low init
+#          collapses by several dB while calm + 15k holds, H2 wins and the
+#          low-init trick is specifically an aggressive-ADC effect.
+#
+#          Same 8 init counts as exp_08 for a row-by-row comparison.
+#
+# Cascade: identical to exp_07c `calm_cloud` at native resolution, only
+#          `gaussian_init.target_count` varies between rows.
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_08b_init_native_calm.yaml
+# =============================================================================
+
+global_overrides:
+  training:
+    max_steps: 3000
+  volume:
+    vdb_file: "cloud_04_variant_0000.vdb"
+    up_axis: "-Z"
+    use_native_size: true
+    tile_size: 8
+    max_gaussians_per_tile: 512
+  rendering:
+    smoke_color: [0.95, 0.95, 0.97]
+    density_scale: 35.0
+    density_curve: 0.8
+    light_penetration: 0.25
+    phase_g: 0.3
+    sun_color: [1.0, 0.95, 0.85]
+    sun_intensity: 4.0
+    ambient_color: [0.7, 0.75, 0.85]
+    ambient_intensity: 0.45
+  output:
+    result_dir: "results/exp_08b_init_native_calm"
+    snapshot_radius: 2.5
+  gaussian_init:
+    target_count: 15000
+    density_weighted: false
+    sigma_scale: 1.5
+    max_count: 60000          # raised from 50000; matches exp_08
+  training:
+    adam_beta2: 0.95
+    learning_rate_pos: 0.20
+    learning_rate_scale: 0.005
+    learning_rate_rotation: 0.02
+    learning_rate_weight: 0.025
+    loss_mode: 0
+    ssim_weight: 0.5
+  adc:
+    max_gaussians: 60000      # raised from 50000; ADC growth ceiling
+    clone_n_dense: 1600
+    clone_n_sparse: 800
+    aniso_n_split: 120
+    grad_n_split: 120
+
+
+experiments:
+
+  - name: "init_1k_native_calm"
+    description: "Cloud native, calm ADC, init 1k — pure compression attempt."
+    gaussian_init:
+      target_count: 1000
+
+  - name: "init_2500_native_calm"
+    description: "Cloud native, calm ADC, init 2.5k."
+    gaussian_init:
+      target_count: 2500
+
+  - name: "init_5k_native_calm"
+    description: "Cloud native, calm ADC, init 5k."
+    gaussian_init:
+      target_count: 5000
+
+  - name: "init_10k_native_calm"
+    description: "Cloud native, calm ADC, init 10k."
+    gaussian_init:
+      target_count: 10000
+
+  - name: "init_15k_native_calm"
+    description: "Cloud native, calm ADC, init 15k — reference, matches calm_cloud in exp_07c."
+    gaussian_init:
+      target_count: 15000
+
+  - name: "init_20k_native_calm"
+    description: "Cloud native, calm ADC, init 20k."
+    gaussian_init:
+      target_count: 20000
+
+  - name: "init_30k_native_calm"
+    description: "Cloud native, calm ADC, init 30k."
+    gaussian_init:
+      target_count: 30000
+
+  - name: "init_40k_native_calm"
+    description: "Cloud native, calm ADC, init 40k — note the ~50k hard cap seen in exp_08."
+    gaussian_init:
+      target_count: 40000

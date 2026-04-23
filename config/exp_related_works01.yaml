@@ -1,0 +1,128 @@
+# =============================================================================
+# exp_related_works01.yaml  —  Capstone cascade on smoke2.vdb at native size
+#
+# Purpose: Extra shape for the related-work comparison.  Same three presets
+#          as exp_07b (baseline / calm / aggressive), native resolution.
+#
+# Usage:
+#   python experiment_runner.py --batch config/exp_related_works01.yaml
+# =============================================================================
+
+global_overrides:
+  training:
+    max_steps: 3000
+  volume:
+    use_native_size: true
+    tile_size: 8
+    max_gaussians_per_tile: 512
+  output:
+    result_dir: "results/exp_related_works01"
+
+experiments:
+
+  # ===== smoke2 ==============================================================
+
+  - name: "baseline_smoke2"
+    description: "smoke2 at native resolution with default config."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\smoke2.vdb"
+      up_axis: "-Y"
+      use_native_size: false
+      vol_size: 460
+    rendering:
+      smoke_color: [0.88, 0.88, 0.90]
+      density_scale: 50.0
+      density_curve: 1.3
+      light_penetration: 0.08
+      phase_g: 0.55
+      sun_direction: [0.5, -1.0, 0.5]
+      sun_color: [1.0, 0.8, 0.6]
+      sun_intensity: 4.0
+      ambient_color: [0.5, 0.55, 0.65]
+      ambient_intensity: 0.45
+      shadow_steps: 8
+    output:
+      snapshot_radius: 2.6
+
+  - name: "calm_smoke2"
+    description: "smoke2 at native resolution with full cascade + calm ADC."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\smoke2.vdb"
+      up_axis: "-Y"
+      use_native_size: false
+      vol_size: 460
+    rendering:
+      smoke_color: [0.88, 0.88, 0.90]
+      density_scale: 50.0
+      density_curve: 1.3
+      light_penetration: 0.08
+      phase_g: 0.55
+      sun_direction: [0.5, -1.0, 0.5]
+      sun_color: [1.0, 0.8, 0.6]
+      sun_intensity: 4.0
+      ambient_color: [0.5, 0.55, 0.65]
+      ambient_intensity: 0.45
+      shadow_steps: 8
+    output:
+      snapshot_radius: 2.6
+    gaussian_init:
+      target_count: 15000
+      density_weighted: false
+      sigma_scale: 1.5
+    training:
+      adam_beta2: 0.95
+      learning_rate_pos: 0.20
+      learning_rate_scale: 0.005
+      learning_rate_rotation: 0.02
+      learning_rate_weight: 0.025
+      loss_mode: 0
+      ssim_weight: 0.5
+    adc:
+      clone_n_dense: 1600
+      clone_n_sparse: 800
+      aniso_n_split: 120
+      grad_n_split: 120
+
+  - name: "aggressive_smoke2"
+    description: "smoke2 at native resolution with full cascade + aggressive ADC."
+    volume:
+      vdb_file: "C:\\Users\\ade0n\\Downloads\\smoke2.vdb"
+      up_axis: "-Y"
+      use_native_size: false
+      vol_size: 460
+    rendering:
+      smoke_color: [0.88, 0.88, 0.90]
+      density_scale: 50.0
+      density_curve: 1.3
+      light_penetration: 0.08
+      phase_g: 0.55
+      sun_direction: [0.5, -1.0, 0.5]
+      sun_color: [1.0, 0.8, 0.6]
+      sun_intensity: 4.0
+      ambient_color: [0.5, 0.55, 0.65]
+      ambient_intensity: 0.45
+      shadow_steps: 8
+    output:
+      snapshot_radius: 2.6
+    gaussian_init:
+      target_count: 15000
+      density_weighted: false
+      sigma_scale: 1.5
+    training:
+      adam_beta2: 0.95
+      learning_rate_pos: 0.20
+      learning_rate_scale: 0.005
+      learning_rate_rotation: 0.02
+      learning_rate_weight: 0.025
+      loss_mode: 0
+      ssim_weight: 0.5
+    adc:
+      clone_n_dense: 1600
+      clone_n_sparse: 800
+      aniso_n_split: 120
+      grad_n_split: 120
+      full_adc_every: 100
+      prune_only_every: 50
+      clone_weight_init_frac: 0.50
+      clone_weight_min: 0.10
+      clone_weight_max: 0.50

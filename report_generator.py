@@ -336,9 +336,12 @@ def _exp_page(results, exp_dir):
                 f'<div class="kv-lbl">{lbl}</div></div>')
 
     comp = results.get("compression", {})
+    cr_rv  = comp.get("ratio_vs_resampled_vdb")
     cr_vol = comp.get("ratio_vs_volume")
     cr_vdb = comp.get("ratio_vs_vdb")
     g_kb   = comp.get("gaussian_data_bytes", 0) / 1024
+    tr     = comp.get("training_resolution") or results.get("training_resolution")
+    rv_lbl = f"Compr. vs sparse VDB ({tr}³)" if tr else "Compr. vs sparse VDB"
 
     cards = "".join([
         _card(_fmt(_last("3d","psnr"),2),  "PSNR 3D (dB)"),
@@ -350,8 +353,9 @@ def _exp_page(results, exp_dir):
         _card(f"{final_g:,}",              "Final Gaussians"),
         _card(f"{st_sum.get('mean_ms','?')} ms","Avg Step"),
         _card(f"{g_kb:.1f} KB",            "Gaussian Data"),
-        _card(f"{cr_vol:.1f}x" if cr_vol else "—", "Compr. vs Vol"),
-        _card(f"{cr_vdb:.1f}x" if cr_vdb else "—", "Compr. vs VDB"),
+        _card(f"{cr_rv:.2f}x" if cr_rv else "—", rv_lbl),
+        _card(f"{cr_vol:.1f}x" if cr_vol else "—", "Compr. vs dense vol (legacy)"),
+        _card(f"{cr_vdb:.1f}x" if cr_vdb else "—", "Compr. vs source VDB (legacy)"),
     ])
 
     # Filmstrip (ref + pred)
@@ -493,8 +497,8 @@ def _index_page(summaries, all_results, base_dir):
                     break
 
         comp = s.get("compression", {})
-        cr   = comp.get("ratio_vs_volume")
-        cr_s = f"{cr:.1f}x" if cr else "—"
+        cr   = comp.get("ratio_vs_resampled_vdb")
+        cr_s = f"{cr:.2f}x" if cr else "—"
 
         rows += (f'<tr>'
                  f'<td><a href="{name}/report.html">{name}</a></td>'
@@ -597,8 +601,8 @@ def _index_page(summaries, all_results, base_dir):
                          for c in cam_names[:3])  # max 3 cams on index
 
         comp_s = s.get("compression", {})
-        cr_s   = comp_s.get("ratio_vs_volume")
-        cr_txt = f"{cr_s:.1f}x" if cr_s else "—"
+        cr_s   = comp_s.get("ratio_vs_resampled_vdb")
+        cr_txt = f"{cr_s:.2f}x" if cr_s else "—"
 
         exp_blocks += f"""
 <div class="exp-block">
@@ -828,8 +832,8 @@ def _export_latex_tables(summaries: list[dict], all_results: dict, out_dir: Path
         gc_str = f"{gc:,}" if isinstance(gc, int) else "---"
 
         comp = s.get("compression", {})
-        cr = comp.get("ratio_vs_volume")
-        cr_str = f"{cr:.1f}$\\times$" if cr else "---"
+        cr = comp.get("ratio_vs_resampled_vdb")
+        cr_str = f"{cr:.2f}$\\times$" if cr else "---"
         cells = [name, gc_str, cr_str]
         fmt_map = {"final_psnr_3d": 2, "final_l1_3d": 5, "final_iou_3d": 4,
                    "final_ssim_3d": 4, "final_psnr_2d": 2, "final_l1_2d": 5,
@@ -960,5 +964,5 @@ if __name__ == "__main__":
         print("No experiments found"); raise SystemExit(1)
 
     idx = generate(base, sums)
-    print(f"Report → {idx}")
+    print(f"Report -> {idx}")
     print(f"Open  : file://{idx.resolve()}")
