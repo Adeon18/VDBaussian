@@ -262,7 +262,9 @@ void project_gaussians(uint3 tid : SV_DispatchThreadID)
     // densityScale compensates and lets the user control overall opacity.
     float3x3 P = buildPrecisionMatrix(g.scale, g.quat);
     float2 screenUV = center / float2(screenWidth, screenHeight) * 2.0 - 1.0;
-    float3 rayDir = normalize(camFront + camRight * screenUV.x + camUp * screenUV.y);
+    // Y is flipped to match the projection (center.y = -focal*cy/cz + H/2), so
+    // scene-up maps to image-top. dPd is sign-invariant but keep it consistent.
+    float3 rayDir = normalize(camFront + camRight * screenUV.x - camUp * screenUV.y);
     float dPd = max(dot(rayDir, mul(P, rayDir)), 1e-6);
     float opacityScale = g.weight * sqrt(2.0 * PI / dPd) * densityScale;
 
@@ -666,7 +668,9 @@ void render_splats(uint3 tid : SV_DispatchThreadID, uint3 groupID : SV_GroupID, 
     float3 camUp    = float3(gCamera[12], gCamera[13], gCamera[14]);
 
     float2 screenUV = (float2(pixel) + 0.5) / float2(screenWidth, screenHeight) * 2.0 - 1.0;
-    float3 rayDir = normalize(camFront + camRight * screenUV.x + camUp * screenUV.y);
+    // Flip Y so the phase-function ray matches the raymarcher: scene-up at top of image.
+    // Without this flip, forward/back HG scattering is inverted.
+    float3 rayDir = normalize(camFront + camRight * screenUV.x - camUp * screenUV.y);
     float phase = henyeyGreenstein(phaseG, dot(rayDir, sunDir));
 
     // Per-pixel base light (transmittance applied per-gaussian below)
