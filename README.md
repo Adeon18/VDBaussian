@@ -1,11 +1,11 @@
-# VDBaussian
+# DENS-E
 
 GPU-accelerated fitting of 3D Gaussians to OpenVDB volumetric data — smoke, clouds, tornadoes, fire, and arbitrary VDB density grids. Training runs entirely on the GPU through Slang compute shaders dispatched via [slangpy](https://shader-slang.com/slang/) on Vulkan; the CPU only handles config, adaptive density control, and the UI.
 
 The result is a compact set of anisotropic 3D Gaussians that approximates a VDB volume and can be rendered in real time, either directly via a 2D screen-space splatting pipeline or by accumulating them back into a 3D density volume with the included **Gaussian-to-volume rasterizer**.
 
 <p align="center">
-  <img src="img/img-app.png" alt="VDBaussian interactive GUI" width="90%" />
+  <img src="img/img-app.png" alt="DENS-E interactive GUI" width="90%" />
 </p>
 
 ## Examples
