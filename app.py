@@ -11,7 +11,7 @@ import time
 # ==========================================
 # UI MODE: Set to False for slim slangpy-native window (no OpenGL/imgui)
 # ==========================================
-EXTENDED_UI = False
+EXTENDED_UI = True
 
 if EXTENDED_UI:
     import glfw
